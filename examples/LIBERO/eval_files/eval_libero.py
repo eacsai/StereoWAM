@@ -10,6 +10,26 @@ import imageio
 import numpy as np
 import tqdm
 import tyro
+import torch
+import contextlib
+
+
+@contextlib.contextmanager
+def _libero_init_state_compat():
+    """Temporarily force weights_only=False on torch.load so LIBERO's
+    pickled init_states (numpy.core.multiarray._reconstruct legacy format)
+    can be deserialised on torch>=2.6 (which defaults to weights_only=True).
+    Scoped so we don't weaken pickle safety globally."""
+    _orig = torch.load
+    def _patched(*a, **kw):
+        return _orig(*a, **{**kw, "weights_only": False})
+    torch.load = _patched
+    try:
+        yield
+    finally:
+        torch.load = _orig
+
+
 from libero.libero import benchmark, get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
 
@@ -105,7 +125,8 @@ def eval_libero(args: Args) -> None:
         task = task_suite.get_task(task_id)
 
         # Get default LIBERO initial states
-        initial_states = task_suite.get_task_init_states(task_id)
+        with _libero_init_state_compat():
+            initial_states = task_suite.get_task_init_states(task_id)
 
         # Initialize LIBERO environment and task description
         env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
