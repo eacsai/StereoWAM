@@ -6,6 +6,7 @@ endpoints (e.g., JSONL local logs, Weights & Biases).
 """
 
 from typing import Tuple
+import os
 import re
 import json
 import numpy as np
@@ -16,6 +17,25 @@ from transformers import get_scheduler
 from accelerate.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+# --------------------------------------------------------------------------
+# Distributed helpers (single source of truth for rank-0 guards)
+# --------------------------------------------------------------------------
+# Centralised so single-process / debug invocations don't crash on
+# `dist.get_rank()` when no process group is initialised. Use everywhere
+# instead of bare `dist.get_rank() == 0` / `dist.get_rank() != 0`.
+def is_main_process() -> bool:
+    """Return True iff this is the rank-0 (or single-process) main worker.
+
+    Resolution order:
+    1. If torch.distributed is initialised → check rank == 0
+    2. Otherwise fall back to ``RANK`` env var (always set by torchrun /
+       accelerate; defaults to 0 in single-process invocations)
+    """
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank() == 0
+    return int(os.environ.get("RANK", 0)) == 0
 
 
 # === Define Tracker Interface ===
@@ -68,7 +88,7 @@ def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, to
         fused=fused_available,
     )
 
-    if dist.is_initialized() and dist.get_rank() == 0:
+    if is_main_process():
         for group in optimizer.param_groups:
             logger.info(f"LR Group {group['name']}: lr={group['lr']}, num_params={len(group['params'])}")
 
@@ -153,7 +173,7 @@ def only_main_process(func):
     """
 
     def wrapper(*args, **kwargs):
-        if dist.is_initialized() and dist.get_rank() != 0:
+        if not is_main_process():
             return None  # non-main process does not execute
         return func(*args, **kwargs)
 
@@ -225,7 +245,7 @@ class TrainerUtils:
                     continue
 
         # accelerator.wait_for_everyone()  # synchronize when distributed training
-        if dist.get_rank == 0:
+        if is_main_process():
             print(f"🔒 Frozen modules with re pattern: {frozen}")
         return model
 
@@ -235,7 +255,7 @@ class TrainerUtils:
         print the total number of parameters and trainable parameters of the model
         :param model: PyTorch model instance
         """
-        if dist.get_rank() != 0:
+        if not is_main_process():
             return
         print("📊 model parameter statistics:")
         num_params = sum(p.numel() for p in model.parameters())
@@ -257,7 +277,7 @@ class TrainerUtils:
         """
         if not checkpoint_path:
             return []
-        if dist.get_rank() == 0:
+        if is_main_process():
             print(f"📦 loading checkpoint: {checkpoint_path}")
         try:
             if _is_safetensors_path(checkpoint_path):
@@ -283,7 +303,7 @@ class TrainerUtils:
                     sub_state_dict = {k[len(prefix) :]: v for k, v in checkpoint.items() if k.startswith(prefix)}
                     if sub_state_dict:
                         module.load_state_dict(sub_state_dict, strict=True)
-                        if dist.get_rank() == 0:
+                        if is_main_process():
                             print(f"✅ parameters loaded to module '{path}'")
                         loaded_modules.append(path)
                     else:
@@ -293,7 +313,7 @@ class TrainerUtils:
         else:  # full load
             try:
                 model.load_state_dict(checkpoint, strict=False)
-                if dist.get_rank() == 0:
+                if is_main_process():
                     print("✅ loaded <full_model> model parameters")
                 loaded_modules = ["<full_model>"]
             except Exception as e:
@@ -533,13 +553,6 @@ class TrainerUtils:
         latest_checkpoint_path = os.path.join(checkpoint_dir, latest_checkpoint)
         self.accelerator.print(f"Latest checkpoint found: {latest_checkpoint_path}")
         return latest_checkpoint_path, completed_steps
-
-import os
-
-
-def is_main_process():
-    rank = int(os.environ.get("RANK", 0))  # if RANK is not set, default to 0
-    return rank == 0
 
 
 def _is_safetensors_path(path):
