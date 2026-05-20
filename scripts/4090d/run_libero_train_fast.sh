@@ -35,17 +35,26 @@ output_dir=${run_root_dir}/${run_id}
 mkdir -p ${output_dir}
 cp $0 ${output_dir}/
 
-# --- Codex finding 2: resume / overwrite guard (see run_libero_train.sh) ---
+# --- Codex finding 2 + F3 (2026-05-20): resume / overwrite guard ----------
+# Only count files matching trainer save naming convention (steps_<N>_pytorch_model.pt).
+# If RESUME=1 but no valid ckpt -> exit 1 (instead of silently restarting from scratch).
 RESUME_FLAG=()
-if [ -d "${output_dir}/checkpoints" ] && [ -n "$(ls -A "${output_dir}/checkpoints" 2>/dev/null)" ]; then
+shopt -s nullglob
+existing_ckpts=("${output_dir}/checkpoints"/steps_*_pytorch_model.pt)
+shopt -u nullglob
+if [ "${#existing_ckpts[@]}" -gt 0 ]; then
   if [ "${RESUME:-0}" = "1" ]; then
-    echo "[resume] existing ckpts in ${output_dir}/checkpoints, RESUME=1 → passing --trainer.is_resume true"
+    echo "[resume] ${#existing_ckpts[@]} valid ckpt(s) in ${output_dir}/checkpoints, RESUME=1 → passing --trainer.is_resume true"
     RESUME_FLAG=(--trainer.is_resume true)
   else
-    echo "[refuse] ${output_dir}/checkpoints is non-empty. Pick one:" >&2
+    echo "[refuse] ${output_dir}/checkpoints contains valid ckpt(s). Pick one:" >&2
     echo "  RESUME=1 bash $0   |   RUN_ID=${run_id}_v2 bash $0   |   rm -rf ${output_dir}/checkpoints" >&2
     exit 1
   fi
+elif [ "${RESUME:-0}" = "1" ]; then
+  echo "[refuse] RESUME=1 set but no valid steps_*_pytorch_model.pt in ${output_dir}/checkpoints — would silently restart from scratch. Aborting." >&2
+  echo "  Either unset RESUME, or check the ckpt path is correct." >&2
+  exit 1
 fi
 # --------------------------------------------------------------------------
 

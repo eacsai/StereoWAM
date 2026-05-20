@@ -58,7 +58,7 @@ def setup_directories(cfg) -> Path:
     cfg.output_dir = os.path.join(cfg.run_root_dir, cfg.run_id)
     output_dir = Path(cfg.output_dir)
 
-    if not dist.is_initialized() or dist.get_rank() == 0:
+    if is_main_process():
         os.makedirs(output_dir, exist_ok=True)
         os.makedirs(output_dir / "checkpoints", exist_ok=True)
 
@@ -87,7 +87,7 @@ def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, to
         fused=True,
     )
 
-    if dist.is_initialized() and dist.get_rank() == 0:
+    if is_main_process():
         for group in optimizer.param_groups:
             logger.info(f"LR Group {group['name']}: lr={group['lr']}, num_params={len(group['params'])}")
 
@@ -467,7 +467,7 @@ if __name__ == "__main__":
     # Store source config path for later copying to output dir
     cfg.config_yaml = args.config_yaml
 
-    if cfg.is_debug and dist.is_initialized() and dist.get_rank() == 0:
+    if cfg.is_debug and is_main_process():
         import debugpy
 
         debugpy.listen(("0.0.0.0", 10092))
