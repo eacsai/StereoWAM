@@ -1,0 +1,31 @@
+{
+  "dataset_id": "libero_goal_stereo_openvla",
+  "suite": "libero_goal",
+  "rendered_by": "scripts/4090d/regenerate_libero_stereo.py",
+  "stereo_baseline_m": 0.06,
+  "patched": true,
+  "patched_at": "2026-05-21",
+  "patch_script": "scripts/4090d/patch_self_rendered_parquets.py",
+  "raw_pre_patch_backup": "data.bak_prepatch_20260521/",
+  "schema": {
+    "state": {"shape": [8], "layout": "ee_pos[3] + ee_axisangle[3] + gripper_qpos[2]"},
+    "action": {"shape": [7], "layout": "delta_xyz[3] + delta_rot[3] + gripper[1]"},
+    "video_keys_available": ["observation.images.image", "observation.images.wrist_image", "observation.images.right_view"]
+  },
+  "gripper_convention": "openvla",
+  "gripper_col_values": [0.0, 1.0],
+  "gripper_semantic": "1.0 = is_open (gripper should release); 0.0 = is_close (gripper should grasp). Matches official IPEC LeRobot release of LIBERO_no_noops.",
+  "recommended_eval": {
+    "gripper_convention_flag": "openvla",
+    "rationale": "Parquet already in OpenVLA convention {0,1}. Use default eval_libero.py path (--args.gripper-convention openvla, threshold 0.5 + invert in _binarize_gripper_open)."
+  },
+  "history": [
+    "2026-05-20: rendered by regenerate_libero_stereo.py with raw LIBERO gripper convention {-1, +1} (action append verbatim without polarity transform)",
+    "2026-05-21: applied (1-g)/2 in-place via patch_self_rendered_parquets.py to convert gripper col to {0, 1}, OpenVLA convention. Originals preserved in data.bak_prepatch_20260521/.",
+    "2026-05-21: regenerate_libero_stereo.py source code updated to apply transform AT SOURCE, so future re-renders are OpenVLA-correct by construction (no post-hoc patch needed)."
+  ],
+  "verification": {
+    "validate_dataset_py": "PASS (all 8 checks green, 2026-05-21)",
+    "model_eval_path_b": "in progress (Mono-SelfRender container retrain + Stereo-SelfRender 4090d retrain)"
+  }
+}
