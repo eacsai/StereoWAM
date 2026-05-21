@@ -191,6 +191,18 @@ def cmd_patch(args) -> int:
     assert set(all_post).issubset({0.0, 1.0}), f"unexpected post values: {all_post}"
     print(f"[patch] overall post unique: {all_post}")
     print(f"[patch] total frames patched: {sum(st['frames'] for st in all_stats)}")
+    # Finding A (codex 2026-05-21): transactional --out-root mode previously only
+    # wrote parquets and left meta/ + videos/ behind, producing a dataset dir that
+    # could not be opened by any consumer. Symlink the siblings so out_root is a
+    # complete, usable dataset (videos can be GBs — symlink avoids duplicate copy).
+    if not args.dry_run and out_root != args.root:
+        for sibling in ("meta", "videos"):
+            src = (args.root / sibling).resolve()
+            dst = out_root / sibling
+            if src.exists() and not dst.exists():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                dst.symlink_to(src, target_is_directory=True)
+                print(f"[patch] linked {sibling}/ from {args.root} into {out_root}")
     print("[patch] DONE")
     return 0
 
@@ -358,6 +370,41 @@ def cmd_manifest_check(args) -> int:
     if state_shape != [args.expect_state_dim]:
         sys.exit(f"ERROR: state shape {state_shape} != expected [{args.expect_state_dim}]")
 
+    if args.live:
+        # Finding B (codex 2026-05-21): static JSON validation misses corruption that
+        # only shows up when the dataset is actually loaded. Spot-check 1 parquet (action
+        # shape + gripper convention) and 1 video file (exists + nonzero size) so the
+        # pre-launch gate refuses a 30k-step run when something is silently broken.
+        pq_dir = args.root / "data" / "chunk-000"
+        parquets = sorted(pq_dir.glob("episode_*.parquet"))
+        if not parquets:
+            sys.exit(f"ERROR [live]: no parquets found under {pq_dir}")
+        df = pd.read_parquet(parquets[0])
+        for col in ("action", "observation.state", "task_index"):
+            if col not in df.columns:
+                sys.exit(f"ERROR [live]: parquet {parquets[0].name} missing column {col!r}")
+        a = np.stack(df["action"].tolist())
+        if a.shape[1] != args.expect_action_dim:
+            sys.exit(f"ERROR [live]: parquet action dim {a.shape[1]} != expected {args.expect_action_dim}")
+        observed_grip = set(np.unique(a[:, 6]).tolist())
+        expected_grip = GRIPPER_VALUES_BY_CONVENTION[got]
+        if not observed_grip.issubset(expected_grip):
+            sys.exit(
+                f"ERROR [live]: parquet gripper values {sorted(observed_grip)} not subset of "
+                f"{sorted(expected_grip)} for declared convention='{got}'. Manifest and parquet disagree."
+            )
+        vid_dir = args.root / "videos" / "chunk-000" / "observation.images.image"
+        if not vid_dir.exists():
+            sys.exit(f"ERROR [live]: video dir missing: {vid_dir}")
+        videos = sorted(vid_dir.glob("episode_*.mp4"))
+        if not videos:
+            sys.exit(f"ERROR [live]: no .mp4 files under {vid_dir}")
+        sz = videos[0].stat().st_size
+        if sz < 1024:
+            sys.exit(f"ERROR [live]: first video {videos[0].name} suspiciously small ({sz} bytes)")
+        print(f"[manifest-check live] parquet={parquets[0].name} action={a.shape} grip={sorted(observed_grip)} "
+              f"| video={videos[0].name} {sz//1024}KB")
+
     print(f"[manifest-check] ✅ {args.root}: convention={got}, action={act_shape}, state={state_shape}")
     return 0
 
@@ -399,6 +446,9 @@ def main():
     sp.add_argument("--expect-convention", required=True, choices=ALLOWED_CONVENTIONS)
     sp.add_argument("--expect-action-dim", type=int, default=7)
     sp.add_argument("--expect-state-dim", type=int, default=8)
+    sp.add_argument("--live", action="store_true",
+                    help="also load 1 parquet + check 1 video file to catch corruption "
+                         "that static JSON validation misses (Codex 2026-05-21 finding B)")
     sp.set_defaults(func=cmd_manifest_check)
 
     args = parser.parse_args()

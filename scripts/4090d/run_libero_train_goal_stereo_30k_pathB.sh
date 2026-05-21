@@ -69,7 +69,8 @@ echo "[launch] data_mix=${data_mix}  run_id=${run_id}  data_root=${libero_data_r
 echo "[launch] manifest pre-flight check"
 .venv/bin/python scripts/4090d/data_tools.py manifest-check \
     --root ${libero_data_root}/libero_goal \
-    --expect-convention openvla
+    --expect-convention openvla \
+    --live
 
 CUDA_VISIBLE_DEVICES=${GPUS} .venv/bin/accelerate launch \
   --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml \

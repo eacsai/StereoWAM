@@ -118,6 +118,15 @@ class Args:
 
     pretrained_path: str = ""
 
+    # NEW (codex F4c 2026-05-21): gate observation.state injection. Training-time
+    # include_state must match eval-time include_state, otherwise an untrained
+    # state_encoder MLP receives state input AND the DiT sequence has an extra
+    # token vs training → success rate collapses to 0% (Phase 1 lesson, see comment
+    # block in observation-build below). All ckpts as of 2026-05-21 train with
+    # include_state=True so the default is safe; only flip to False if you trained
+    # without state encoder.
+    include_state: bool = True
+
     # Dataset key for un-normalization. None = auto (only if model trained on a single dataset).
     unnorm_key: str | None = None
 
@@ -160,7 +169,18 @@ def eval_libero(args: Args) -> None:
     if not requested_video_keys:
         raise ValueError("--args.video-keys must list at least one key (e.g. 'primary')")
 
-    logging.info(f"[eval] gripper_convention={args.gripper_convention}  video_keys={requested_video_keys}")
+    logging.info(f"[eval] gripper_convention={args.gripper_convention}  video_keys={requested_video_keys}  include_state={args.include_state}")
+
+    # NEW (codex F4c 2026-05-21): fail-closed ckpt existence check. Previously a typo
+    # in --args.pretrained-path produced a buried FileNotFoundError mid-init after
+    # the policy server already started; now we exit upfront with a clear message.
+    if args.pretrained_path:
+        from pathlib import Path as _P
+        if not _P(args.pretrained_path).exists():
+            raise FileNotFoundError(
+                f"--args.pretrained-path={args.pretrained_path!r} does not exist. "
+                f"Check the path, or pass empty string '' to skip ckpt-name-derived output dir."
+            )
 
     # NEW (2026-05-20): stereo eval flag — derived from video_keys. Drives both env
     # construction (make_stereo_env vs vanilla OffScreenRenderEnv) and per-step
@@ -295,9 +315,10 @@ def eval_libero(args: Args) -> None:
                 observation = {  #
                     "observation.primary": np.expand_dims(img, axis=0),  # (H, W, C), dtype=unit8, range(0-255)
                     "observation.wrist_image": np.expand_dims(wrist_img, axis=0),  # (H, W, C)
-                    "observation.state": np.expand_dims(state, axis=0),
                     "instruction": [str(task_description)],
                 }
+                if args.include_state:
+                    observation["observation.state"] = np.expand_dims(state, axis=0)
                 if use_stereo:
                     observation["observation.right_view"] = np.expand_dims(right_img, axis=0)  # (H, W, C)
 
