@@ -173,6 +173,35 @@ def cmd_patch(args) -> int:
     if not parquet_dir.exists():
         sys.exit(f"ERROR: {parquet_dir} not found — wrong --root?")
 
+    # Finding F6b (codex 2026-05-21): validate sibling symlink destinations BEFORE
+    # writing any parquets, so a stale/wrong-source symlink in out_root aborts the
+    # run without leaving half-patched data behind. We resolve which siblings will
+    # need new symlinks vs which are already correct (idempotent rerun).
+    siblings_to_link = []  # list of (sibling_name, src_path)
+    if not args.dry_run and out_root != args.root:
+        for sibling in ("meta", "videos"):
+            src_path = (args.root / sibling).resolve()
+            dst = out_root / sibling
+            if not src_path.exists():
+                continue
+            if dst.exists() or dst.is_symlink():
+                if dst.is_symlink():
+                    existing = dst.resolve()
+                    if existing != src_path:
+                        sys.exit(
+                            f"ERROR: {dst} already exists as symlink → {existing}, but this run "
+                            f"wants {sibling}/ to point at {src_path}. Either delete {dst} first "
+                            f"(if stale), or use a fresh --out-root."
+                        )
+                    continue  # idempotent: same target, skip later
+                else:
+                    sys.exit(
+                        f"ERROR: {dst} already exists as a real {sibling} directory, not a "
+                        f"symlink. Refusing to mix real + linked siblings in out_root. "
+                        f"Either delete {dst} or use a fresh --out-root."
+                    )
+            siblings_to_link.append((sibling, src_path))
+
     files = sorted(parquet_dir.glob("episode_*.parquet"))
     print(f"[patch] {len(files)} parquets under {parquet_dir}")
     print(f"[patch] mode: {'DRY-RUN' if args.dry_run else f'WRITE to {out_root}'}")
@@ -195,34 +224,12 @@ def cmd_patch(args) -> int:
     # wrote parquets and left meta/ + videos/ behind, producing a dataset dir that
     # could not be opened by any consumer. Symlink the siblings so out_root is a
     # complete, usable dataset (videos can be GBs — symlink avoids duplicate copy).
-    if not args.dry_run and out_root != args.root:
-        for sibling in ("meta", "videos"):
-            src_path = (args.root / sibling).resolve()
-            dst = out_root / sibling
-            if not src_path.exists():
-                continue
-            if dst.exists() or dst.is_symlink():
-                # Finding F5b (codex 2026-05-21): patch rerun should not silently accept
-                # a stale sibling from a previous run pointing somewhere else.
-                if dst.is_symlink():
-                    existing = dst.resolve()
-                    if existing != src_path:
-                        sys.exit(
-                            f"ERROR: {dst} already exists as symlink → {existing}, but this run\n"
-                            f"  wants {sibling}/ to point at {src_path}. Either delete {dst} first \n"
-                            f"  (if stale), or use a fresh --out-root."
-                        )
-                    # same target: skip silently (idempotent rerun)
-                    continue
-                else:
-                    sys.exit(
-                        f"ERROR: {dst} already exists as a real {sibling} directory, not a \n"
-                        f"  symlink. Refusing to mix real + linked siblings in out_root. \n"
-                        f"  Either delete {dst} or use a fresh --out-root."
-                    )
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            dst.symlink_to(src_path, target_is_directory=True)
-            print(f"[patch] linked {sibling}/ from {args.root} into {out_root}")
+    # Validated up-front (F6b); just create the symlinks now that parquets are written.
+    for sibling, src_path in siblings_to_link:
+        dst = out_root / sibling
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.symlink_to(src_path, target_is_directory=True)
+        print(f"[patch] linked {sibling}/ from {args.root} into {out_root}")
     print("[patch] DONE")
     return 0
 
@@ -326,6 +333,18 @@ def cmd_manifest_write(args) -> int:
             f"Either run  first or declare the correct convention."
         )
 
+    # Finding F6a (codex 2026-05-21): manifest-check --live iterates
+    # schema.video_keys_available; if manifest-write skipped it, --live silently
+    # falls back to just observation.images.image. Enumerate present modalities so
+    # F5a covers the actual dataset.
+    vid_chunk_dir = args.root / "videos" / "chunk-000"
+    if vid_chunk_dir.exists():
+        video_keys_available = sorted(
+            d.name for d in vid_chunk_dir.iterdir()
+            if d.is_dir() and d.name.startswith("observation.images.")
+        )
+    else:
+        video_keys_available = []
     manifest = {
         "dataset_id": args.root.name,
         "suite": args.suite or args.root.name,
@@ -337,6 +356,7 @@ def cmd_manifest_write(args) -> int:
                        "layout": "delta_xyz[3] + delta_rot[3] + gripper[1]"},
             "total_episodes": info.get("total_episodes"),
             "total_frames": int(sum(self_lens)),
+            "video_keys_available": video_keys_available,
         },
         "gripper_convention": args.convention,
         "gripper_col_values": observed_grip,
