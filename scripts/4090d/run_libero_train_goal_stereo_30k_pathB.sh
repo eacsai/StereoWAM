@@ -5,7 +5,7 @@
 # Mono-Official vs Stereo-Path-B comparison for paper.
 #
 # Prerequisite:
-#   1. patch_self_rendered_parquets.py applied in-place (gripper {-1,+1} → {0,1})
+#   1. data_tools.py patch applied (gripper {-1,+1} → {0,1}, openvla convention)
 #   2. playground/Datasets/LEROBOT_LIBERO_STEREO_DATA → libero_goal_stereo_openvla
 #
 # After training:
@@ -61,6 +61,15 @@ elif [ "${RESUME:-0}" = "1" ]; then
 fi
 
 echo "[launch] data_mix=${data_mix}  run_id=${run_id}  data_root=${libero_data_root}"
+
+# F2 fail-closed pre-flight: refuse to start a 30k-step run if dataset_manifest.json
+# disagrees with the gripper convention this launcher assumes (openvla).
+# Without this gate, a future contributor swapping in un-patched data would
+# silently re-burn the 2026-05-21 polarity catastrophe over ~14h of GPU time.
+echo "[launch] manifest pre-flight check"
+.venv/bin/python scripts/4090d/data_tools.py manifest-check \
+    --root ${libero_data_root}/libero_goal \
+    --expect-convention openvla
 
 CUDA_VISIBLE_DEVICES=${GPUS} .venv/bin/accelerate launch \
   --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml \

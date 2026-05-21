@@ -283,6 +283,15 @@ def eval_libero(args: Args) -> None:
                     )
                 )
 
+                # ⚠ Phase 1 lesson (migrated from removed examples/LIBERO_STEREO/eval_files/eval_libero_stereo.py):
+                # If the training config did NOT set include_state, the dataloader never put state
+                # into training samples → state_encoder MLP was never gradient-updated. Injecting
+                # state at eval feeds an untrained MLP AND adds an extra token to the DiT input
+                # sequence (mismatched seq length / position-embedding layout vs training) → success
+                # rate collapses to 0%. The current ckpts (Mono-Official / Mono-SelfRender /
+                # Stereo-SelfRender, 2026-05-21) all train with include_state=True, so passing state
+                # below is correct. If you train a model with include_state=False, gate the
+                # "observation.state" key here on the training-time config.
                 observation = {  #
                     "observation.primary": np.expand_dims(img, axis=0),  # (H, W, C), dtype=unit8, range(0-255)
                     "observation.wrist_image": np.expand_dims(wrist_img, axis=0),  # (H, W, C)
