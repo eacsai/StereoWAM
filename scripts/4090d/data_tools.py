@@ -197,12 +197,32 @@ def cmd_patch(args) -> int:
     # complete, usable dataset (videos can be GBs — symlink avoids duplicate copy).
     if not args.dry_run and out_root != args.root:
         for sibling in ("meta", "videos"):
-            src = (args.root / sibling).resolve()
+            src_path = (args.root / sibling).resolve()
             dst = out_root / sibling
-            if src.exists() and not dst.exists():
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                dst.symlink_to(src, target_is_directory=True)
-                print(f"[patch] linked {sibling}/ from {args.root} into {out_root}")
+            if not src_path.exists():
+                continue
+            if dst.exists() or dst.is_symlink():
+                # Finding F5b (codex 2026-05-21): patch rerun should not silently accept
+                # a stale sibling from a previous run pointing somewhere else.
+                if dst.is_symlink():
+                    existing = dst.resolve()
+                    if existing != src_path:
+                        sys.exit(
+                            f"ERROR: {dst} already exists as symlink → {existing}, but this run\n"
+                            f"  wants {sibling}/ to point at {src_path}. Either delete {dst} first \n"
+                            f"  (if stale), or use a fresh --out-root."
+                        )
+                    # same target: skip silently (idempotent rerun)
+                    continue
+                else:
+                    sys.exit(
+                        f"ERROR: {dst} already exists as a real {sibling} directory, not a \n"
+                        f"  symlink. Refusing to mix real + linked siblings in out_root. \n"
+                        f"  Either delete {dst} or use a fresh --out-root."
+                    )
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.symlink_to(src_path, target_is_directory=True)
+            print(f"[patch] linked {sibling}/ from {args.root} into {out_root}")
     print("[patch] DONE")
     return 0
 
@@ -393,17 +413,25 @@ def cmd_manifest_check(args) -> int:
                 f"ERROR [live]: parquet gripper values {sorted(observed_grip)} not subset of "
                 f"{sorted(expected_grip)} for declared convention='{got}'. Manifest and parquet disagree."
             )
-        vid_dir = args.root / "videos" / "chunk-000" / "observation.images.image"
-        if not vid_dir.exists():
-            sys.exit(f"ERROR [live]: video dir missing: {vid_dir}")
-        videos = sorted(vid_dir.glob("episode_*.mp4"))
-        if not videos:
-            sys.exit(f"ERROR [live]: no .mp4 files under {vid_dir}")
-        sz = videos[0].stat().st_size
-        if sz < 1024:
-            sys.exit(f"ERROR [live]: first video {videos[0].name} suspiciously small ({sz} bytes)")
+        # Finding F5a (codex 2026-05-21): live-check must cover ALL declared video
+        # modalities. A stereo dataset with right_view missing/empty would silently
+        # pass if we only check primary.
+        schema = m.get("schema", {})
+        video_keys = schema.get("video_keys_available") or ["observation.images.image"]
+        video_summary = []
+        for vkey in video_keys:
+            vid_dir = args.root / "videos" / "chunk-000" / vkey
+            if not vid_dir.exists():
+                sys.exit(f"ERROR [live]: video dir missing for declared modality {vkey!r}: {vid_dir}")
+            videos = sorted(vid_dir.glob("episode_*.mp4"))
+            if not videos:
+                sys.exit(f"ERROR [live]: no .mp4 files under {vid_dir} (modality {vkey!r})")
+            sz = videos[0].stat().st_size
+            if sz < 1024:
+                sys.exit(f"ERROR [live]: first video {videos[0].name} suspiciously small ({sz} bytes) for modality {vkey!r}")
+            video_summary.append(f"{vkey.split('.')[-1]}={videos[0].name}({sz//1024}KB)")
         print(f"[manifest-check live] parquet={parquets[0].name} action={a.shape} grip={sorted(observed_grip)} "
-              f"| video={videos[0].name} {sz//1024}KB")
+              f"| videos: {', '.join(video_summary)}")
 
     print(f"[manifest-check] ✅ {args.root}: convention={got}, action={act_shape}, state={state_shape}")
     return 0
