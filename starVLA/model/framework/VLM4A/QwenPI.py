@@ -28,6 +28,7 @@ from starVLA.model.modules.action_model.LayerwiseFM_ActionHeader import Layerwis
 from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 from starVLA.training.trainer_utils.trainer_tools import resize_images
+from starVLA.model.modules.stereo import StereoCamEmbedding
 
 ####################################################
 # ⚠️ Warning: This framework has been restructured and is NOT compatible with checkpoints created before 2025-10-20.
@@ -62,6 +63,20 @@ class QwenPIDefaultConfig:
             "vl_hidden_dim": 2048,
             # Number of VL transformer layers (auto-set at runtime)
             "num_vl_layers": 36,
+            # === Phase 3 A2: stereo cam_id additive embedding (opt-in) ===
+            # When True, build StereoCamEmbedding and register a forward_hook
+            # on model.visual that adds learnable (cam_id, row, col) embeddings
+            # to image token features. Zero-init so step-0 output = mono baseline.
+            # Only meaningful for stereo training (>=2 images per sample).
+            "stereo_cam_embed_enabled": False,
+            # Number of distinct cameras for cam_id embedding table; default
+            # 2 = (primary/left, right_view). Image index within a sample
+            # is taken modulo this number to assign cam_id.
+            "stereo_cam_embed_num_cameras": 2,
+            # Patch grid upper bounds for 2D pos embed table (cheap, oversized
+            # for safety against unusual resolutions; only used positions train).
+            "stereo_cam_embed_max_patches_x": 64,
+            "stereo_cam_embed_max_patches_y": 64,
         }
     )
 
@@ -163,6 +178,89 @@ class Qwen_PI(baseframework):
         # are normalised upstream by `share_tools.apply_config_compat`, so we
         # only ever read `action_horizon` here.
         self.action_horizon = int(self.config.framework.action_model.action_horizon)
+
+        # === Phase 3 A2: Stereo cam_id additive embedding (opt-in) ===
+        # Hook on model.visual output: image features get tagged with learnable
+        # (cam_id, row, col) embeddings BEFORE language transformer sees them.
+        # Zero init -> behavior identical to baseline at step 0.
+        self._stereo_cam_hook_handle = None
+        self.stereo_cam_embed = None
+        if bool(self.config.framework.qwenvl.get("stereo_cam_embed_enabled", False)):
+            self.stereo_cam_embed = StereoCamEmbedding(
+                hidden_dim=llm_hidden_size,
+                num_cameras=int(self.config.framework.qwenvl.get("stereo_cam_embed_num_cameras", 2)),
+                max_patches_x=int(self.config.framework.qwenvl.get("stereo_cam_embed_max_patches_x", 64)),
+                max_patches_y=int(self.config.framework.qwenvl.get("stereo_cam_embed_max_patches_y", 64)),
+            )
+
+            # Locate the visual encoder. Qwen3.5-VL stores it at model.model.visual.
+            hf_root = self.qwen_vl_interface.model
+            visual = getattr(hf_root, "visual", None) or getattr(getattr(hf_root, "model", None), "visual", None)
+            if visual is None:
+                raise RuntimeError("stereo_cam_embed_enabled=True but model.visual not found")
+
+            stereo_mod = self.stereo_cam_embed
+
+            def _vision_output_hook(module, args, kwargs, output):
+                # visual.forward(hidden_states, grid_thw, **kwargs)
+                # Qwen3.5-VL returns BaseModelOutputWithPooling where:
+                #   last_hidden_state = (sum_thw, vision_hidden_dim)        ← pre-merger
+                #   pooler_output    = (sum_thw//s**2, llm_hidden_dim)     ← post-merger (what LLM sees)
+                # We add cam_id embeddings AT THE POST-MERGER LLM-DIM tokens.
+                grid_thw = kwargs.get("grid_thw")
+                if grid_thw is None and len(args) >= 2:
+                    grid_thw = args[1]
+                if grid_thw is None:
+                    return output
+                s = int(getattr(module, "spatial_merge_size", 1))
+                if isinstance(output, torch.Tensor):
+                    return stereo_mod(output, grid_thw, spatial_merge_size=s)
+                # BaseModelOutputWithPooling — modify pooler_output (LLM dim, post-merger).
+                feats = getattr(output, "pooler_output", None)
+                if feats is None:
+                    return output
+                output.pooler_output = stereo_mod(feats, grid_thw, spatial_merge_size=s)
+                return output
+
+            self._stereo_cam_hook_handle = visual.register_forward_hook(
+                _vision_output_hook, with_kwargs=True
+            )
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        """Permissive load that survives stereo_cam_embed toggle between training runs.
+
+        Phase 3 A2 introduced an opt-in module (stereo_cam_embed). When loading a
+        Phase 2 ckpt into an A2-enabled model, the stereo_cam_embed.* keys are
+        missing; when loading an A2 ckpt into a non-A2 model they are extra. In
+        both cases, the rest of the network is fine — we don't want a mismatch
+        on the optional branch to block resume / eval.
+        """
+        stereo_prefix = "stereo_cam_embed."
+        own_keys = set(self.state_dict().keys())
+        provided_keys = set(state_dict.keys())
+
+        missing_stereo = {k for k in own_keys - provided_keys if k.startswith(stereo_prefix)}
+        extra_stereo = {k for k in provided_keys - own_keys if k.startswith(stereo_prefix)}
+
+        if missing_stereo or extra_stereo:
+            import logging
+            if missing_stereo:
+                logging.warning(
+                    f"[stereo_cam_embed] ckpt missing {len(missing_stereo)} stereo_cam_embed.* "
+                    f"keys (loading Phase 2 ckpt into Phase 3 A2 model). New module will be "
+                    f"zero-init (safe — output identical to baseline until trained)."
+                )
+            if extra_stereo:
+                logging.warning(
+                    f"[stereo_cam_embed] ckpt has {len(extra_stereo)} extra stereo_cam_embed.* "
+                    f"keys but model has it disabled. Dropping these keys silently."
+                )
+                # Drop extras so torch's loader doesn't choke.
+                state_dict = {k: v for k, v in state_dict.items() if k not in extra_stereo}
+            # Force non-strict for these specific mismatches; other mismatches still raise.
+            strict = False
+
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
     def _encode_vl_hidden_states(
         self, batch_images: List, instructions: List[str]
