@@ -12,6 +12,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.nn as nn
 from PIL import Image
 
 from deployment.model_server.tools.image_tools import to_pil_preserve
@@ -28,6 +29,7 @@ from starVLA.model.modules.action_model.LayerwiseFM_ActionHeader import Layerwis
 from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 from starVLA.training.trainer_utils.trainer_tools import resize_images
+from starVLA.model.modules.stereo import install_stereo_cam_rope_hooks
 
 ####################################################
 # ⚠️ Warning: This framework has been restructured and is NOT compatible with checkpoints created before 2025-10-20.
@@ -62,6 +64,19 @@ class QwenPIDefaultConfig:
             "vl_hidden_dim": 2048,
             # Number of VL transformer layers (auto-set at runtime)
             "num_vl_layers": 36,
+            # === Phase 3 B: stereo Camera-Frame RoPE (dim expansion, opt-in) ===
+            # When True, patch every Qwen3_5Attention layer to add a d_c branch
+            # carrying camera-conditioned positional rotation (StereoWorld Eq 6-8).
+            # Image tokens get cam_id-dependent P_t rotation; text tokens get 0.
+            # Zero Init so step-0 output equals the mono baseline byte-identical.
+            "stereo_cam_rope_enabled": False,
+            "stereo_cam_rope_d_c": 16,             # new dim per head
+            "stereo_cam_rope_num_cameras": 2,
+            "stereo_cam_rope_baseline_m": 0.06,    # 6cm right of agentview
+            "stereo_cam_rope_fovy_degrees": 45.0,  # LIBERO agentview default
+            "stereo_cam_rope_image_width": 256,
+            "stereo_cam_rope_image_height": 256,
+            "stereo_cam_rope_spatial_merge": 2,    # Qwen3.5-VL default
         }
     )
 
@@ -163,6 +178,74 @@ class Qwen_PI(baseframework):
         # are normalised upstream by `share_tools.apply_config_compat`, so we
         # only ever read `action_horizon` here.
         self.action_horizon = int(self.config.framework.action_model.action_horizon)
+
+        # === Phase 3 B: Stereo Camera-Frame RoPE (dim expansion, opt-in) ===
+        # Patches each standard attention layer to add q_cam/k_cam projections;
+        # image tokens get a camera-conditioned rotation in the new d_c dim.
+        # Zero Init → step-0 byte-identical to baseline.
+        self._stereo_cam_rope_state = None
+        self._stereo_cam_rope_layers = None
+        if bool(self.config.framework.qwenvl.get("stereo_cam_rope_enabled", False)):
+            self._stereo_cam_rope_state, scl_modules = install_stereo_cam_rope_hooks(
+                self.qwen_vl_interface.model,
+                d_c=int(self.config.framework.qwenvl.get("stereo_cam_rope_d_c", 16)),
+                num_cameras=int(self.config.framework.qwenvl.get("stereo_cam_rope_num_cameras", 2)),
+                baseline_m=float(self.config.framework.qwenvl.get("stereo_cam_rope_baseline_m", 0.06)),
+                fovy_degrees=float(self.config.framework.qwenvl.get("stereo_cam_rope_fovy_degrees", 45.0)),
+                image_width=int(self.config.framework.qwenvl.get("stereo_cam_rope_image_width", 256)),
+                image_height=int(self.config.framework.qwenvl.get("stereo_cam_rope_image_height", 256)),
+                spatial_merge_size=int(self.config.framework.qwenvl.get("stereo_cam_rope_spatial_merge", 2)),
+            )
+            # B-1a (codex round-1 fix): fail-closed startup check. install_*_hooks
+            # already raises if no Qwen3_5Attention layers exist, but we double-check
+            # here because future model surgery / freeze_modules cfg may silently
+            # leave the list empty without raising.
+            if not scl_modules:
+                raise RuntimeError(
+                    "stereo_cam_rope_enabled=True but install_stereo_cam_rope_hooks returned 0 layers. "
+                    "Did the model architecture change so no Qwen3_5Attention layers are present?"
+                )
+            # Register the per-layer projection modules as a ModuleList child so
+            # they participate in state_dict / DDP / DeepSpeed sharding.
+            self.stereo_cam_rope_layers = nn.ModuleList(scl_modules)
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        """Permissive load that survives Phase 3 stereo module toggles.
+
+        Phase 3 introduces opt-in stereo modules (cam_embed, cam_rope). When the
+        ckpt and the model disagree on which are enabled, the rest of the
+        network is fine — we don'''t want a mismatch on the optional branch to
+        block resume / eval.
+        """
+        def _is_stereo_key(k):
+            if k.startswith("stereo_cam_embed.") or k.startswith("stereo_cam_rope_layers."):
+                return True
+            if "qwen_vl_interface.model.model.language_model.layers." in k                and ".self_attn.stereo_cam_layer." in k:
+                return True
+            return False
+
+        own_keys = set(self.state_dict().keys())
+        provided_keys = set(state_dict.keys())
+
+        missing_stereo = {k for k in own_keys - provided_keys if _is_stereo_key(k)}
+        extra_stereo = {k for k in provided_keys - own_keys if _is_stereo_key(k)}
+
+        if missing_stereo or extra_stereo:
+            import logging
+            if missing_stereo:
+                logging.warning(
+                    f"[stereo] ckpt missing {len(missing_stereo)} stereo module key(s) — "
+                    f"loading older ckpt into Phase 3 model. New modules stay at zero-init (safe)."
+                )
+            if extra_stereo:
+                logging.warning(
+                    f"[stereo] ckpt has {len(extra_stereo)} extra stereo module key(s) — "
+                    f"loading Phase 3 ckpt into model with module disabled. Dropping extras."
+                )
+                state_dict = {k: v for k, v in state_dict.items() if k not in extra_stereo}
+            strict = False
+
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
     def _encode_vl_hidden_states(
         self, batch_images: List, instructions: List[str]
