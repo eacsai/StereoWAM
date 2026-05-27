@@ -37,6 +37,7 @@ from starVLA.model.modules.action_model.GR00T_ActionHeader import FlowmatchingAc
 from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 from starVLA.training.trainer_utils.trainer_tools import resize_images
+from starVLA.model.modules.stereo import install_stereo_cam_rope_hooks
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -65,6 +66,18 @@ class QwenGR00TDefaultConfig:
             "attn_implementation": "flash_attention_2",
             # VLM hidden dimension (used for cross-attention alignment)
             "vl_hidden_dim": 2048,
+            # === Stereo Camera-Frame RoPE (ported from QwenPI) ===
+            "stereo_cam_rope_enabled": False,
+            "stereo_cam_rope_d_c": 16,
+            "stereo_cam_rope_num_cameras": 2,
+            "stereo_cam_rope_baseline_m": 0.06,
+            "stereo_cam_rope_fovy_degrees": 45.0,
+            "stereo_cam_rope_image_width": 256,
+            "stereo_cam_rope_image_height": 256,
+            "stereo_cam_rope_spatial_merge": 2,
+            "stereo_cam_rope_init_mode": "zero",
+            # === Phase 4 epipolar attention mask ===
+            "stereo_epipolar_mask_enabled": False,
         }
     )
 
@@ -151,6 +164,31 @@ class Qwen_GR00T(baseframework):
         # Merge framework defaults with YAML config (YAML wins on conflicts)
         self.config = merge_framework_config(QwenGR00TDefaultConfig, config)
         self.qwen_vl_interface = get_vlm_model(config=self.config)
+
+        # === Stereo Camera-Frame RoPE install (ported from QwenPI) ===
+        self._stereo_cam_rope_state = None
+        self.stereo_cam_rope_layers = None
+        if bool(self.config.framework.qwenvl.get("stereo_cam_rope_enabled", False)):
+            import torch.nn as _nn_for_stereo
+            self._stereo_cam_rope_state, scl_modules = install_stereo_cam_rope_hooks(
+                self.qwen_vl_interface.model,
+                d_c=int(self.config.framework.qwenvl.get("stereo_cam_rope_d_c", 16)),
+                num_cameras=int(self.config.framework.qwenvl.get("stereo_cam_rope_num_cameras", 2)),
+                baseline_m=float(self.config.framework.qwenvl.get("stereo_cam_rope_baseline_m", 0.06)),
+                fovy_degrees=float(self.config.framework.qwenvl.get("stereo_cam_rope_fovy_degrees", 45.0)),
+                image_width=int(self.config.framework.qwenvl.get("stereo_cam_rope_image_width", 256)),
+                image_height=int(self.config.framework.qwenvl.get("stereo_cam_rope_image_height", 256)),
+                spatial_merge_size=int(self.config.framework.qwenvl.get("stereo_cam_rope_spatial_merge", 2)),
+                init_mode=str(self.config.framework.qwenvl.get("stereo_cam_rope_init_mode", "zero")),
+                epipolar_mask_enabled=bool(self.config.framework.qwenvl.get("stereo_epipolar_mask_enabled", False)),
+            )
+            if not scl_modules:
+                raise RuntimeError(
+                    "stereo_cam_rope_enabled=True but install_stereo_cam_rope_hooks returned 0 layers. "
+                    "Did the model architecture change so no attention layers found?"
+                )
+            self.stereo_cam_rope_layers = _nn_for_stereo.ModuleList(scl_modules)
+
         # align dims --> we should put them to config or no?
         self.config.framework.action_model.diffusion_model_cfg.cross_attention_dim = (
             self.qwen_vl_interface.model.config.hidden_size

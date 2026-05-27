@@ -1,23 +1,26 @@
-"""Camera-Frame RoPE integration glue for Qwen3.5-0.8B (Phase 3 Level B).
+"""Camera-Frame RoPE integration glue for Qwen3.5-0.8B (Phase 3 B) and
+Qwen3-VL-4B-Instruct (Phase 3 C, M-RoPE Copy Init ablation).
 
 This module:
   1. Defines per-batch state (StereoCamRoPEState) holding per_token_cam_id.
   2. Provides compute_per_token_cam_id() that derives cam_id from input_ids +
      image_grid_thw + image_token_id (Qwen-VL placeholder).
   3. Provides patched_qwen3_5_attention_forward() — drop-in replacement for
-     Qwen3_5Attention.forward that adds the d_c branch (Eq 6-8) and uses SDPA
-     because head_dim+d_c > Flash Attn 2 limit.
-  4. install_stereo_cam_rope_hooks() walks the model, attaches StereoCamRoPELayer
-     to each Qwen3_5Attention layer, replaces forward, and registers the
-     pre-forward hook that fills the per-batch state.
+     Qwen3_5Attention.forward (Qwen3.5-0.8B) that adds the d_c branch (Eq 6-8).
+     branch.  Differs from the Qwen3.5 patch: no gated tail, no q_chunked
+     split, multimodal 3D position_embeddings (post-apply_interleaved_mrope).
+  5. install_stereo_cam_rope_hooks() walks the model, dispatches to the correct
+     patched forward per attention class, optionally Copy-Init's q_cam_proj /
+     k_cam_proj from the M-RoPE temporal subspace slice of q_proj / k_proj,
+     and registers the pre-forward hook that fills per-batch state.
 
 Why SDPA not Flash Attn 2:
   Qwen3.5-0.8B head_dim = 256 is already at Flash Attn 2's hard upper limit.
   Adding d_c = 16 gives head_dim+d_c = 272, which Flash Attn 2 rejects with
   '[FlashAttention] only supports head dimensions up to 256'. SDPA accepts any
-  head_dim with the same softmax math, ~1.5x slower in the bf16/fp16 case but
-  only applied to 6 of 24 layers (the rest stay on their original GatedDeltaNet
-  path), so overall slowdown is < 10%.
+  head_dim with the same softmax math. For Qwen3-VL-4B (head_dim=128, d_c=48
+  -> 176) FA2 would technically fit, but we keep SDPA across both backbones
+  for code symmetry (the d_c-block math is the same).
 """
 from __future__ import annotations
 
@@ -48,6 +51,9 @@ class StereoCamRoPEState:
 
     def __init__(self) -> None:
         self.per_token_cam_id: Optional[torch.Tensor] = None  # (B, S) long, -1=text
+        # === Phase 4 epipolar mask support (backward compat: disabled by default) ===
+        self.per_token_row_id: Optional[torch.Tensor] = None  # (B, S) long, -1=text/non-image
+        self.epipolar_mask_enabled: bool = False
 
 
 # --------------------------------------------------------------------------- #
@@ -120,6 +126,51 @@ def compute_per_token_cam_id(
                 continue
             cam_id = img_idx_in_sample % num_cameras
             out[b, s_start:s_end] = cam_id
+            img_idx_global += 1
+
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# Derive per_token_row_id for epipolar mask.
+# --------------------------------------------------------------------------- #
+
+def compute_per_token_row_id(
+    input_ids: torch.Tensor,
+    image_token_id: int,
+    image_grid_thw,
+    spatial_merge_size: int = 2,
+) -> torch.Tensor:
+    """Assign each image token a row index within its image (0-indexed). Text/non-image = -1."""
+    B, S = input_ids.shape
+    out = torch.full((B, S), -1, dtype=torch.long, device=input_ids.device)
+    if image_grid_thw is None or image_grid_thw.numel() == 0:
+        return out
+
+    image_mask = (input_ids == image_token_id)
+    s2 = max(int(spatial_merge_size), 1)
+    per_image_n = ((image_grid_thw[:, 0] * image_grid_thw[:, 1] * image_grid_thw[:, 2]) // (s2 * s2)).tolist()
+    per_image_w = (image_grid_thw[:, 2] // s2).tolist()
+
+    img_idx_global = 0
+    for b in range(B):
+        mask_b = image_mask[b]
+        diff = torch.diff(mask_b.int(), prepend=torch.zeros(1, dtype=torch.int, device=mask_b.device))
+        starts = torch.nonzero(diff == 1, as_tuple=True)[0].tolist()
+        diff_end = torch.diff(mask_b.int(), append=torch.zeros(1, dtype=torch.int, device=mask_b.device))
+        ends = torch.nonzero(diff_end == -1, as_tuple=True)[0].tolist()
+        for img_idx_in_sample, (s_start, s_end) in enumerate(zip(starts, ends)):
+            if img_idx_global >= len(per_image_n):
+                continue
+            n_expected = per_image_n[img_idx_global]
+            w_image = per_image_w[img_idx_global]
+            actual_len = s_end - s_start + 1
+            if actual_len != n_expected or w_image <= 0:
+                img_idx_global += 1
+                continue
+            for i in range(actual_len):
+                out[b, s_start + i] = i // w_image
             img_idx_global += 1
 
     return out
@@ -256,6 +307,25 @@ def patched_qwen3_5_attention_forward(
         # Unexpected shape — pass through; if SDPA errors, codex will surface.
         sdpa_attn_mask = attention_mask
 
+    # === Phase 4 Epipolar attention mask (StereoWorld paper Sec 3.3) ===
+    # Block cross-view image-image attention except where same horizontal row.
+    if state.epipolar_mask_enabled and state.per_token_row_id is not None:
+        per_cam = state.per_token_cam_id  # (B, S)
+        per_row = state.per_token_row_id  # (B, S)
+        i_cam = per_cam.unsqueeze(-1)
+        j_cam = per_cam.unsqueeze(-2)
+        i_row = per_row.unsqueeze(-1)
+        j_row = per_row.unsqueeze(-2)
+        epi_block = (i_cam != j_cam) & (i_cam >= 0) & (j_cam >= 0) & (i_row != j_row)  # (B, S, S) True=block
+        if sdpa_attn_mask is None:
+            # Need explicit 4D mask now. Build from causal (if is_causal) or empty.
+            sdpa_attn_mask = torch.zeros((per_cam.shape[0], 1, S, S), dtype=q_tilde.dtype, device=q_tilde.device)
+            if is_causal:
+                _causal_only = torch.triu(torch.ones(S, S, device=q_tilde.device, dtype=torch.bool), diagonal=1)
+                sdpa_attn_mask = sdpa_attn_mask.masked_fill(_causal_only.unsqueeze(0).unsqueeze(0), float("-inf"))
+                is_causal = False
+        sdpa_attn_mask = sdpa_attn_mask.masked_fill(epi_block.unsqueeze(1), float("-inf"))
+
     attn_output = F.scaled_dot_product_attention(
         q_tilde,
         k_tilde,
@@ -274,9 +344,15 @@ def patched_qwen3_5_attention_forward(
     return attn_output, None
 
 
-# --------------------------------------------------------------------------- #
-# Install hooks on the model.
-# --------------------------------------------------------------------------- #
+
+
+
+# Dispatch table: attention class name -> patched forward function.
+# Extend this when adding support for new VLM backbones.
+_PATCHED_FORWARD_DISPATCH = {
+    'Qwen3_5Attention': patched_qwen3_5_attention_forward,
+}
+
 
 def install_stereo_cam_rope_hooks(
     hf_model,
@@ -287,15 +363,28 @@ def install_stereo_cam_rope_hooks(
     image_width: int = 256,
     image_height: int = 256,
     spatial_merge_size: int = 2,
+    init_mode: str = 'zero',
+    epipolar_mask_enabled: bool = False,
 ) -> Tuple[StereoCamRoPEState, List[StereoCamRoPELayer]]:
-    """Walk Qwen3.5-VL hf_model, attach StereoCamRoPELayer to every standard
-    attention layer (Qwen3_5Attention), replace their forward with the patched
-    version, and register a pre-forward hook on the top-level model that fills
-    the per-batch state.
+    """Walk hf_model's language_model.layers, attach StereoCamRoPELayer to each
+    supported standard attention layer (Qwen3_5Attention),
+    replace its forward with the matching patched version, optionally Copy-Init
+    the d_c projections from the M-RoPE temporal subspace, and register a
+    pre-forward hook on the top-level model that fills the per-batch state.
+
+    init_mode:
+      * 'zero'  — Zero-init q_cam_proj/k_cam_proj so step-0 attention is
+        byte-identical to the baseline backbone. (Currently the only mode;
+        copy_temporal_mrope variant was removed after 4B+GR00T proved unusable.)
 
     Returns the shared state holder + list of layer modules (so the framework
     can register them as nn.Module children for ckpt save/load).
     """
+    if init_mode != 'zero':
+        raise RuntimeError(
+            f"init_mode must be 'zero' (copy_temporal_mrope removed); got {init_mode!r}."
+        )
+
     # 1. Pre-compute the constant camera P_stack.
     P_stack = compute_libero_camera_P_stack(
         fovy_degrees=fovy_degrees,
@@ -305,6 +394,7 @@ def install_stereo_cam_rope_hooks(
     )
 
     state = StereoCamRoPEState()
+    state.epipolar_mask_enabled = bool(epipolar_mask_enabled)
 
     # 2. Find the language model.
     inner = getattr(hf_model, 'model', None) or hf_model
@@ -312,7 +402,7 @@ def install_stereo_cam_rope_hooks(
     if lm is None or not hasattr(lm, 'layers'):
         raise RuntimeError('Could not locate language_model.layers in hf_model')
 
-    # 3. For each standard attention layer, attach StereoCamRoPELayer + patch forward.
+    # 3. For each supported attention layer, attach StereoCamRoPELayer + patch forward.
     text_cfg = hf_model.config.text_config if hasattr(hf_model.config, 'text_config') else hf_model.config
     hidden_dim = int(text_cfg.hidden_size)
     n_heads_q = int(text_cfg.num_attention_heads)
@@ -321,6 +411,7 @@ def install_stereo_cam_rope_hooks(
 
     scl_modules: List[StereoCamRoPELayer] = []
     standard_attn_idxs = []
+    patched_attn_classes: List[str] = []
     for layer_idx, layer in enumerate(lm.layers):
         attn = None
         for child_name in ('self_attn', 'attention', 'attn'):
@@ -330,9 +421,11 @@ def install_stereo_cam_rope_hooks(
         if attn is None:
             continue
         attn_cls_name = type(attn).__name__
-        if attn_cls_name != 'Qwen3_5Attention':
+        patched_forward = _PATCHED_FORWARD_DISPATCH.get(attn_cls_name)
+        if patched_forward is None:
             continue
         standard_attn_idxs.append(layer_idx)
+        patched_attn_classes.append(attn_cls_name)
 
         scl = StereoCamRoPELayer(
             hidden_dim=hidden_dim,
@@ -340,16 +433,25 @@ def install_stereo_cam_rope_hooks(
             n_heads_kv=n_heads_kv,
             d_c=d_c,
         )
+
+        # Match base model dtype so DeepSpeed ZeRO-3 defragment doesn't choke on
+        # mixed-dtype param groups (q_cam_proj/k_cam_proj are nn.Linear so default
+        # fp32; base Qwen3-VL is bf16).
+        base_dtype = attn.q_proj.weight.dtype
+        scl = scl.to(base_dtype)
+
         scl.state_holder = state
         scl.register_buffer('camera_P_stack', P_stack.clone(), persistent=False)
         attn.stereo_cam_layer = scl
-        # Replace the bound method.
-        attn.forward = MethodType(patched_qwen3_5_attention_forward, attn)
+        # Replace the bound method (per-class dispatch).
+        attn.forward = MethodType(patched_forward, attn)
         scl_modules.append(scl)
 
     if not scl_modules:
         raise RuntimeError(
-            'No Qwen3_5Attention layers found to patch. Did the model switch architecture?'
+            'No supported attention layers found to patch.  Looked for: '
+            f'{sorted(_PATCHED_FORWARD_DISPATCH.keys())}.  '
+            'Did the model switch architecture?'
         )
 
     # 4. Register pre-forward hook on the top-level model to populate state.
@@ -368,14 +470,25 @@ def install_stereo_cam_rope_hooks(
             num_cameras=num_cameras,
             spatial_merge_size=spatial_merge_size,
         )
+        if state.epipolar_mask_enabled:
+            state.per_token_row_id = compute_per_token_row_id(
+                input_ids=input_ids,
+                image_token_id=image_token_id,
+                image_grid_thw=image_grid_thw,
+                spatial_merge_size=spatial_merge_size,
+            )
+        else:
+            state.per_token_row_id = None
 
     hf_model.register_forward_pre_hook(_pre_forward_hook, with_kwargs=True)
 
     import logging
+    unique_cls = sorted(set(patched_attn_classes))
     logging.info(
-        f'[stereo_cam_rope] patched {len(scl_modules)} standard attention layers '
-        f'at language_model.layers[{standard_attn_idxs}] (d_c={d_c}, '
-        f'num_cameras={num_cameras}, baseline_m={baseline_m})'
+        f'[stereo_cam_rope] patched {len(scl_modules)} attention layers '
+        f'({unique_cls}) at language_model.layers[{standard_attn_idxs}] '
+        f'(d_c={d_c}, num_cameras={num_cameras}, baseline_m={baseline_m}, '
+        f'init_mode={init_mode}, epipolar={state.epipolar_mask_enabled})'
     )
 
     return state, scl_modules

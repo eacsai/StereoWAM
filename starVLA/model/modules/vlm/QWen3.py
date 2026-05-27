@@ -67,6 +67,22 @@ class _QWen3_VL_Interface(nn.Module):
         processor = AutoProcessor.from_pretrained(model_id)
         processor.tokenizer.padding_side = "left"
 
+        # Gradient checkpointing — critical for fitting Qwen3-VL-4B + stereo
+        # cam_rope d_c branch + LayerwiseFM action head into 80GB H100.
+        # Trades ~1.5x compute for ~30-50% activation memory reduction.
+        # Toggle off by setting framework.qwenvl.gradient_checkpointing=false.
+        enable_grad_ckpt = bool(qwenvl_config.get("gradient_checkpointing", True))
+        if enable_grad_ckpt:
+            try:
+                model.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False}
+                )
+                if hasattr(model, "enable_input_require_grads"):
+                    model.enable_input_require_grads()
+                print("[QWen3] gradient_checkpointing ENABLED (use_reentrant=False)", flush=True)
+            except Exception as e:
+                print(f"[QWen3] failed to enable gradient_checkpointing: {e}", flush=True)
+
         self.model = model
         self.processor = processor
         self.config = config

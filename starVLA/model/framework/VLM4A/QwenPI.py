@@ -77,6 +77,12 @@ class QwenPIDefaultConfig:
             "stereo_cam_rope_image_width": 256,
             "stereo_cam_rope_image_height": 256,
             "stereo_cam_rope_spatial_merge": 2,    # Qwen3.5-VL default
+            # init_mode default "zero": byte-identical step-0 to baseline.
+            # (copy_temporal_mrope variant for Qwen3-VL-4B was removed —
+            #  4B+GR00T NaN'd upstream, Issue 171.)
+            "stereo_cam_rope_init_mode": "zero",
+            # === Phase 4 epipolar attention mask (StereoWorld paper Sec 3.3) ===
+            "stereo_epipolar_mask_enabled": False,
         }
     )
 
@@ -195,6 +201,8 @@ class Qwen_PI(baseframework):
                 image_width=int(self.config.framework.qwenvl.get("stereo_cam_rope_image_width", 256)),
                 image_height=int(self.config.framework.qwenvl.get("stereo_cam_rope_image_height", 256)),
                 spatial_merge_size=int(self.config.framework.qwenvl.get("stereo_cam_rope_spatial_merge", 2)),
+                init_mode=str(self.config.framework.qwenvl.get("stereo_cam_rope_init_mode", "zero")),
+                epipolar_mask_enabled=bool(self.config.framework.qwenvl.get("stereo_epipolar_mask_enabled", False)),
             )
             # B-1a (codex round-1 fix): fail-closed startup check. install_*_hooks
             # already raises if no Qwen3_5Attention layers exist, but we double-check
