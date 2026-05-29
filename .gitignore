@@ -262,3 +262,10 @@ examples/SimplerEnv/eval_files/auto_eval_scripts/auto_collect_results/schedule_w
 examples/SimplerEnv/eval_files/auto_eval_scripts/auto_collect_results/summarize_widowx_all.sh
 examples/SimplerEnv/eval_files/auto_eval_scripts/auto_collect_results/schedule_widowx_eval.sh
 starVLA/model/framework/VLM4A/QwenGR00T_v2.py
+
+# Experiment registry: durable, git-tracked eval results.
+# Overrides the broad "*/**/*.md" ignore (.gitignore:240) for this dir ONLY,
+# so per-run experiment docs survive in version control (checkpoints under
+# playground/ are gitignored, so results MUST be recorded here instead).
+!docs/experiments/
+!docs/experiments/*.md
