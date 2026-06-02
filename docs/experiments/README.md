@@ -79,6 +79,9 @@ The "no ControlNet" column of the 2×2. Stereo enters purely through camera-fram
 | `goal_only_30k_mono_primary_official_0520` | 0.88 | 0.81 | 0.94 | 0.88 | 0.91 |
 | `goal_mono_newrender_0523` | 0.89 | — | 0.85 | — | — |
 
+> ⚠️ **CORRECTION (2026-05-29):** `goal_only_30k_qwenpi_0519` is `data_mix=libero_goal` = **primary+WRIST** (Libero4in1DataConfig default), NOT mono — its 0.94/0.96 reflect a *second view (wrist)*, not mono. **True mono-primary** = `goal_only_30k_mono_primary_official_0520` (0.88/0.91, mix libero_goal_mono_official) and `goal_mono_newrender_0523` (0.85-0.89, video_keys=[primary]). So mono-primary ≈ **0.85-0.91**, and adding a second view (wrist OR stereo right_view) lifts it to ~0.94-0.96.
+
+
 ## 🔑 Headline findings
 
 1. **`libero_goal` is saturated.** Mono (0.91–0.96), plain cam_rope stereo (0.86–0.96), FFS-ControlNet (0.90),
@@ -103,3 +106,50 @@ The "no ControlNet" column of the 2×2. Stereo enters purely through camera-fram
 2. Add a row to the relevant table above.
 3. Record run_id, framework + config deltas, dataset, train setup, per-step right_view SR, conclusion.
 4. Do it right after the eval finishes — never leave results in `/tmp`.
+
+## E. FFS-injection comparison — does introducing FFS beat plain cam_rope?
+
+All right_view, libero_goal, 100ep. **Reference (NO FFS): plain cam_rope d16 `goal_phase3b_camrope_0523` = 0.94/0.96 @30k.**
+Every row below injects FFS *backbone (monocular)* features — EXCEPT the gru_hidden row (post-cost-volume net[0], the real stereo signal).
+
+| injection mechanism | run | init | 5k | 10k | 20k | 25k | 30k |
+|---|---|---|---|---|---|---|---|
+| ControlNet→V (residual into vl_embs) | NOEpipolar_ffs_controlnet_fromscratch | fromscratch | (0.45) | — | — | 0.90 | 0.90–0.92 |
+| | epipolar_ffs_controlnet_fromscratch | fromscratch | 0.31 | 0.74 | 0.91 | 0.89 | 0.90 |
+| | epipolar_ffs_controlnet_init_epi25k | warm@epi25k | 0.82 | 0.83 | — | — | — |
+| | NOEpipolar_ffs_controlnet_init_camrope30k | warm@camrope30k | 0.85 | — | — | — | — |
+| ControlVLA branch (parallel K/V in action attn) | controlvla_branch_fromscratch | fromscratch | — | — | — | 0.90 | 0.90–0.91 |
+| | controlvla_branch_initdisp_fromscratch | fromscratch | — | 0.80 | (15k 0.74) | 0.90 | 0.87 |
+| | controlvla_..._initdisp_from_baseline96 | warm@phase3b | — | 0.87 | — | 0.92 | 0.92 |
+| **ControlVLA + gru_hidden (REAL post-CV stereo net[0])** | controlvla_gruhidden_fromscratch_0529 | fromscratch | 0.42 | 0.74 | 0.84 | 0.89 | **0.92** |
+| | controlvla_gruhidden_**warmstart**_0529 | warm@phase3b | 0.82 | 0.90 | (20k 0.94) | 0.94 | **0.92** |
+| **REFERENCE (no FFS)** | **goal_phase3b_camrope_0523** | fromscratch | — | 0.86 | 0.82 | — | **0.94/0.96** |
+
+### Findings
+1. **No FFS-injection variant beats the no-FFS cam_rope baseline (0.94–0.96).** All converge to 0.87–0.92.
+   Injecting FFS *backbone (monocular)* features is net-neutral-to-slightly-harmful on this (saturated) suite.
+2. ControlNet→V (~0.90–0.92) ≈ ControlVLA branch (~0.87–0.92) at convergence — the injection mechanism does not matter.
+3. warm-start consistently > fromscratch (ControlVLA+initdisp: 0.92 vs 0.87; ControlNet epi warm@5k=0.82 vs fromscratch 0.31),
+   but neither clears the baseline.
+4. init_disp adds nothing (ControlVLA+initdisp fromscratch 0.87 ≤ plain ControlVLA fromscratch 0.90–0.91).
+5. **Open: gru_hidden** is the only run that injects the REAL post-cost-volume stereo feature (net[0]) instead of
+   monocular backbone features — the test of whether a genuine stereo signal finally changes this picture.
+   (All prior FFS rows were later found to inject monocular features — see project_ffs_features_are_monocular.)
+
+## F. VLM-ControlNet 3-run ablation (true VLM ControlNet + zero-conv, real stereo net[0])
+
+Detail: `pi_qwen0p8_vlmcontrolnet_ffs_3run_0601.md`. Framework `QwenPIVLMControlNetFFS`: frozen Qwen VLM +
+trunk-copy of the 6 cam_rope softmax layers + per-depth zero-conv residual into VLM hidden states; FFS
+gru_hidden net[0] (real post-cost-volume stereo). Reference (no FFS) = `goal_phase3b_camrope_0523` 0.94/0.96.
+
+| run | what trains | 10k | 20k | 30k |
+|---|---|---|---|---|
+| Run1 head-only (control, no FFS) | action head only | 0.88 | 0.91 | 0.92 |
+| Run2 head+ControlNet | head + branch | 0.93 | 0.96 | 0.93 |
+| Run3 pure ControlNet (frozen head) | branch only | 0.95 | 0.93 | 0.95 |
+
+Decomposition @30k (baseline 0.94): Run3-baseline=+0.01, Run2-Run1=+0.01, Run1-baseline=-0.02 — all within
++/-3-5% noise = **no signal** (libero_goal saturated). **Key contrast vs section E**: this true VLM-ControlNet
+is the **first FFS-injection that stays AT baseline instead of drifting down to 0.87-0.92** (zero-conv +
+trunk-copy avoids the drift the section-E variants suffered). Clean but value-neutral here; decisive test needs a
+non-saturated depth/occlusion suite (stereo4d proposal section 5).
