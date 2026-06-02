@@ -183,6 +183,10 @@ data_processed
 llavavla/conf/qwenvla_lmdb_3Lpretrain.yaml
 extracted_frames
 starVLA/config/deepseeds/*
+!starVLA/config/deepseeds/deepspeed_zero2_ga2.yaml
+!starVLA/config/deepseeds/deepspeed_zero2_ga4.yaml
+!starVLA/config/deepseeds/ds_config_ga2.yaml
+!starVLA/config/deepseeds/ds_config_ga4.yaml
 **/bar
 llavavla/model/openvla_temp
 real_deployment/upload/push_model_to_hf.py
@@ -269,3 +273,6 @@ starVLA/model/framework/VLM4A/QwenGR00T_v2.py
 # playground/ are gitignored, so results MUST be recorded here instead).
 !docs/experiments/
 !docs/experiments/*.md
+
+# third-party LIBERO sim env (646MB) — not tracked
+SSF/libero_sim_env/
