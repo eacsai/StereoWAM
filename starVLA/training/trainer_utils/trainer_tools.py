@@ -148,8 +148,8 @@ def build_param_lr_groups(model, cfg):
         try:
             for attr in module_name.split("."):
                 module = getattr(module, attr)
-            # filter out frozen parameters
-            params = [p for p in module.parameters() if id(p) not in frozen_params]
+            # filter out frozen parameters (freeze_modules paths AND requires_grad=False)
+            params = [p for p in module.parameters() if id(p) not in frozen_params and p.requires_grad]
             if params:  # only add param group if there are trainable parameters
                 param_groups.append({"params": params, "lr": lr, "name": module_name})
                 used_params.update(id(p) for p in params)
@@ -157,9 +157,25 @@ def build_param_lr_groups(model, cfg):
             ReferenceError(f"⚠️ module path `{module_name}` not found in vla")
 
     # assign base learning rate to the remaining unused parameters (exclude frozen ones)
-    other_params = [p for p in model.parameters() if id(p) not in used_params and id(p) not in frozen_params]
+    other_params = [p for p in model.parameters() if id(p) not in used_params and id(p) not in frozen_params and p.requires_grad]
     if other_params:
         param_groups.append({"params": other_params, "lr": base_lr, "name": "base"})
+
+    # CODEX FIX (2026-05-29): never hand requires_grad=False params to the optimizer.
+    # Previously only `freeze_modules` paths were excluded; a framework that freezes a
+    # submodule via requires_grad=False (e.g. the frozen Fast-FoundationStereo inside
+    # QwenPIControlVLAFFS) with an empty freeze_modules would leak its params into the
+    # AdamW/DeepSpeed base group — wasting ZeRO master-copy memory and risking dtype /
+    # resume mismatches when that frozen module is recast at runtime. The `p.requires_grad`
+    # filters above exclude them; assert here that none slipped through.
+    n_no_grad_in_opt = sum(1 for g in param_groups for p in g["params"] if not p.requires_grad)
+    assert n_no_grad_in_opt == 0, (
+        f"[optimizer] {n_no_grad_in_opt} requires_grad=False params leaked into optimizer groups"
+    )
+    n_opt = sum(len(g["params"]) for g in param_groups)
+    n_frozen_total = sum(1 for p in model.parameters() if not p.requires_grad)
+    print(f"[optimizer] {n_opt} trainable params in {len(param_groups)} groups; "
+          f"excluded {n_frozen_total} frozen (requires_grad=False) params")
 
     return param_groups
 
