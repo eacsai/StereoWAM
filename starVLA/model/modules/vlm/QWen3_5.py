@@ -101,6 +101,23 @@ class _QWen3_5_VL_Interface(nn.Module):
 
         return outputs
 
+    def enable_input_require_grads(self):
+        """Enable input embedding grads for PEFT LoRA with gradient checkpointing."""
+        if hasattr(self.model, "enable_input_require_grads"):
+            self.model.enable_input_require_grads()
+            logger.info("Enabled input require grads on Qwen3.5 VLM wrapper model")
+            return
+
+        embeddings = self.model.get_input_embeddings()
+        if getattr(self, "_input_require_grads_hook", None) is not None:
+            return
+
+        def _make_inputs_require_grad(_module, _inputs, output):
+            output.requires_grad_(True)
+
+        self._input_require_grads_hook = embeddings.register_forward_hook(_make_inputs_require_grad)
+        logger.info("Installed fallback input require grads hook on Qwen3.5 embeddings")
+
     def generate(
         self,
         **kwargs,

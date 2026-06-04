@@ -191,6 +191,9 @@ class Qwen_PI(baseframework):
         # Zero Init → step-0 byte-identical to baseline.
         self._stereo_cam_rope_state = None
         self._stereo_cam_rope_layers = None
+        self._stereo_cam_rope_top_hook_handle = None
+        self._stereo_cam_rope_top_hook_fn = None
+        self._stereo_cam_rope_reinstall_top_hook = None
         if bool(self.config.framework.qwenvl.get("stereo_cam_rope_enabled", False)):
             self._stereo_cam_rope_state, scl_modules = install_stereo_cam_rope_hooks(
                 self.qwen_vl_interface.model,
@@ -203,6 +206,13 @@ class Qwen_PI(baseframework):
                 spatial_merge_size=int(self.config.framework.qwenvl.get("stereo_cam_rope_spatial_merge", 2)),
                 init_mode=str(self.config.framework.qwenvl.get("stereo_cam_rope_init_mode", "zero")),
                 epipolar_mask_enabled=bool(self.config.framework.qwenvl.get("stereo_epipolar_mask_enabled", False)),
+            )
+            self._stereo_cam_rope_top_hook_handle = getattr(
+                self._stereo_cam_rope_state, "top_pre_hook_handle", None
+            )
+            self._stereo_cam_rope_top_hook_fn = getattr(self._stereo_cam_rope_state, "top_pre_hook_fn", None)
+            self._stereo_cam_rope_reinstall_top_hook = getattr(
+                self._stereo_cam_rope_state, "reinstall_top_pre_hook", None
             )
             # B-1a (codex round-1 fix): fail-closed startup check. install_*_hooks
             # already raises if no Qwen3_5Attention layers exist, but we double-check
@@ -228,7 +238,7 @@ class Qwen_PI(baseframework):
         def _is_stereo_key(k):
             if k.startswith("stereo_cam_embed.") or k.startswith("stereo_cam_rope_layers."):
                 return True
-            if "qwen_vl_interface.model.model.language_model.layers." in k                and ".self_attn.stereo_cam_layer." in k:
+            if ".language_model.layers." in k and ".self_attn.stereo_cam_layer." in k:
                 return True
             return False
 

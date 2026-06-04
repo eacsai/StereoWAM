@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import math
 from types import MethodType
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -54,6 +54,9 @@ class StereoCamRoPEState:
         # === Phase 4 epipolar mask support (backward compat: disabled by default) ===
         self.per_token_row_id: Optional[torch.Tensor] = None  # (B, S) long, -1=text/non-image
         self.epipolar_mask_enabled: bool = False
+        self.top_pre_hook_handle: Optional[torch.utils.hooks.RemovableHandle] = None
+        self.top_pre_hook_fn: Optional[Callable] = None
+        self.reinstall_top_pre_hook: Optional[Callable] = None
 
 
 # --------------------------------------------------------------------------- #
@@ -354,6 +357,21 @@ _PATCHED_FORWARD_DISPATCH = {
 }
 
 
+def reinstall_stereo_cam_rope_outer_hook(
+    top_module,
+    outer_hook_fn: Callable,
+) -> torch.utils.hooks.RemovableHandle:
+    """Attach the cam-rope outer bookkeeping hook to a top-level wrapper."""
+    handle = top_module.register_forward_pre_hook(outer_hook_fn, with_kwargs=True)
+    setattr(handle, "stereo_cam_rope_outer_hook_fn", outer_hook_fn)
+    setattr(
+        handle,
+        "reinstall_outer_hook",
+        lambda new_top_module: reinstall_stereo_cam_rope_outer_hook(new_top_module, outer_hook_fn),
+    )
+    return handle
+
+
 def install_stereo_cam_rope_hooks(
     hf_model,
     d_c: int = 16,
@@ -480,7 +498,10 @@ def install_stereo_cam_rope_hooks(
         else:
             state.per_token_row_id = None
 
-    hf_model.register_forward_pre_hook(_pre_forward_hook, with_kwargs=True)
+    top_hook_handle = reinstall_stereo_cam_rope_outer_hook(hf_model, _pre_forward_hook)
+    state.top_pre_hook_handle = top_hook_handle
+    state.top_pre_hook_fn = _pre_forward_hook
+    state.reinstall_top_pre_hook = getattr(top_hook_handle, "reinstall_outer_hook")
 
     import logging
     unique_cls = sorted(set(patched_attn_classes))
