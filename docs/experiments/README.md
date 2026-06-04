@@ -153,3 +153,24 @@ Decomposition @30k (baseline 0.94): Run3-baseline=+0.01, Run2-Run1=+0.01, Run1-b
 is the **first FFS-injection that stays AT baseline instead of drifting down to 0.87-0.92** (zero-conv +
 trunk-copy avoids the drift the section-E variants suffered). Clean but value-neutral here; decisive test needs a
 non-saturated depth/occlusion suite (stereo4d proposal section 5).
+
+## G. Depth-token FFS 3-run ablation (FFS feature as SEQUENCE TOKENS, not a residual)
+
+Detail: `pi_qwen0p8_depthtoken_ffs_3run_0603.md`. New injection family: the FFS post-cost-volume stereo feature
+(gru_hidden net[0]) is `adaptive_pool`'d to 16 cells and inserted as **16 depth TOKENS** into the Qwen
+image+text sequence (S→S+16, the VLM's self-attention fuses them; tokens sliced out before the action expert
+so downstream is unchanged). Distinct from sections E/F which inject a *residual* without changing sequence
+length. Frameworks `QwenPIDepthTokenFFS` / `QwenPIDepthTokenLoRAFFS`. Reference (no FFS) = `goal_phase3b_camrope_0523` 0.94/0.96.
+
+| run | adaptation | LR (projector) | 10k | 20k | 30k |
+|---|---|---|---|---|---|
+| Run A frozen-VLM (warm-start 0.94) | projector + head; VLM frozen | base ~1e-5 (low) | 0.89 | 0.92 | 0.90 |
+| Run B LoRA (warm-start 0.94) | LoRA r16/α32 + projector + head | **1e-4 (high)** | 0.83 | 0.94 | 0.93 |
+| Run C full / fromscratch (STRESS) | everything, no warm-start | base | 0.57 | 0.88 | 0.94 |
+
+Decomposition @30k (baseline 0.94): A−base=−0.04, B−base=−0.01, C−base=0.00 — all within ±3-5% noise = **no
+signal**. **A-vs-B is a clean null**: LoRA + high projector LR does NOT beat frozen + low LR. All three
+adaptation paradigms land in the **same 0.90-0.94 band** as gru_hidden (0.92) and VLM-ControlNet (0.92-0.95)
+→ Nth confirmation the bottleneck is the **suite, not the mechanism / feature / capacity / adaptation strategy**.
+Run C is confounded (fromscratch+full+depth) and not a clean attribution point. Decisive test still needs a
+non-saturated depth/occlusion suite (stereo4d proposal section 5).
