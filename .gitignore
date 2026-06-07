@@ -276,3 +276,6 @@ starVLA/model/framework/VLM4A/QwenGR00T_v2.py
 
 # third-party LIBERO sim env (646MB) — not tracked
 SSF/libero_sim_env/
+
+# backup snapshots (never commit)
+*.bak*
