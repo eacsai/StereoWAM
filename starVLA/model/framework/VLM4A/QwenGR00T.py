@@ -76,6 +76,7 @@ class QwenGR00TDefaultConfig:
             "stereo_cam_rope_image_height": 256,
             "stereo_cam_rope_spatial_merge": 2,
             "stereo_cam_rope_init_mode": "zero",
+            "stereo_cam_rope_right_first": True,
             # === Phase 4 epipolar attention mask ===
             "stereo_epipolar_mask_enabled": False,
         }
@@ -181,6 +182,7 @@ class Qwen_GR00T(baseframework):
                 spatial_merge_size=int(self.config.framework.qwenvl.get("stereo_cam_rope_spatial_merge", 2)),
                 init_mode=str(self.config.framework.qwenvl.get("stereo_cam_rope_init_mode", "zero")),
                 epipolar_mask_enabled=bool(self.config.framework.qwenvl.get("stereo_epipolar_mask_enabled", False)),
+                right_first=bool(self.config.framework.qwenvl.get("stereo_cam_rope_right_first", True)),
             )
             if not scl_modules:
                 raise RuntimeError(

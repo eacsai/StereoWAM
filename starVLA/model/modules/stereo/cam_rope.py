@@ -70,19 +70,24 @@ def compute_libero_camera_P_stack(
     image_width: int = 256,
     image_height: int = 256,
     baseline_m: float = 0.06,
+    right_first: bool = True,
 ) -> torch.Tensor:
     """Compute the per-camera P_t matrices for LIBERO 2-camera stereo.
 
     Returns
     -------
     P_stack : (num_cameras=2, 4, 4) float32 tensor
-        P_stack[0] = P_left  = lift(K_norm) @ T_left  (T_left  = I_4)
-        P_stack[1] = P_right = lift(K_norm) @ T_right (T_right shifts +baseline_m in X)
+        P_stack[0] = P_right = lift(K_norm) @ T_right (right_view, +baseline_m in X) -- RIGHT-FIRST
+        P_stack[1] = P_left  = lift(K_norm) @ T_left  (primary, origin)
 
     Notes
     -----
     LIBERO agentview's default fovy is 45 degrees; render resolution 256x256.
     These are configurable (in case future renders use a different camera).
+
+    right_first (default True): P_stack[0]=right_view(+baseline), [1]=primary(origin),
+    matching the right-first convention (video_keys=[right_view, primary]). Set
+    right_first=False for OLD left-first runs (video_keys=[primary, right_view]).
     """
     f = (image_height / 2.0) / math.tan(math.radians(fovy_degrees / 2.0))
     K = torch.tensor([
@@ -99,7 +104,8 @@ def compute_libero_camera_P_stack(
 
     P_left = K_4 @ T_left
     P_right = K_4 @ T_right
-    return torch.stack([P_left, P_right], dim=0)  # (2, 4, 4)
+    order = [P_right, P_left] if right_first else [P_left, P_right]
+    return torch.stack(order, dim=0)  # right_first(default): cam0=right_view(+baseline); else left-first (old): cam0=primary(origin)
 
 
 # --------------------------------------------------------------------------- #

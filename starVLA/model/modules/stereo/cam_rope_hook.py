@@ -80,8 +80,10 @@ def compute_per_token_cam_id(
         Each row is (t, h_raw, w_raw); merged token count per image is
         t * (h_raw // spatial_merge_size) * (w_raw // spatial_merge_size).
         If None, no images -> all -1.
-    num_cameras : default 2 (left, right). Image index within a sample is
-        taken modulo num_cameras (so cam_id alternates 0, 1, 0, 1, ...).
+    num_cameras : default 2 (left, right). Images are laid out CAMERA-MAJOR
+        (outer camera, inner frame), so cam_id = img_idx // num_frames where
+        num_frames = images_per_sample // num_cameras (single-frame stereo -> [0,1];
+        3-frame stereo -> [0,0,0,1,1,1]). NOT modulo (that assumes interleaving).
     spatial_merge_size : Qwen3.5-VL default 2.
 
     Returns
@@ -117,6 +119,12 @@ def compute_per_token_cam_id(
         starts = (diff == 1).nonzero(as_tuple=True)[0].tolist()
         diff_end = torch.diff(mask_b.int(), append=torch.zeros(1, dtype=torch.int, device=mask_b.device))
         ends = ((diff_end == -1).nonzero(as_tuple=True)[0] + 1).tolist()  # exclusive ends
+        # camera-major layout (outer camera, inner frame): images_per_camera = num_frames.
+        # cam_id = img_idx // num_frames (NOT % num_cameras, which assumes interleaving).
+        _nc = max(int(num_cameras), 1)
+        if len(starts) % _nc != 0:
+            raise ValueError(f"[cam_rope] {len(starts)} images not a multiple of num_cameras={_nc}; camera-major layout broken (mono+cam_rope? set num_cameras=1)")
+        num_frames_b = max(len(starts) // _nc, 1)
         for img_idx_in_sample, (s_start, s_end) in enumerate(zip(starts, ends)):
             if img_idx_global >= len(per_image_n):
                 break
@@ -127,7 +135,7 @@ def compute_per_token_cam_id(
                 # Up to caller to investigate (a warning is logged once by the framework).
                 img_idx_global += 1
                 continue
-            cam_id = img_idx_in_sample % num_cameras
+            cam_id = (img_idx_in_sample // num_frames_b) % max(int(num_cameras), 1)
             out[b, s_start:s_end] = cam_id
             img_idx_global += 1
 
@@ -383,6 +391,7 @@ def install_stereo_cam_rope_hooks(
     spatial_merge_size: int = 2,
     init_mode: str = 'zero',
     epipolar_mask_enabled: bool = False,
+    right_first: bool = True,
 ) -> Tuple[StereoCamRoPEState, List[StereoCamRoPELayer]]:
     """Walk hf_model's language_model.layers, attach StereoCamRoPELayer to each
     supported standard attention layer (Qwen3_5Attention),
@@ -409,6 +418,7 @@ def install_stereo_cam_rope_hooks(
         image_width=image_width,
         image_height=image_height,
         baseline_m=baseline_m,
+        right_first=right_first,
     )
 
     state = StereoCamRoPEState()
