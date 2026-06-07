@@ -19,8 +19,8 @@ from starVLA.dataloader.gr00t_lerobot.embodiment_tags import EmbodimentTag
 class Libero4in1StereoDataConfig:
     embodiment_tag = EmbodimentTag.FRANKA
     video_keys = [
-        "video.primary_image",    # left eye (== original agentview)
         "video.right_view",       # right eye (baseline 6cm)  ★ SSF new
+        "video.primary_image",    # left eye (== original agentview)
         # NOTE: wrist dropped in Phase 1 (no wrist stereo). Deferred to Phase 1.5.
     ]
     state_keys = [
