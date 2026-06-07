@@ -174,3 +174,21 @@ adaptation paradigms land in the **same 0.90-0.94 band** as gru_hidden (0.92) an
 → Nth confirmation the bottleneck is the **suite, not the mechanism / feature / capacity / adaptation strategy**.
 Run C is confounded (fromscratch+full+depth) and not a clean attribution point. Decisive test still needs a
 non-saturated depth/occlusion suite (stereo4d proposal section 5).
+
+## H. Qwen2.5-VL-3B 4-suite input-view ablation (stereo vs mono vs primary+wrist) — IN-PROGRESS
+
+Strong-backbone (Qwen2.5-VL-3B + GR00T, **no cam_rope, no FFS**) plain input-view baselines on the
+NEW 4-suite stereo data (spatial/object/goal/libero_10 joint, eff128, 30k, fromscratch). All 3 runs
+share ONE dataset (`LEROBOT_LIBERO_STEREO_4SUITE`); only the read channels differ → stereo−mono is a
+clean apples-to-apples (only right_view differs). Detail + live results table:
+`docs/experiments/qwen2p5vl_3baseline_inputview_0604.md`.
+
+| run | step | spatial | object | goal | libero_10 | mean |
+|---|---|---|---|---|---|---|
+| stereo (primary+right) | 10k | 0.45 | 0.39 | 0.53 | 0.07 | ≈0.36 |
+| stereo / mono / primary+wrist | 20k,30k | — | — | — | — | running (h100b chain) |
+
+10k stereo = short-validation gate (PASSED: pipeline OK, state=None train/eval matched, numbers
+in-range for early fromscratch 4-suite-joint). Purpose = validate stereo on strong backbone + hard
+data before adding cam_rope / FFS-hybrid. Auto: training launchers in `scripts/h100b/` (run_qwen2p5vl3b_groot_4suite_stereo.sh + chain_*.sh),
+eval daemon `scripts/4090d/auto_eval_qwen2p5vl_3baseline.sh`.
