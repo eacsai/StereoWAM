@@ -1371,10 +1371,11 @@ class LeRobotSingleDataset(Dataset):
     def _pack_sample(self, data: dict) -> dict:
         """Pack transformed modality data into training sample format."""
         step_images = []
-        for video_key in self.modality_keys["video"]:
-            image = data[video_key][0]
-            image = Image.fromarray(image).resize((224, 224))
-            step_images.append(image)
+        for video_key in self.modality_keys["video"]:          # camera-major (outer: camera)
+            frames = data[video_key]                            # (T,H,W,C); T=len(observation_indices)
+            for f in range(frames.shape[0]):                    # inner: frame, time-ascending (current frame last)
+                image = Image.fromarray(frames[f]).resize((224, 224))
+                step_images.append(image)
 
         language = data[self.modality_keys["language"][0]][0]
         action = []
@@ -1396,6 +1397,10 @@ class LeRobotSingleDataset(Dataset):
             state = np.concatenate(state, axis=1).astype(np.float16)
             sample["state"] = state
 
+        if __import__("os").environ.get("MF_DEBUG") and getattr(type(self), "_mfdbg_n", 0) < 6:
+            type(self)._mfdbg_n = getattr(type(self), "_mfdbg_n", 0) + 1
+            import numpy as _npd
+            print(f"[MFDBG-pack] n_images={len(step_images)} cams={self.modality_keys['video']} frame_means={[round(float(_npd.asarray(im).mean()),1) for im in step_images]}", flush=True)
         return sample
 
     def get_step_data(self, trajectory_id: int, base_index: int) -> dict:

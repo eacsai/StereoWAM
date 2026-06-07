@@ -6,6 +6,7 @@
 from abc import ABC, abstractmethod
 
 from starVLA.dataloader.gr00t_lerobot.datasets import ModalityConfig
+from starVLA.dataloader.gr00t_lerobot.embodiment_tags import EmbodimentTag
 from starVLA.dataloader.gr00t_lerobot.transform.base import ComposedModalityTransform, ModalityTransform
 from starVLA.dataloader.gr00t_lerobot.transform.concat import ConcatTransform
 from starVLA.dataloader.gr00t_lerobot.transform.state_action import (
@@ -436,6 +437,7 @@ class SingleFrankaRobotiqDeltaEefDataConfig:
 ###########################################################################################
 
 class Libero4in1DataConfig:
+    embodiment_tag = EmbodimentTag.FRANKA
     video_keys = [
         "video.primary_image",
         "video.wrist_image",
@@ -1066,8 +1068,51 @@ class VLAArenaFrankaDataConfig:
 
 ###########################################################################################
 
+class Libero4in1_3FrameDataConfig(Libero4in1DataConfig):
+    observation_indices = [-2, -1, 0]
+
+
+class Libero4in1_3FrameMonoDataConfig(Libero4in1_3FrameDataConfig):
+    video_keys = ["video.primary_image"]
+
+
+class Libero4in1_3FrameStereoDataConfig(Libero4in1_3FrameDataConfig):
+    video_keys = ["video.primary_image", "video.right_view"]
+
+
+class Libero4in1MonoDataConfig(Libero4in1DataConfig):
+    video_keys = ["video.primary_image"]
+
+
+class Libero4in1StereoDataConfig(Libero4in1DataConfig):
+    video_keys = ["video.primary_image", "video.right_view"]
+
+
+class Libero4in1_3FrameInterval0p5sDataConfig(Libero4in1DataConfig):
+    # 4D temporal, 3 frames at 0.5s interval [t-20,t-10,t] @20fps = GaussianDream-matched (0.5s adjacent vs stride-1 ~0.1s)
+    observation_indices = [-20, -10, 0]
+
+
+class Libero4in1StereoRightPrimaryDataConfig(Libero4in1DataConfig):
+    # single-frame stereo, RIGHT-FIRST: right_view then primary (feedback_stereo_view_order)
+    video_keys = ["video.right_view", "video.primary_image"]
+
+
+class Libero4in1_3FrameStereoRightPrimaryDataConfig(Libero4in1_3FrameDataConfig):
+    # 3-frame stereo, RIGHT-FIRST: right_view then primary (feedback_stereo_view_order)
+    video_keys = ["video.right_view", "video.primary_image"]
+
+
 ROBOT_TYPE_CONFIG_MAP = {
     "libero_franka": Libero4in1DataConfig(),
+    "libero_franka_3frame": Libero4in1_3FrameDataConfig(),
+    "libero_franka_3frame_interval0p5s": Libero4in1_3FrameInterval0p5sDataConfig(),
+    "libero_franka_3frame_mono": Libero4in1_3FrameMonoDataConfig(),
+    "libero_franka_3frame_stereo": Libero4in1_3FrameStereoDataConfig(),
+    "libero_franka_sfstereo_rightprimary": Libero4in1StereoRightPrimaryDataConfig(),
+    "libero_franka_3frame_stereo_rightprimary": Libero4in1_3FrameStereoRightPrimaryDataConfig(),
+    "libero_franka_mono": Libero4in1MonoDataConfig(),
+    "libero_franka_sfstereo": Libero4in1StereoDataConfig(),
     "oxe_droid": OxeDroidDataConfig(),
     "oxe_bridge": OxeBridgeDataConfig(),
     "oxe_rt1": OxeRT1DataConfig(),
