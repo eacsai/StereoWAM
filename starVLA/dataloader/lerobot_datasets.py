@@ -40,11 +40,14 @@ def make_LeRobotSingleDataset(
     modality_config = data_config.modality_config()
     transforms = data_config.transform()
     dataset_path = data_root_dir / data_name
-    if robot_type not in ROBOT_TYPE_TO_EMBODIMENT_TAG:
-        print(f"Warning: Robot type {robot_type} not found in ROBOT_TYPE_TO_EMBODIMENT_TAG, using {EmbodimentTag.NEW_EMBODIMENT} as default")
-        embodiment_tag = EmbodimentTag.NEW_EMBODIMENT
-    else:
-        embodiment_tag = ROBOT_TYPE_TO_EMBODIMENT_TAG[robot_type]
+    # Prefer the DataConfig.embodiment_tag classvar (Proposal A); fall back to the map.
+    embodiment_tag = getattr(data_config, "embodiment_tag", None)
+    if embodiment_tag is None:
+        if robot_type not in ROBOT_TYPE_TO_EMBODIMENT_TAG:
+            print(f"Warning: Robot type {robot_type} has no embodiment_tag classvar and not in ROBOT_TYPE_TO_EMBODIMENT_TAG, using {EmbodimentTag.NEW_EMBODIMENT} as default")
+            embodiment_tag = EmbodimentTag.NEW_EMBODIMENT
+        else:
+            embodiment_tag = ROBOT_TYPE_TO_EMBODIMENT_TAG[robot_type]
     
     video_backend = data_cfg.get("video_backend", "decord") if data_cfg else "torchvision_av"
     return LeRobotSingleDataset(
