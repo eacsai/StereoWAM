@@ -10,10 +10,18 @@
 #   EVAL_DIR   output dir for server.log / client.log / videos
 #   TASK_SUITE libero suite name           (default: libero_goal)
 #   VIDEO_KEYS comma-separated camera keys  (default: primary,right_view  -- STEREO models, NO wrist)
+#   NUM_OBS_FRAMES  consecutive frames per camera (default 1; 3-frame ckpts MUST pass 3)
 #              mono ckpts: "primary" ; stereo ckpts: "primary,right_view". Never "primary,wrist" here.
 set -euo pipefail
 
-CKPT="$1"; GPU="$2"; PORT="$3"; EVAL_DIR="$4"; TASK_SUITE="${5:-libero_goal}"; VIDEO_KEYS="${6:-primary,right_view}"
+# Cap CPU threads per eval process (FIX 2026-06-05): server(torch)+client(mujoco/numpy)
+# otherwise each spawns ~1 thread/core on this 384-core shared box -> CPU oversubscription
+# that hammers the shared machine. 8 threads is plenty for single-env sim + GPU-bound inference.
+export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8 NUMEXPR_NUM_THREADS=8 VECLIB_MAXIMUM_THREADS=8
+
+CKPT="$1"; GPU="$2"; PORT="$3"; EVAL_DIR="$4"; TASK_SUITE="${5:-libero_goal}"; VIDEO_KEYS="${6:-primary,right_view}"; NUM_OBS_FRAMES="${7:-1}"; OBS_INDICES="${8:-}"
+# back-compat: derive stride-1 obs_indices from NUM_OBS_FRAMES if 8th arg omitted
+if [ -z "$OBS_INDICES" ]; then OBS_INDICES="0"; for ((k=1; k<=NUM_OBS_FRAMES-1; k++)); do OBS_INDICES="-$k,$OBS_INDICES"; done; fi
 STARVLA_DIR=/data/wangqiwei/ICLR2026/starVLA
 LIBERO_VENV=/data/wangqiwei/ICLR2026/SSF/libero_sim_env/.venv/bin/python
 LIBERO_HOME=/data/wangqiwei/ICLR2026/SSF/libero_sim_env/LIBERO
@@ -47,13 +55,29 @@ done
 export LIBERO_HOME LIBERO_CONFIG_PATH="${LIBERO_HOME}/libero"
 export PYTHONPATH="${LIBERO_HOME}:${STARVLA_DIR}:${PYTHONPATH:-}"
 export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl
+# Pin this lane's EGL render to its own GPU (FIX 2026-06-04): the server is CUDA_VISIBLE_DEVICES-pinned
+# but the client's mujoco EGL render was not -> N parallel lanes all rendered on the default GPU0 (contention).
+export MUJOCO_EGL_DEVICE_ID="$GPU"
 
+set +e
 $LIBERO_VENV examples/LIBERO/eval_files/eval_libero.py \
   --args.pretrained-path "$CKPT" --args.host 127.0.0.1 --args.port "$PORT" \
   --args.task-suite-name "$TASK_SUITE" --args.num-trials-per-task 10 --args.max-tasks -1 \
   --args.video-keys "$VIDEO_KEYS" \
+  --args.num-obs-frames "$NUM_OBS_FRAMES" \
+  --args.obs-indices "$OBS_INDICES" \
   --args.video-out-path "$EVAL_DIR/videos" \
-  > "$EVAL_DIR/client.log" 2>&1 || true
+  > "$EVAL_DIR/client.log" 2>&1
+CLIENT_RC=$?
+set -e
+# fail-closed (codex round-2): do NOT swallow eval_libero.py multi-frame asserts/ValueErrors.
+# Non-zero client AND no success line => hard fail (kill server, exit).
+if [ "$CLIENT_RC" -ne 0 ] && ! grep -q "Total success rate" "$EVAL_DIR/client.log" 2>/dev/null; then
+  echo "  [FATAL] eval client failed (rc=$CLIENT_RC, no success line) -- see $EVAL_DIR/client.log"
+  grep -iE "ValueError|AssertionError|num.obs.frames|image_list len|duplicate" "$EVAL_DIR/client.log" 2>/dev/null | tail -5
+  kill -9 $SERVER_PID 2>/dev/null || true
+  exit 5
+fi
 
 echo "  [RESULT] $(grep 'Total success rate' "$EVAL_DIR/client.log" | tail -1)  ($(date))"
 kill -9 $SERVER_PID 2>/dev/null || true

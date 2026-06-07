@@ -1,4 +1,5 @@
 import dataclasses
+from collections import deque
 import json
 import logging
 import math
@@ -95,6 +96,13 @@ class Args:
                                        # Default backward compat. Mono primary-only ckpts: --args.video-keys primary.
                                        # Stereo ckpts: --args.video-keys primary,right_view.
 
+    obs_indices: str = "0"  # NEW (2026-06-07): full observation_indices from ckpt DataConfig
+                            # ("0" single / "-2,-1,0" stride1 / "-4,-2,0" stride2); buffer
+                            # samples frames at these offsets -> supports any stride.
+    num_obs_frames: int = 1  # NEW (2026-06-06 multi-frame): consecutive obs frames per camera;
+                             # MUST match training observation_indices length (single=1, 3-frame=3).
+                             # Set by eval driver from ckpt config.
+
     stereo_baseline: float = 0.06  # NEW (2026-05-20): rightview camera baseline in meters.
                                    # Only used when video_keys contains "right_view". 0.06 (6cm) matches
                                    # scripts/4090d/regenerate_libero_stereo.py default — keep in sync.
@@ -168,6 +176,18 @@ def eval_libero(args: Args) -> None:
         )
     if not requested_video_keys:
         raise ValueError("--args.video-keys must list at least one key (e.g. 'primary')")
+    # multi-frame fail-closed validation
+    if len(requested_video_keys) != len(set(requested_video_keys)):
+        raise ValueError(f"--args.video-keys has duplicates: {requested_video_keys}")
+    _obs_idx = [int(x) for x in str(args.obs_indices).split(",") if x.strip() != ""]
+    if not _obs_idx:
+        raise ValueError(f"--args.obs-indices empty: {args.obs_indices!r}")
+    if any(i > 0 for i in _obs_idx):
+        raise ValueError(f"--args.obs-indices must be <=0 (past/current frames): {_obs_idx}")
+    _obs_buf_maxlen = max(-min(_obs_idx), 0) + 1
+    if args.num_obs_frames != len(_obs_idx):
+        raise ValueError(f"num_obs_frames={args.num_obs_frames} != len(obs_indices)={len(_obs_idx)} {_obs_idx} -- fail-closed")
+    logging.info(f"[eval] obs_indices={_obs_idx} buffer_maxlen={_obs_buf_maxlen} (per-camera, supports stride)")
 
     logging.info(f"[eval] gripper_convention={args.gripper_convention}  video_keys={requested_video_keys}  include_state={args.include_state}")
 
@@ -250,6 +270,10 @@ def eval_libero(args: Args) -> None:
             # Set initial states
             obs = env.set_init_state(initial_states[episode_idx])
 
+            # NEW (2026-06-06 multi-frame): per-camera rolling buffer, re-created each
+            # episode so it auto-clears (no cross-episode frame bleed).
+            _obs_bufs = {k: deque(maxlen=_obs_buf_maxlen) for k in requested_video_keys}
+
             # Setup
             t = 0
             replay_images = []
@@ -331,12 +355,33 @@ def eval_libero(args: Args) -> None:
                 }
                 if use_stereo:
                     _img_map["right_view"] = observation["observation.right_view"][0]
-                _selected = [k.strip() for k in args.video_keys.split(",") if k.strip()]
-                image_list = [_img_map[k] for k in _selected if k in _img_map]
+                # multi-frame: append current frame per camera, then sample at obs_indices
+                # offsets (CAMERA-MAJOR, time-ascending, current frame last). Front-pad via
+                # clamp to first buffered frame (mirrors training get_video np.maximum(idx,0)).
+                image_list = []
+                for _k in requested_video_keys:
+                    if _k not in _img_map:
+                        continue
+                    _obs_bufs[_k].append(_img_map[_k])
+                    _buf = list(_obs_bufs[_k])      # most recent frames, _buf[-1]=current
+                    for _i in _obs_idx:             # e.g. [-4,-2,0] -> t-4,t-2,t (current last)
+                        _j = len(_buf) - 1 + _i     # _i<=0, relative to current
+                        image_list.append(_buf[_j if _j >= 0 else 0])  # clamp to first
+                if len(image_list) != len(requested_video_keys) * len(_obs_idx):
+                    raise ValueError(
+                        f"image_list len {len(image_list)} != "
+                        f"{len(requested_video_keys)}*{len(_obs_idx)} (multi-frame fail-closed)"
+                    )
                 example_dict = {
                     "image": image_list,
                     "lang": observation["instruction"][0],
                 }
+                # NOTE (2026-06-04): do NOT forward observation.state here. The action heads
+                # (QwenPI / QwenGR00T) gate `state = example["state"] if "state" in examples[0] else None`
+                # and handle state=None gracefully (state_encoder skipped). The eval-built state is 8-dim
+                # (eef_pos3 + axisangle3 + gripper_qpos2) but the trained state_encoder is 7-dim -> forwarding
+                # it crashes (mat 1x8 vs 7x1024). The proven-working evals (0.8B stereo @0.90) all ran with
+                # state=None. If a future model truly needs proprioception at eval, build a matching 7-dim state.
 
                 start_time = time.time()
 
