@@ -358,12 +358,26 @@ def install_vlm_controlnet_hooks(
             return None
         inputs_embeds = kwargs.get("inputs_embeds", None)
         if inputs_embeds is None:
-            return None
+            # Fail loud (mirrors ffs_vlm_inject): FFS features are staged for THIS
+            # forward — silently skipping would degrade the whole ControlNet branch
+            # to baseline with zero errors if the transformers calling convention
+            # ever stops passing inputs_embeds to language_model.
+            raise RuntimeError(
+                "[vlm_controlnet] FFS hint staged but language_model received no "
+                "inputs_embeds — injection would be silently skipped. The qwen_vl "
+                "calling convention changed; refusing to continue."
+            )
 
         cam = state.per_token_cam_id
         ffs = state.ffs_feat
         add = torch.zeros_like(inputs_embeds)
         B = inputs_embeds.shape[0]
+        if ffs.shape[0] != B or cam.shape[0] != B:
+            raise RuntimeError(
+                f"[vlm_controlnet] staged FFS state batch ({ffs.shape[0]}/{cam.shape[0]}) "
+                f"!= inputs_embeds batch ({B}) — stale state from a previous forward; "
+                "refusing silent cross-batch feature injection."
+            )
         for b in range(B):
             primary_pos = (cam[b] == primary_cam_id).nonzero(as_tuple=True)[0]
             n_primary = int(primary_pos.numel())

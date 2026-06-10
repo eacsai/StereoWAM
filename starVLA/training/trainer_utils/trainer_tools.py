@@ -282,7 +282,7 @@ class TrainerUtils:
         return num_params, num_trainable_params
 
     @staticmethod
-    def load_pretrained_backbones(model, checkpoint_path=None, reload_modules=None):
+    def load_pretrained_backbones(model, checkpoint_path=None, reload_modules=None, init_from_baseline=False):
         """
         load checkpoint:
         - if reload_modules is set, load by path part
@@ -328,7 +328,19 @@ class TrainerUtils:
                     print(f"❌ cannot find module path: {path}")
         else:  # full load
             try:
-                model.load_state_dict(checkpoint, strict=False)
+                # Full-model load. init_from_baseline comes from the CALLER:
+                # True only on the explicit pretrained_checkpoint warm-start path
+                # (new-module keys may be fresh-initialised); False on RESUME and
+                # any other full load (a resume checkpoint missing adapter keys is
+                # corruption and must fail loud, not silently re-init mid-training).
+                import inspect as _inspect
+
+                if "init_from_baseline" in _inspect.signature(model.load_state_dict).parameters:
+                    model.load_state_dict(
+                        checkpoint, strict=False, init_from_baseline=bool(init_from_baseline)
+                    )
+                else:
+                    model.load_state_dict(checkpoint, strict=False)
                 if is_main_process():
                     print("✅ loaded <full_model> model parameters")
                 loaded_modules = ["<full_model>"]

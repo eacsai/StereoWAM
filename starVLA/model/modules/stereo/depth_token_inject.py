@@ -2,7 +2,9 @@
 
 This module turns the frozen FoundationStereo net[0] feature into a short run
 of learned depth tokens, then inserts those tokens into the Qwen VLM sequence
-right after the primary-view image-token run.
+immediately BEFORE the primary-view (left) image-token run (see the insertion
+point in the language_model pre-hook below), reusing the primary cell's
+position id.
 
 The framework computes and stashes the depth tokens before the VLM forward.
 Two pre-hooks then handle sequence bookkeeping:
@@ -66,8 +68,13 @@ class DepthTokenProjector(nn.Module):
 class DepthTokenInjectState:
     depth_tokens: Optional[torch.Tensor] = None
     per_token_cam_id: Optional[torch.Tensor] = None
+    original_per_token_cam_id: Optional[torch.Tensor] = None
     insert_idx: Optional[torch.Tensor] = None
     keep_mask: Optional[torch.Tensor] = None
+    position_ids_before: Optional[torch.Tensor] = None
+    position_ids_after: Optional[torch.Tensor] = None
+    inserted_depth_embeds: Optional[torch.Tensor] = None
+    original_seq_len: Optional[int] = None
     primary_cam_id: int = 0
 
 
@@ -81,8 +88,13 @@ def set_depth_tokens(depth_tokens: torch.Tensor) -> None:
 def clear_state() -> None:
     _STATE.depth_tokens = None
     _STATE.per_token_cam_id = None
+    _STATE.original_per_token_cam_id = None
     _STATE.insert_idx = None
     _STATE.keep_mask = None
+    _STATE.position_ids_before = None
+    _STATE.position_ids_after = None
+    _STATE.inserted_depth_embeds = None
+    _STATE.original_seq_len = None
 
 
 def get_state() -> DepthTokenInjectState:
@@ -98,7 +110,7 @@ def _extract_input_ids(args, kwargs):
 
 def _locate_language_model(hf_model):
     inner = getattr(hf_model, "model", None) or hf_model
-    lm = getattr(inner, "language_model", None)
+    lm = getattr(inner, "language_model", None) or getattr(inner, "model", None)
     if lm is None or not hasattr(lm, "layers"):
         raise RuntimeError(
             "[depth_token_inject] could not locate model.language_model with .layers "
@@ -112,11 +124,18 @@ def _insert_batched_2d(
     insert_idx: torch.Tensor,
     inserted: torch.Tensor,
 ) -> torch.Tensor:
-    rows = []
-    for b in range(x.shape[0]):
-        idx = int(insert_idx[b].item())
-        rows.append(torch.cat([x[b, :idx], inserted[b], x[b, idx:]], dim=0))
-    return torch.stack(rows, dim=0)
+    batch_size, seq_len = x.shape
+    num_insert = int(inserted.shape[1])
+    insert_idx = insert_idx.to(device=x.device, dtype=torch.long)
+    src_pos = torch.arange(seq_len, device=x.device, dtype=torch.long).unsqueeze(0)
+    src_pos = src_pos.expand(batch_size, seq_len)
+    out_pos = src_pos + (src_pos >= insert_idx.unsqueeze(1)).to(torch.long) * num_insert
+    ins_pos = insert_idx.unsqueeze(1) + torch.arange(num_insert, device=x.device, dtype=torch.long).unsqueeze(0)
+
+    out = x.new_empty((batch_size, seq_len + num_insert))
+    out.scatter_(1, out_pos, x)
+    out.scatter_(1, ins_pos, inserted)
+    return out
 
 
 def _insert_batched_3d(
@@ -124,11 +143,18 @@ def _insert_batched_3d(
     insert_idx: torch.Tensor,
     inserted: torch.Tensor,
 ) -> torch.Tensor:
-    rows = []
-    for b in range(x.shape[0]):
-        idx = int(insert_idx[b].item())
-        rows.append(torch.cat([x[b, :idx], inserted[b], x[b, idx:]], dim=0))
-    return torch.stack(rows, dim=0)
+    batch_size, seq_len, hidden_dim = x.shape
+    num_insert = int(inserted.shape[1])
+    insert_idx = insert_idx.to(device=x.device, dtype=torch.long)
+    src_pos = torch.arange(seq_len, device=x.device, dtype=torch.long).unsqueeze(0)
+    src_pos = src_pos.expand(batch_size, seq_len)
+    out_pos = src_pos + (src_pos >= insert_idx.unsqueeze(1)).to(torch.long) * num_insert
+    ins_pos = insert_idx.unsqueeze(1) + torch.arange(num_insert, device=x.device, dtype=torch.long).unsqueeze(0)
+
+    out = x.new_empty((batch_size, seq_len + num_insert, hidden_dim))
+    out.scatter_(1, out_pos.unsqueeze(-1).expand(-1, -1, hidden_dim), x)
+    out.scatter_(1, ins_pos.unsqueeze(-1).expand(-1, -1, hidden_dim), inserted)
+    return out
 
 
 def _make_keep_mask(
@@ -138,14 +164,84 @@ def _make_keep_mask(
     num_insert: int,
     device,
 ) -> torch.Tensor:
-    rows = []
-    for b in range(batch_size):
-        idx = int(insert_idx[b].item())
-        before = torch.ones(idx, dtype=torch.bool, device=device)
-        middle = torch.zeros(num_insert, dtype=torch.bool, device=device)
-        after = torch.ones(seq_len - idx, dtype=torch.bool, device=device)
-        rows.append(torch.cat([before, middle, after], dim=0))
-    return torch.stack(rows, dim=0)
+    pos = torch.arange(seq_len + num_insert, device=device, dtype=torch.long).unsqueeze(0)
+    idx = insert_idx.to(device=device, dtype=torch.long).unsqueeze(1)
+    inserted = (pos >= idx) & (pos < idx + num_insert)
+    return ~inserted.expand(batch_size, seq_len + num_insert)
+
+
+def _insert_position_columns(
+    position_ids: torch.Tensor,
+    insert_idx: torch.Tensor,
+    inserted: torch.Tensor,
+) -> torch.Tensor:
+    batch_size = int(position_ids.shape[-2])
+    seq_len = int(position_ids.shape[-1])
+    num_insert = int(inserted.shape[-1])
+    leading = tuple(position_ids.shape[:-2])
+    insert_idx = insert_idx.to(device=position_ids.device, dtype=torch.long)
+
+    src_pos = torch.arange(seq_len, device=position_ids.device, dtype=torch.long).unsqueeze(0)
+    src_pos = src_pos.expand(batch_size, seq_len)
+    out_pos = src_pos + (src_pos >= insert_idx.unsqueeze(1)).to(torch.long) * num_insert
+    ins_pos = insert_idx.unsqueeze(1) + torch.arange(
+        num_insert, device=position_ids.device, dtype=torch.long
+    ).unsqueeze(0)
+
+    out = position_ids.new_empty((*leading, batch_size, seq_len + num_insert))
+    view_prefix = (1,) * len(leading)
+    out.scatter_(
+        -1,
+        out_pos.reshape(*view_prefix, batch_size, seq_len).expand(*leading, batch_size, seq_len),
+        position_ids,
+    )
+    out.scatter_(
+        -1,
+        ins_pos.reshape(*view_prefix, batch_size, num_insert).expand(*leading, batch_size, num_insert),
+        inserted,
+    )
+    return out
+
+
+def _depth_source_indices(
+    cam: torch.Tensor,
+    insert_idx: torch.Tensor,
+    num_insert: int,
+    primary_cam_id: int,
+) -> torch.Tensor:
+    batch_size, seq_len = cam.shape
+    device = cam.device
+    primary = cam == int(primary_cam_id)
+    counts = primary.sum(dim=1)
+    seq_pos = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0)
+    seq_pos = seq_pos.expand(batch_size, seq_len)
+    primary_pos = torch.where(primary, seq_pos, torch.full_like(seq_pos, seq_len)).sort(dim=1).values
+
+    if num_insert == 1:
+        offsets = torch.zeros((batch_size, 1), dtype=torch.long, device=device)
+    else:
+        steps = torch.arange(num_insert, device=device, dtype=torch.float32).unsqueeze(0)
+        scale = (counts.clamp_min(1) - 1).to(torch.float32).unsqueeze(1) / float(num_insert - 1)
+        offsets = torch.round(steps * scale).to(torch.long)
+
+    one_primary = counts == 1
+    offsets = torch.where(one_primary.unsqueeze(1), torch.zeros_like(offsets), offsets)
+
+    k = int(round(num_insert ** 0.5))
+    if k * k == num_insert:
+        g = torch.round(torch.sqrt(counts.to(torch.float32))).to(torch.long)
+        square_ok = (counts > 0) & (g * g == counts) & (g >= k)
+        grid = torch.arange(k, device=device, dtype=torch.long)
+        r = torch.minimum(((2 * grid + 1).unsqueeze(0) * g.unsqueeze(1)) // (2 * k), g.unsqueeze(1) - 1)
+        c = torch.minimum(((2 * grid + 1).unsqueeze(0) * g.unsqueeze(1)) // (2 * k), g.unsqueeze(1) - 1)
+        square_offsets = (r.unsqueeze(2) * g.view(batch_size, 1, 1) + c.unsqueeze(1)).reshape(
+            batch_size, num_insert
+        )
+        offsets = torch.where(square_ok.unsqueeze(1), square_offsets, offsets)
+
+    source_idx = primary_pos.gather(1, offsets.clamp(min=0, max=max(seq_len - 1, 0)))
+    fallback = (insert_idx.to(device=device, dtype=torch.long) - 1).clamp(min=0, max=max(seq_len - 1, 0))
+    return torch.where((counts > 0).unsqueeze(1), source_idx, fallback.unsqueeze(1).expand(-1, num_insert))
 
 
 def _depth_position_columns(
@@ -160,68 +256,45 @@ def _depth_position_columns(
     position_ids is treated as (..., B, S). This covers Qwen M-RoPE tensors
     shaped (3, B, S) or (4, B, S), while also working for plain (B, S).
     """
-    samples = []
-    for b in range(cam.shape[0]):
-        pos_b = position_ids[..., b, :]  # (..., S)
-        idx = int(insert_idx[b].item())
-        primary_pos = (cam[b] == primary_cam_id).nonzero(as_tuple=True)[0]
-        n_prim = int(primary_pos.numel())
-        if n_prim > 0:
-            k = int(round(num_insert ** 0.5))   # pooled-grid side (16 tokens -> 4x4)
-            g = int(round(n_prim ** 0.5))        # primary token grid side (square images)
-            if k * k == num_insert and g * g == n_prim and g >= k:
-                # MED-4 fix (2026-06-03, codex review): pick the 4x4 CELL-CENTER tokens of
-                # the primary image's g×g token grid, matching where the pooled FFS tokens
-                # come from. (The old even-linspace over the flattened run traced a
-                # row-major stripe, not faithful 2D cell centers.) Square-grid only;
-                # non-square falls back to linspace below.
-                sel = []
-                for i in range(k):
-                    r = min(int((i + 0.5) * g / k), g - 1)
-                    for j in range(k):
-                        c = min(int((j + 0.5) * g / k), g - 1)
-                        sel.append(r * g + c)
-                source_idx = primary_pos.index_select(
-                    0, torch.tensor(sel, dtype=torch.long, device=primary_pos.device)
-                )
-            elif n_prim == 1:
-                source_idx = primary_pos.expand(num_insert)
-            else:
-                lin = torch.linspace(
-                    0,
-                    n_prim - 1,
-                    steps=num_insert,
-                    device=primary_pos.device,
-                )
-                source_idx = primary_pos.index_select(0, lin.round().long())
-            insert_pos = pos_b.index_select(-1, source_idx.to(position_ids.device))
-        else:
-            fallback = max(idx - 1, 0)
-            insert_pos = pos_b[..., fallback : fallback + 1].expand(
-                *pos_b.shape[:-1], num_insert
-            )
-        samples.append(torch.cat([pos_b[..., :idx], insert_pos, pos_b[..., idx:]], dim=-1))
-    return torch.stack(samples, dim=-2)
+    source_idx = _depth_source_indices(
+        cam=cam,
+        insert_idx=insert_idx.to(cam.device),
+        num_insert=num_insert,
+        primary_cam_id=primary_cam_id,
+    ).to(position_ids.device)
+    leading = tuple(position_ids.shape[:-2])
+    batch_size = int(position_ids.shape[-2])
+    view_prefix = (1,) * len(leading)
+    gather_idx = source_idx.reshape(*view_prefix, batch_size, num_insert).expand(
+        *leading, batch_size, num_insert
+    )
+    insert_pos = torch.gather(position_ids, dim=-1, index=gather_idx)
+    return _insert_position_columns(position_ids, insert_idx.to(position_ids.device), insert_pos)
 
 
 def _compute_insert_idx(cam: torch.Tensor, primary_cam_id: int) -> torch.Tensor:
-    # HIGH-2 fix (2026-06-03, codex review): insert depth tokens BEFORE all image
-    # tokens, so that under Qwen's CAUSAL attention every image + text token (all of
-    # which come AFTER the insertion point) can attend back to the depth tokens.
-    # The old "after the primary image run" placement left the primary image tokens
-    # (the main visual signal) unable to see depth at all — only later right-view /
-    # text tokens could. `primary_cam_id` is kept for signature compatibility; the
-    # anchor is now the FIRST image token of ANY view (cam >= 0).
-    idxs = []
-    for b in range(cam.shape[0]):
-        image_pos = (cam[b] >= 0).nonzero(as_tuple=True)[0]
-        if int(image_pos.numel()) == 0:
+    # FFS #4 GR00T spec (2026-06-08): the prompt is real text in the message
+    # layer; the hook inserts only depth tokens immediately before the primary
+    # (left, cam_id=1 for right-first LIBERO stereo) image-token block.
+    batch_size, seq_len = cam.shape
+    primary = cam == int(primary_cam_id)
+    pos = torch.arange(seq_len, device=cam.device, dtype=torch.long).unsqueeze(0)
+    pos = pos.expand(batch_size, seq_len)
+    missing = torch.full_like(pos, seq_len + 1)
+    idx = torch.where(primary, pos, missing).min(dim=1).values
+
+    # Preserve the precise fail-closed message for CPU/debug runs. On CUDA, the
+    # valid training path stays fully on-device; an invalid sample will fail at
+    # the first scatter instead of synchronizing every step just to format text.
+    if not cam.is_cuda:
+        missing_rows = (idx == seq_len + 1).nonzero(as_tuple=True)[0].tolist()
+        if missing_rows:
+            b = int(missing_rows[0])
             raise RuntimeError(
-                f"[depth_token_inject] sample {b}: no image tokens (cam>=0) to anchor insertion"
+                f"[depth_token_inject] sample {b}: no primary_cam_id={primary_cam_id} "
+                "image tokens to anchor depth-token insertion"
             )
-        idx = int(image_pos.min().item())  # right BEFORE the first image token
-        idxs.append(idx)
-    return torch.tensor(idxs, dtype=torch.long, device=cam.device)
+    return idx
 
 
 def reinstall_depth_token_outer_hook(
@@ -279,6 +352,7 @@ def install_depth_token_hooks(
                 spatial_merge_size=spatial_merge_size,
             )
 
+        state.original_per_token_cam_id = cam
         state.per_token_cam_id = cam
         state.insert_idx = _compute_insert_idx(cam, int(primary_cam_id))
         state.keep_mask = None
@@ -293,7 +367,13 @@ def install_depth_token_hooks(
 
         inputs_embeds = kwargs.get("inputs_embeds", None)
         if inputs_embeds is None:
-            return None
+            # N2 fail-closed (review 2026-06-08): outer hook 已备好插入(insert_idx 等非 None),
+            # 但 inputs_embeds 不在 kwargs(被位置参数传?) → 无法插 depth token。静默跳过会让
+            # 训练退化成 baseline 且无报错 → 直接 raise。
+            raise RuntimeError(
+                "[depth_token_inject] insertion prepared but inputs_embeds not in kwargs "
+                "(passed positionally?). Cannot inject depth tokens → fail-closed."
+            )
 
         batch_size, seq_len, hidden_dim = inputs_embeds.shape
         if depth_tokens.shape[0] != batch_size:
@@ -313,6 +393,8 @@ def install_depth_token_hooks(
         depth = depth_tokens.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
         num_insert = int(depth.shape[1])
         insert_idx_local = insert_idx.to(device=inputs_embeds.device)
+        state.original_seq_len = int(seq_len)
+        state.inserted_depth_embeds = depth.detach()
 
         kwargs["inputs_embeds"] = _insert_batched_3d(inputs_embeds, insert_idx_local, depth)
         state.keep_mask = _make_keep_mask(
@@ -324,7 +406,16 @@ def install_depth_token_hooks(
         )
 
         position_ids = kwargs.get("position_ids", None)
+        if position_ids is None:
+            # N1 fail-closed (review 2026-06-08): inputs_embeds 已扩了 depth token, 但 lm 没把
+            # M-RoPE position_ids 当 kwarg 传(传 None 让 lm 内部算) → embeds 与 position 长度不一致
+            # 会静默错位/学坏。直接 raise: 模型必须把 position_ids 传进 language_model.forward。
+            raise RuntimeError(
+                "[depth_token_inject] inputs_embeds expanded with depth tokens but position_ids "
+                "is None (not a kwarg to language_model.forward) → would desync, fail-closed."
+            )
         if position_ids is not None:
+            state.position_ids_before = position_ids.detach()
             if int(position_ids.shape[-1]) != seq_len:
                 raise RuntimeError(
                     f"[depth_token_inject] position_ids last dim {position_ids.shape[-1]} "
@@ -342,6 +433,7 @@ def install_depth_token_hooks(
                 num_insert=num_insert,
                 primary_cam_id=int(primary_cam_id),
             )
+            state.position_ids_after = kwargs["position_ids"].detach()
 
         attention_mask = kwargs.get("attention_mask", None)
         if attention_mask is not None:

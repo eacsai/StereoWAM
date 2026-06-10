@@ -54,6 +54,15 @@ Only image tokens of the PRIMARY (left) view are touched; text/system tokens and
 the right-view tokens are never modified -- the FFS net[0] disparity map lives in
 the left-camera frame, so the left-view token grid is the geometrically correct
 target, and language grounding is left untouched.
+
+NOTE (2026-06-08): the live GR00T FFS framework (QwenGR00T_VLMInputFFS) does NOT
+use the `FFSVLMInjector` scalar-gate module defined below. It passes a
+`FFSPerTokenProjector` (from QwenGR00T_FFSCommon) as the `injector`, whose final
+`zero_proj` Linear is either zero-init (step-0 no-op, warm-start parity) OR
+identity-init (step-0 FULL injection, selected by `inject_gate_init=identity`).
+The "single learnable scalar gate, init 0" description above and the
+`FFSVLMInjector` class below describe a LEGACY variant; the install hook works
+with any `injector(ffs_feat_b, h_tok, w_tok) -> (n_tok, llm_dim)` module.
 """
 from __future__ import annotations
 
@@ -131,7 +140,13 @@ def _raise_primary_grid_mismatch(
 
 
 class FFSVLMInjector(nn.Module):
-    """FFS feature map -> per-image-token residual in VLM hidden space.
+    """[LEGACY — NOT used by the GR00T FFS framework] scalar-gated FFS injector.
+
+    The live QwenGR00T_VLMInputFFS passes a FFSPerTokenProjector (zero/identity
+    gate_init) as the `injector`; this single-scalar-gate variant is kept only for
+    older frameworks. The description below applies to THIS class, not the GR00T path.
+
+    FFS feature map -> per-image-token residual in VLM hidden space.
 
     spatial_proj : Conv 1x1 stack  (C_ffs -> hidden -> llm_dim), NORMAL init.
     gate         : single learnable scalar, init 0  (the slow global brake).
@@ -255,13 +270,27 @@ def install_ffs_vlm_input_hooks(
 
         inputs_embeds = kwargs.get("inputs_embeds", None)
         if inputs_embeds is None:
-            # language_model is always called with inputs_embeds in this pipeline;
-            # if it ever isn't, skip rather than crash.
-            return None
+            # We reach here only when an FFS feature is staged (ffs_feat is not
+            # None), so the language_model MUST be receiving merged inputs_embeds.
+            # Silently skipping would degrade an FFS run into the plain baseline
+            # with NO error — fail loud instead (mirrors depth_token_inject's
+            # N2 fail-closed). A genuine text-only / feature-absent forward already
+            # returned above on the ffs_feat / per_token_cam_id None checks.
+            raise RuntimeError(
+                "[ffs_vlm_inject] FFS feature staged but language_model called "
+                "without inputs_embeds; refusing to silently skip injection "
+                "(would silently turn an FFS run into the baseline)."
+            )
 
         cam = state.per_token_cam_id              # (B, S)
         ffs = state.ffs_feat                      # (B, C_ffs, h, w)
         B, S, D = inputs_embeds.shape
+        if ffs.shape[0] != B or cam.shape[0] != B:
+            raise RuntimeError(
+                f"[ffs_vlm_inject] staged FFS state batch ({ffs.shape[0]}/{cam.shape[0]}) "
+                f"!= inputs_embeds batch ({B}) — stale state from a previous forward; "
+                "refusing silent cross-batch feature injection."
+            )
         add = torch.zeros_like(inputs_embeds)     # fresh tensor; final add stays out-of-place
 
         for b in range(B):

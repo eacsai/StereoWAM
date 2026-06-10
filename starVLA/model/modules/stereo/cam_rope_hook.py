@@ -54,6 +54,8 @@ class StereoCamRoPEState:
         # === Phase 4 epipolar mask support (backward compat: disabled by default) ===
         self.per_token_row_id: Optional[torch.Tensor] = None  # (B, S) long, -1=text/non-image
         self.epipolar_mask_enabled: bool = False
+        self.sdpa_attn_mask_cache_key = None
+        self.sdpa_attn_mask_cache: Optional[torch.Tensor] = None
         self.top_pre_hook_handle: Optional[torch.utils.hooks.RemovableHandle] = None
         self.top_pre_hook_fn: Optional[Callable] = None
         self.reinstall_top_pre_hook: Optional[Callable] = None
@@ -69,6 +71,7 @@ def compute_per_token_cam_id(
     image_grid_thw: Optional[torch.Tensor],
     num_cameras: int = 2,
     spatial_merge_size: int = 2,
+    extra_image_cam_id: Optional[int] = None,
 ) -> torch.Tensor:
     """Assign each token a camera id (or -1 for text) based on image-token runs.
 
@@ -85,6 +88,9 @@ def compute_per_token_cam_id(
         num_frames = images_per_sample // num_cameras (single-frame stereo -> [0,1];
         3-frame stereo -> [0,0,0,1,1,1]). NOT modulo (that assumes interleaving).
     spatial_merge_size : Qwen3.5-VL default 2.
+    extra_image_cam_id : optional gated extra-image cam id. When set, each
+        sample must contain exactly one trailing extra image after the normal
+        camera-major images; that final run is assigned this cam id.
 
     Returns
     -------
@@ -108,11 +114,30 @@ def compute_per_token_cam_id(
     s2 = max(int(spatial_merge_size), 1)
     per_image_n = (image_grid_thw[:, 0] * image_grid_thw[:, 1] * image_grid_thw[:, 2]) // (s2 * s2)
     per_image_n = per_image_n.tolist()  # (num_images_total,)
+    _nc = max(int(num_cameras), 1)
+    if extra_image_cam_id is not None:
+        extra_image_cam_id = int(extra_image_cam_id)
+        if extra_image_cam_id < 0 or extra_image_cam_id >= _nc:
+            raise ValueError(
+                f"[cam_rope] extra_image_cam_id={extra_image_cam_id} out of range for num_cameras={_nc}"
+            )
+        expected_total_images = B * (_nc + 1)
+        if int(image_grid_thw.shape[0]) != expected_total_images:
+            raise ValueError(
+                "[cam_rope] stereo_extra_image_cam_id is set, so each sample must have exactly "
+                f"{_nc + 1} image_grid_thw rows ({_nc} normal camera images + 1 trailing extra); "
+                f"got total rows={int(image_grid_thw.shape[0])} for batch_size={B}"
+            )
 
     img_idx_global = 0
     for b in range(B):
         mask_b = image_mask[b]
         if not mask_b.any():
+            if extra_image_cam_id is not None:
+                raise ValueError(
+                    f"[cam_rope] stereo_extra_image_cam_id set but sample {b} has no image tokens "
+                    f"(expected {_nc + 1} image runs)"
+                )
             continue
         # Find runs of consecutive image tokens.
         diff = torch.diff(mask_b.int(), prepend=torch.zeros(1, dtype=torch.int, device=mask_b.device))
@@ -121,21 +146,43 @@ def compute_per_token_cam_id(
         ends = ((diff_end == -1).nonzero(as_tuple=True)[0] + 1).tolist()  # exclusive ends
         # camera-major layout (outer camera, inner frame): images_per_camera = num_frames.
         # cam_id = img_idx // num_frames (NOT % num_cameras, which assumes interleaving).
-        _nc = max(int(num_cameras), 1)
-        if len(starts) % _nc != 0:
-            raise ValueError(f"[cam_rope] {len(starts)} images not a multiple of num_cameras={_nc}; camera-major layout broken (mono+cam_rope? set num_cameras=1)")
-        num_frames_b = max(len(starts) // _nc, 1)
+        if extra_image_cam_id is None:
+            if len(starts) % _nc != 0:
+                raise ValueError(f"[cam_rope] {len(starts)} images not a multiple of num_cameras={_nc}; camera-major layout broken (mono+cam_rope? set num_cameras=1)")
+            num_frames_b = max(len(starts) // _nc, 1)
+        else:
+            expected_runs = _nc + 1
+            if len(starts) != expected_runs:
+                raise ValueError(
+                    "[cam_rope] stereo_extra_image_cam_id is set, so each sample must have exactly "
+                    f"{expected_runs} image token runs ({_nc} normal camera images + 1 trailing extra); "
+                    f"sample={b} has {len(starts)}"
+                )
+            num_frames_b = 1
         for img_idx_in_sample, (s_start, s_end) in enumerate(zip(starts, ends)):
             if img_idx_global >= len(per_image_n):
+                if extra_image_cam_id is not None:
+                    raise ValueError(
+                        "[cam_rope] image_grid_thw ended before all image token runs were assigned "
+                        f"with stereo_extra_image_cam_id set (sample={b}, image={img_idx_in_sample})"
+                    )
                 break
             n_expected = per_image_n[img_idx_global]
             n_actual = s_end - s_start
             if n_actual != n_expected:
+                if extra_image_cam_id is not None:
+                    raise ValueError(
+                        f"[cam_rope] image token run length mismatch with stereo_extra_image_cam_id set: "
+                        f"sample={b} image={img_idx_in_sample} actual={n_actual} expected={n_expected}"
+                    )
                 # Layout assumption broken; skip this image rather than crash.
                 # Up to caller to investigate (a warning is logged once by the framework).
                 img_idx_global += 1
                 continue
-            cam_id = (img_idx_in_sample // num_frames_b) % max(int(num_cameras), 1)
+            if extra_image_cam_id is not None and img_idx_in_sample == len(starts) - 1:
+                cam_id = extra_image_cam_id
+            else:
+                cam_id = (img_idx_in_sample // num_frames_b) % max(int(num_cameras), 1)
             out[b, s_start:s_end] = cam_id
             img_idx_global += 1
 
@@ -300,17 +347,31 @@ def patched_qwen3_5_attention_forward(
     if attention_mask is None:
         is_causal = S > 1
     elif attention_mask.dim() == 2:
-        # Build (B, 1, S, S) float mask = -inf where padded OR causal-future.
-        causal = torch.triu(
-            torch.ones(S, S, device=q_tilde.device, dtype=torch.bool),
-            diagonal=1,
-        )  # (S, S), True = future position to block
-        pad = (attention_mask == 0).unsqueeze(1).unsqueeze(2)  # (B, 1, 1, S)
-        combined = causal.unsqueeze(0).unsqueeze(0) | pad      # broadcast (B, 1, S, S)
-        sdpa_attn_mask = torch.zeros((), dtype=q_tilde.dtype, device=q_tilde.device).expand(
-            attention_mask.shape[0], 1, S, S
-        ).clone()
-        sdpa_attn_mask = sdpa_attn_mask.masked_fill(combined, float('-inf'))
+        cache_key = (
+            int(attention_mask.data_ptr()),
+            tuple(attention_mask.shape),
+            tuple(attention_mask.stride()),
+            int(attention_mask.storage_offset()),
+            q_tilde.device,
+            q_tilde.dtype,
+            S,
+        )
+        if state.sdpa_attn_mask_cache_key == cache_key:
+            sdpa_attn_mask = state.sdpa_attn_mask_cache
+        else:
+            # Build (B, 1, S, S) float mask = -inf where padded OR causal-future.
+            causal = torch.triu(
+                torch.ones(S, S, device=q_tilde.device, dtype=torch.bool),
+                diagonal=1,
+            )  # (S, S), True = future position to block
+            pad = (attention_mask == 0).unsqueeze(1).unsqueeze(2)  # (B, 1, 1, S)
+            combined = causal.unsqueeze(0).unsqueeze(0) | pad      # broadcast (B, 1, S, S)
+            sdpa_attn_mask = torch.zeros((), dtype=q_tilde.dtype, device=q_tilde.device).expand(
+                attention_mask.shape[0], 1, S, S
+            ).clone()
+            sdpa_attn_mask = sdpa_attn_mask.masked_fill(combined, float('-inf'))
+            state.sdpa_attn_mask_cache_key = cache_key
+            state.sdpa_attn_mask_cache = sdpa_attn_mask
     elif attention_mask.dim() == 4:
         # Already 4D — use as-is (transformers may pass pre-prepared 4D mask).
         sdpa_attn_mask = attention_mask
@@ -392,6 +453,7 @@ def install_stereo_cam_rope_hooks(
     init_mode: str = 'zero',
     epipolar_mask_enabled: bool = False,
     right_first: bool = True,
+    extra_image_cam_id: Optional[int] = None,
 ) -> Tuple[StereoCamRoPEState, List[StereoCamRoPELayer]]:
     """Walk hf_model's language_model.layers, attach StereoCamRoPELayer to each
     supported standard attention layer (Qwen3_5Attention),
@@ -490,13 +552,18 @@ def install_stereo_cam_rope_hooks(
         image_grid_thw = kwargs.get('image_grid_thw', None)
         if input_ids is None:
             state.per_token_cam_id = None
+            state.sdpa_attn_mask_cache_key = None
+            state.sdpa_attn_mask_cache = None
             return
+        state.sdpa_attn_mask_cache_key = None
+        state.sdpa_attn_mask_cache = None
         state.per_token_cam_id = compute_per_token_cam_id(
             input_ids=input_ids,
             image_token_id=image_token_id,
             image_grid_thw=image_grid_thw,
             num_cameras=num_cameras,
             spatial_merge_size=spatial_merge_size,
+            extra_image_cam_id=extra_image_cam_id,
         )
         if state.epipolar_mask_enabled:
             state.per_token_row_id = compute_per_token_row_id(
@@ -519,7 +586,8 @@ def install_stereo_cam_rope_hooks(
         f'[stereo_cam_rope] patched {len(scl_modules)} attention layers '
         f'({unique_cls}) at language_model.layers[{standard_attn_idxs}] '
         f'(d_c={d_c}, num_cameras={num_cameras}, baseline_m={baseline_m}, '
-        f'init_mode={init_mode}, epipolar={state.epipolar_mask_enabled})'
+        f'init_mode={init_mode}, epipolar={state.epipolar_mask_enabled}, '
+        f'extra_image_cam_id={extra_image_cam_id})'
     )
 
     return state, scl_modules
