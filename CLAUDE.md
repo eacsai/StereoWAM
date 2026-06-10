@@ -310,4 +310,27 @@ LEROBOT_LIBERO_DATA.bak_user_mono_20260519 -> libero_mono/libero    (历史备�
 
 ---
 
-_最后更新: 2026-05-19 by Claude（增 ⛔ /tmp 禁令 + scripts/4090d 路径 + archive 现状 + 当前 fast run）_
+## 10. ⭐ StereoWorld 官方代码深读结论（cam_rope 复活依据, 2026-06-10）
+
+> 详细逐文件 walkthrough（全部 file:line）: `notes/stereoworld_code_walkthrough_20260610.md`（本地 ICLR2026/notes/ + 4090d notes/）。
+> 仓库 clone: 本地 `ICLR2026/notes/code_refs/stereoworld/`（HEAD 7856c29, 2026-06-08 放权重）。
+
+**背景**: 我们的 stereo cam_rope 参考 StereoWorld 论文（arXiv 2603.17375）实现, 但 q_cam_proj/k_cam_proj 双零初始化 → 梯度死锁, 从未学习（摆设, 见 memory `project_cam_rope_inert_bug`）; 且扩维 256→272 撞 FlashAttention 上限 → 慢 4 倍（2026-06-10 已用 CAM_ROPE=0 旁路修掉）。
+
+**深读后的 4 个关键事实**:
+1. **发布代码 ≠ 论文叙述**: 论文的 "Camera-Frame RoPE 扩维" 和 "分解式 Stereo Attention" 在官方代码里都不存在。实际实现 = 主注意力完全不动 + 每层一条**并行相机注意力支路**（自带 q/k/v/out 普通投影）, 支路输出残差加回主注意力。
+2. **几何零参数**: 支路内用 PRoPE 官方变换（Q 乘投影矩阵转置、K/V 乘逆、输出乘回; 同相机打分不变, 跨相机注入相对几何）, 不可学 → 不存在"学不动"问题。
+3. **防死锁配方 = 单边零初始化**: 整条链只把支路出口 out_proj 置零（"zero-initialize out_proj for stable residual training"）, q/k/v 保持 xavier → step-0 == baseline 且第一步就有梯度。我们的双零双线性是自己发明的, 参考代码里 grep 不到。
+4. **不撞 FA 上限**: PRoPE 变换在 attention kernel 外面做, head_dim 不变; 他们 head_dim 才 128。变换完直接喂 FlashAttention。
+
+**我们的旧实现还有 3 个独立偏差**（修也救不回来, 建议放弃旧机制）: Q/K 用同一个 P 旋转（他们 Q 用转置、K 用逆 → 同相机=单位阵; 我们同相机也被扰动）; V 不变换、输出不乘回; 内参归一化常数差 2 倍。
+
+**复活路线（推荐路线 1）**:
+- 路线 1 ⭐ 并行相机支路: 选定层挂窄支路（宽度/层数都有旋钮）, 支路内 PRoPE 变换 + out_proj 零初始化。step-0==baseline、FA2 不掉、免死锁、有 production 参考。混合序列（文本+图像）用 per-token 矩阵分支（文本=单位阵）。与 #5/#7 "零出口残差支路"方法族同构。
+- 路线 2 ✗ 只修双零 init: 扩维慢 4 倍的问题会回来, 不推荐。
+- 路线 3 零新参数 in-place PRoPE（alpha-gate 保 step-0）: 最轻但直接扰动 Qwen 已训练 M-RoPE 维度, 风险高一档。
+- 考场提醒: 饱和 LIBERO 4-suite 大概率测不出收益（FFS 全系教训）; 真正考场 = 非饱和深度敏感 suite。
+
+---
+
+_最后更新: 2026-06-10 by Claude（增 §10 StereoWorld 代码深读 + cam_rope 复活路线; 上次 2026-05-19）_
