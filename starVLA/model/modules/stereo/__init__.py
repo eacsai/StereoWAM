@@ -12,13 +12,23 @@ from .cam_rope_hook import (
     install_stereo_cam_rope_hooks,
     patched_qwen3_5_attention_forward,
 )
+from .cam_branch_attention import (
+    CamBranchAttention,
+    CamBranchState,
+    build_prope_matrix_triple,
+    install_cam_branch,
+)
 
 __all__ = [
+    'CamBranchAttention',
+    'CamBranchState',
     'StereoCamRoPELayer',
     'StereoCamRoPEState',
     'apply_camera_rope',
+    'build_prope_matrix_triple',
     'compute_libero_camera_P_stack',
     'compute_per_token_cam_id',
+    'install_cam_branch',
     'install_stereo_cam_rope_hooks',
     'patched_qwen3_5_attention_forward',
 ]

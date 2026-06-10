@@ -37,7 +37,7 @@ from starVLA.model.modules.action_model.GR00T_ActionHeader import FlowmatchingAc
 from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 from starVLA.training.trainer_utils.trainer_tools import resize_images
-from starVLA.model.modules.stereo import install_stereo_cam_rope_hooks
+from starVLA.model.modules.stereo import install_cam_branch, install_stereo_cam_rope_hooks
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -77,8 +77,14 @@ class QwenGR00TDefaultConfig:
             "stereo_cam_rope_spatial_merge": 2,
             "stereo_cam_rope_init_mode": "zero",
             "stereo_cam_rope_right_first": True,
+            "stereo_extra_image_cam_id": None,
             # === Phase 4 epipolar attention mask ===
             "stereo_epipolar_mask_enabled": False,
+            # === Parallel PRoPE camera branch (default off = exact legacy behavior) ===
+            "stereo_cam_branch_enabled": False,
+            "stereo_cam_branch_heads": 4,
+            "stereo_cam_branch_head_dim": 128,
+            "stereo_cam_branch_layers": None,
         }
     )
 
@@ -166,10 +172,18 @@ class Qwen_GR00T(baseframework):
         self.config = merge_framework_config(QwenGR00TDefaultConfig, config)
         self.qwen_vl_interface = get_vlm_model(config=self.config)
 
+        cam_rope_enabled = bool(self.config.framework.qwenvl.get("stereo_cam_rope_enabled", False))
+        cam_branch_enabled = bool(self.config.framework.qwenvl.get("stereo_cam_branch_enabled", False))
+        if cam_rope_enabled and cam_branch_enabled:
+            raise RuntimeError(
+                "stereo_cam_rope_enabled and stereo_cam_branch_enabled are mutually exclusive. "
+                "cam_branch is the parallel PRoPE replacement; disable cam_rope first."
+            )
+
         # === Stereo Camera-Frame RoPE install (ported from QwenPI) ===
         self._stereo_cam_rope_state = None
         self.stereo_cam_rope_layers = None
-        if bool(self.config.framework.qwenvl.get("stereo_cam_rope_enabled", False)):
+        if cam_rope_enabled:
             import torch.nn as _nn_for_stereo
             self._stereo_cam_rope_state, scl_modules = install_stereo_cam_rope_hooks(
                 self.qwen_vl_interface.model,
@@ -183,6 +197,7 @@ class Qwen_GR00T(baseframework):
                 init_mode=str(self.config.framework.qwenvl.get("stereo_cam_rope_init_mode", "zero")),
                 epipolar_mask_enabled=bool(self.config.framework.qwenvl.get("stereo_epipolar_mask_enabled", False)),
                 right_first=bool(self.config.framework.qwenvl.get("stereo_cam_rope_right_first", True)),
+                extra_image_cam_id=self.config.framework.qwenvl.get("stereo_extra_image_cam_id", None),
             )
             if not scl_modules:
                 raise RuntimeError(
@@ -190,6 +205,40 @@ class Qwen_GR00T(baseframework):
                     "Did the model architecture change so no attention layers found?"
                 )
             self.stereo_cam_rope_layers = _nn_for_stereo.ModuleList(scl_modules)
+
+        # === Parallel PRoPE camera branch install ===
+        self._stereo_cam_branch_state = None
+        self.stereo_cam_branch_layers_modules = None
+        if cam_branch_enabled:
+            import torch.nn as _nn_for_stereo
+
+            trainer_cfg = getattr(self.config, "trainer", {})
+            logging_frequency = (
+                int(trainer_cfg.get("logging_frequency", 20))
+                if hasattr(trainer_cfg, "get")
+                else 20
+            )
+            self._stereo_cam_branch_state, branch_modules = install_cam_branch(
+                self.qwen_vl_interface.model,
+                branch_heads=int(self.config.framework.qwenvl.get("stereo_cam_branch_heads", 4)),
+                branch_head_dim=int(self.config.framework.qwenvl.get("stereo_cam_branch_head_dim", 128)),
+                layers=self.config.framework.qwenvl.get("stereo_cam_branch_layers", None),
+                num_cameras=int(self.config.framework.qwenvl.get("stereo_cam_rope_num_cameras", 2)),
+                baseline_m=float(self.config.framework.qwenvl.get("stereo_cam_rope_baseline_m", 0.06)),
+                fovy_degrees=float(self.config.framework.qwenvl.get("stereo_cam_rope_fovy_degrees", 45.0)),
+                image_width=int(self.config.framework.qwenvl.get("stereo_cam_rope_image_width", 256)),
+                image_height=int(self.config.framework.qwenvl.get("stereo_cam_rope_image_height", 256)),
+                spatial_merge_size=int(self.config.framework.qwenvl.get("stereo_cam_rope_spatial_merge", 2)),
+                right_first=bool(self.config.framework.qwenvl.get("stereo_cam_rope_right_first", True)),
+                extra_image_cam_id=self.config.framework.qwenvl.get("stereo_extra_image_cam_id", None),
+                logging_frequency=logging_frequency,
+            )
+            if not branch_modules:
+                raise RuntimeError(
+                    "stereo_cam_branch_enabled=True but install_cam_branch returned 0 layers. "
+                    "Did the model architecture change so no attention layers found?"
+                )
+            self.stereo_cam_branch_layers_modules = _nn_for_stereo.ModuleList(branch_modules)
 
         # align dims --> we should put them to config or no?
         self.config.framework.action_model.diffusion_model_cfg.cross_attention_dim = (
@@ -203,6 +252,77 @@ class Qwen_GR00T(baseframework):
         # are normalised upstream by `share_tools.apply_config_compat`, so we
         # only ever read `action_horizon` here.
         self.action_horizon = int(self.config.framework.action_model.action_horizon)
+
+    def load_state_dict(self, state_dict, strict=True, assign=False, init_from_baseline: bool = False):
+        """Fail-closed load with one warm-start exception for new cam_branch keys."""
+        cam_branch_enabled = bool(self.config.framework.qwenvl.get("stereo_cam_branch_enabled", False))
+        if not cam_branch_enabled:
+            return super().load_state_dict(state_dict, strict=strict, assign=assign)
+
+        own_keys = set(self.state_dict().keys())
+
+        def _is_legacy_cam_rope_key(key: str) -> bool:
+            # The inert legacy cam_rope registers the SAME modules under two families
+            # (framework ModuleList + attention child); a cam_rope-enabled baseline
+            # checkpoint (e.g. B) carries both. A cam_branch model runs with cam_rope
+            # off, so neither family exists here.
+            return key.startswith("stereo_cam_rope_layers.") or ".stereo_cam_layer." in key
+
+        if init_from_baseline and self.stereo_cam_rope_layers is None:
+            legacy_keys = [k for k in state_dict.keys() if _is_legacy_cam_rope_key(k)]
+            if legacy_keys:
+                nonzero = [k for k in legacy_keys if state_dict[k].abs().max().item() != 0.0]
+                if nonzero:
+                    raise RuntimeError(
+                        "[cam_branch audit] baseline checkpoint has NON-ZERO legacy cam_rope "
+                        f"weights ({nonzero[:5]}...). cam_rope was provably inert (all-zero); "
+                        "non-zero values mean this is not the expected baseline. Refusing."
+                    )
+                state_dict = {k: v for k, v in state_dict.items() if not _is_legacy_cam_rope_key(k)}
+                logger.info(
+                    "[cam_branch audit] dropped %d inert legacy cam_rope keys (all verified zero) "
+                    "from the warm-start checkpoint",
+                    len(legacy_keys),
+                )
+
+        provided_keys = set(state_dict.keys())
+
+        def _is_cam_branch_key(key: str) -> bool:
+            return key.startswith("stereo_cam_branch_layers_modules.")
+
+        # Missing branch keys are tolerated ONLY for a true baseline checkpoint that
+        # has ZERO cam_branch keys. A checkpoint with SOME branch keys is a partial/
+        # truncated cam_branch checkpoint — loading it with fresh-initialized gaps
+        # would silently corrupt the run.
+        provided_has_branch = any(_is_cam_branch_key(key) for key in provided_keys)
+        allowed_missing = (
+            {key for key in own_keys - provided_keys if _is_cam_branch_key(key)}
+            if (init_from_baseline and not provided_has_branch)
+            else set()
+        )
+        suspicious_missing = (own_keys - provided_keys) - allowed_missing
+        unexpected = provided_keys - own_keys
+
+        if suspicious_missing:
+            sample = sorted(suspicious_missing)[:20]
+            raise RuntimeError(
+                "[cam_branch audit] warm-start would leave non-cam_branch params uninitialized; "
+                f"missing {len(suspicious_missing)} keys, first={sample}"
+            )
+        if unexpected:
+            sample = sorted(unexpected)[:20]
+            raise RuntimeError(
+                f"[cam_branch audit] checkpoint has {len(unexpected)} unexpected keys; "
+                f"first={sample}. Refusing silent drop."
+            )
+        if allowed_missing:
+            logger.info(
+                "[cam_branch audit] allowing %d missing cam_branch keys during warm-start",
+                len(allowed_missing),
+            )
+
+        forwarded_strict = strict and not allowed_missing
+        return super().load_state_dict(state_dict, strict=forwarded_strict, assign=assign)
 
     def forward(
         self,
