@@ -28,6 +28,15 @@ TARGETS=(
   "qwen3p5_0p8b_ffs_depthtoken_keep_fromscratch_30k|20000 30000|ffs"
   "qwen3p5_0p8b_ffs_depthtoken_strip_fromscratch_30k|20000 30000|ffs"
   "qwen3p5_0p8b_ffs_depthimage_fromscratch_30k|20000 30000|ffs"
+  # 2026-06-10 #5 LLaMA-Adapter prefix injection:
+  "qwen3p5_0p8b_ffs_llama_adapter_prefix_warmstartB_frozen_30k|20000 30000|ffs"
+  "qwen3p5_0p8b_ffs_llama_adapter_prefix_fromscratch_perhead_30k|20000 30000|ffs"
+  # 2026-06-11 cam_branch (纯立体 run, 非 FFS -> plain eval, right_view,primary):
+  "qwen3p5_0p8b_stereo_cam_branch_prope_fromscratch_30k|20000 30000|plain"
+  # 2026-06-12 baseline reproducibility re-runs (seed 42, plain QwenGR00T fromscratch, no FFS/cam_rope/cam_branch).
+  # 4th field = video_keys: mono MUST eval primary-only; stereo right_view,primary. Checks if mono~91% on saturated LIBERO is real.
+  "qwen3p5_0p8b_4suite_monoprimary_ourrender_fromscratch_rerun_30k|20000 30000|plain|primary"
+  "qwen3p5_0p8b_4suite_stereo_rightprimary_ourrender_fromscratch_rerun_30k|20000 30000|plain|right_view,primary"
 )
 
 pick_free_gpus(){ nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits 2>/dev/null \
@@ -37,8 +46,8 @@ ckpt_ready(){ local sz; sz=$($H100B "stat -c %s ${H100B_CKPT}/$1/checkpoints/ste
 # a watcher killed mid-record must NOT leave a truncated block that reads as "done".
 already_done(){ grep -A4 -E "^===== ${1} step=${2} " "$RESULTS" 2>/dev/null | grep -q "libero_10: SR="; }
 
-record(){ local rid="$1" step="$2"
-  local edir="playground/Checkpoints/${rid}/eval_step${step}_right_view_primary"
+record(){ local rid="$1" step="$2" vk="${3:-right_view,primary}"
+  local edir="playground/Checkpoints/${rid}/eval_step${step}_$(echo "$vk" | tr ',' '_')"
   # Build the whole block first, then append atomically (single write): a kill
   # between header and suite lines would otherwise permanently truncate the record.
   local block s sr
@@ -62,7 +71,7 @@ while true; do
   remaining=0
   gaveup=0
   for row in "${TARGETS[@]}"; do
-    IFS='|' read -r rid steps kind <<< "$row"
+    IFS='|' read -r rid steps kind vk <<< "$row"; vk="${vk:-right_view,primary}"
     for step in $steps; do
       already_done "$rid" "$step" && continue
       key="${rid}|${step}"
@@ -74,10 +83,10 @@ while true; do
       if [ "$kind" = "ffs" ]; then
         ok=0; bash scripts/4090d/eval_ffs_4suite.sh "$rid" "$step" "$gpus" >> "$LOG" 2>&1 && ok=1
       else
-        ok=0; bash scripts/4090d/eval_qwen2p5vl_4suite.sh "$rid" "$step" right_view,primary "$gpus" >> "$LOG" 2>&1 && ok=1
+        ok=0; bash scripts/4090d/eval_qwen2p5vl_4suite.sh "$rid" "$step" "$vk" "$gpus" >> "$LOG" 2>&1 && ok=1
       fi
       if [ "$ok" = 1 ]; then
-        record "$rid" "$step"; log "EVAL_DONE $rid step$step"
+        record "$rid" "$step" "$vk"; log "EVAL_DONE $rid step$step"
       else
         FAILCOUNT[$key]=$(( ${FAILCOUNT[$key]:-0} + 1 ))
         if [ "${FAILCOUNT[$key]}" -ge "$GIVEUP_AFTER" ]; then
