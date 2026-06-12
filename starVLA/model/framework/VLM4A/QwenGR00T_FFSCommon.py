@@ -523,8 +523,17 @@ class QwenGR00TFFSBase(QwenGR00TNet0FFSMixin, Qwen_GR00T):
             if init_from_baseline
             else set()
         )
+        legacy_cam_rope_keys = (
+            {
+                key
+                for key in provided_keys
+                if key.startswith("stereo_cam_rope_layers.") or ".stereo_cam_layer." in key
+            }
+            if init_from_baseline and getattr(self, "stereo_cam_rope_layers", None) is None
+            else set()
+        )
         suspicious_missing = (own_keys - provided_keys) - allowed_missing
-        unexpected = provided_keys - own_keys
+        unexpected = (provided_keys - own_keys) - legacy_cam_rope_keys
 
         if suspicious_missing:
             sample = sorted(suspicious_missing)[:20]

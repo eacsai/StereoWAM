@@ -254,18 +254,16 @@ class Qwen_GR00T(baseframework):
         self.action_horizon = int(self.config.framework.action_model.action_horizon)
 
     def load_state_dict(self, state_dict, strict=True, assign=False, init_from_baseline: bool = False):
-        """Fail-closed load with one warm-start exception for new cam_branch keys."""
-        cam_branch_enabled = bool(self.config.framework.qwenvl.get("stereo_cam_branch_enabled", False))
-        if not cam_branch_enabled:
-            return super().load_state_dict(state_dict, strict=strict, assign=assign)
-
+        """Fail-closed load with warm-start exceptions for inert legacy stereo keys."""
         own_keys = set(self.state_dict().keys())
+        cam_branch_enabled = bool(self.config.framework.qwenvl.get("stereo_cam_branch_enabled", False))
+        legacy_audit_label = "cam_branch audit" if cam_branch_enabled else "legacy cam_rope audit"
 
         def _is_legacy_cam_rope_key(key: str) -> bool:
             # The inert legacy cam_rope registers the SAME modules under two families
             # (framework ModuleList + attention child); a cam_rope-enabled baseline
-            # checkpoint (e.g. B) carries both. A cam_branch model runs with cam_rope
-            # off, so neither family exists here.
+            # checkpoint (e.g. B) carries both. Any CAM_ROPE=0 warm-start target
+            # has no such family, including cam_branch and FFS frameworks.
             return key.startswith("stereo_cam_rope_layers.") or ".stereo_cam_layer." in key
 
         if init_from_baseline and self.stereo_cam_rope_layers is None:
@@ -274,16 +272,20 @@ class Qwen_GR00T(baseframework):
                 nonzero = [k for k in legacy_keys if state_dict[k].abs().max().item() != 0.0]
                 if nonzero:
                     raise RuntimeError(
-                        "[cam_branch audit] baseline checkpoint has NON-ZERO legacy cam_rope "
+                        f"[{legacy_audit_label}] baseline checkpoint has NON-ZERO legacy cam_rope "
                         f"weights ({nonzero[:5]}...). cam_rope was provably inert (all-zero); "
                         "non-zero values mean this is not the expected baseline. Refusing."
                     )
                 state_dict = {k: v for k, v in state_dict.items() if not _is_legacy_cam_rope_key(k)}
                 logger.info(
-                    "[cam_branch audit] dropped %d inert legacy cam_rope keys (all verified zero) "
+                    "[%s] dropped %d inert legacy cam_rope keys (all verified zero) "
                     "from the warm-start checkpoint",
+                    legacy_audit_label,
                     len(legacy_keys),
                 )
+
+        if not cam_branch_enabled:
+            return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
         provided_keys = set(state_dict.keys())
 
