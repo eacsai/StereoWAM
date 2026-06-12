@@ -334,3 +334,18 @@ LEROBOT_LIBERO_DATA.bak_user_mono_20260519 -> libero_mono/libero    (历史备�
 ---
 
 _最后更新: 2026-06-10 by Claude（增 §10 StereoWorld 代码深读 + cam_rope 复活路线; 上次 2026-05-19）_
+
+## 11. ⭐ FastWAM 官方代码深读结论（"它到底做没做预训练", 2026-06-12）
+
+论文 arXiv 2603.16666（IIIS 清华 + Galaxea，与 DepthVLA 同组）。仓库 github yuantianyuan01/FastWAM，本地 clone `code_refs/fastwam`。完整逐文件 walkthrough = `notes/fastwam_code_walkthrough.md`；论文笔记 = `notes/2603.16666_FastWAM.md`。方法：8 读码 + 3 对抗代理（11 Opus），结论带 file:line。
+
+**核心问题：FastWAM 做没做预训练？→ 没有自己的预训练（3/3 对抗代理判 False）。** 拆三类：
+- (a) **继承的预训练**：加载现成 **Wan2.2-TI2V-5B**（视频 DiT 3072/30层/24头 + VAE + T5），阿里 Wan 团队训的，不是它训的（wan22.py:50-51；ModelScope/HF 按 hash 加载）。
+- (b) **权重手术（非训练）**：动作专家骨干 = 把 Wan2.2 DiT 权重线性插值+alpha 缩放初始化（`preprocess_action_dit_backbone.py`，无梯度无数据）；action_encoder/head/proprio 保持随机。
+- (c) **它自己的预训练阶段**：**没有**。全仓只有一个训练阶段 = benchmark 上单次 finetune（run_training→一个 Wan22Trainer.train()）。搜遍 pretrain/stage/OpenX/DROID/OXE 全无。
+
+**⭐ 关键纠正（别误读）："不预训练" ≠ "训练轻"**：训练时那个 **5B 视频 DiT 是被训练的,不是冻结的**——`self.dit=self.mot`（含视频+动作两专家），trainer 全冻后只 `model.dit.requires_grad_(True)`，优化器 = `list(model.dit.parameters())`(+proprio)（trainer.py:85-90,289-291）；只冻 VAE+T5。"without embodied pretraining" 的真义 = 不用机器人语料/不分预训练阶段,但整个 6B end-to-end finetune 了 → 这才是 RoboTwin 要 64 卡的原因。
+
+**训练配方（实锤）**：AdamW lr 1e-4 cosine+5%warmup，wd 1e-2，bf16，DeepSpeed ZeRO-1；batch 16/卡；**LIBERO 8 卡 10 epochs（全局 128）/ RoboTwin 64 卡 5 epochs（全局 1024）**（README.md:259）。数据 = LIBERO 4 套件 lerobot + RoboTwin 27,500 demos（HF 下载），33 帧窗口=32 动作+9 视频帧（4:1）。
+
+**对我们（2 H100）**：① "省具身预训练 + 借大模型先验" 学得了（同 DepthVLA 套路）；② 但它端到端训 6B（视频 DiT 没冻）→ **Wan2.2-5B 我们 2 卡放不下,要换轻量 video DiT 或改"冻骨干只训小专家"**（偏离其 co-train 核心，而 ablation 证删 co-train 真机 90%→10%）；③ "训练 co-train 塑表征、推理砍未来" 实证支持我们 stereo-4D 的"训练预测未来 4D、推理一次前向"。
