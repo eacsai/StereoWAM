@@ -192,3 +192,23 @@ clean apples-to-apples (only right_view differs). Detail + live results table:
 in-range for early fromscratch 4-suite-joint). Purpose = validate stereo on strong backbone + hard
 data before adding cam_rope / FFS-hybrid. Auto: training launchers in `scripts/h100b/` (run_qwen2p5vl3b_groot_4suite_stereo.sh + chain_*.sh),
 eval daemon `scripts/4090d/auto_eval_qwen2p5vl_3baseline.sh`.
+
+
+## I. LLaMA-Adapter prefix FFS injection (#5) — frozen-VLM arm DONE
+
+Method #5 of the 8-method FFS port: a few learnable prompt tokens absorb the FFS `net[0]` stereo
+features and are **zero-init-tanh-gated, prepended** into the last 6 softmax layers of the
+Qwen3.5-0.8B VLM (faithful to LLaMA-Adapter v1: tanh gate, prefix un-RoPE'd, adapter-only training).
+The **frozen** arm warm-starts from B and freezes the VLM (single-scalar gate); the **per-head**
+from-scratch arm was SIGKILLed in the 2026-06-13 host-OOM and is not yet rerun. Detail:
+`docs/experiments/qwen0p8_ffs5_llama_adapter_prefix_0611.md`.
+
+| run | step | spatial | object | goal | libero_10 | mean |
+|---|---|---|---|---|---|---|
+| frozen (warm-start B, freeze VLM) | 20k | 0.92 | 0.95 | 0.85 | 0.71 | 0.858 |
+| frozen (warm-start B, freeze VLM) | 30k | 0.91 | 0.96 | 0.95 | 0.68 | **0.875** |
+| per-head (from-scratch) | — | — | — | — | — | OOM-killed, not rerun |
+
+**Verdict: #5 frozen 0.875 < mono 0.913 < depthtoken_keep 0.910 — in the 0.85–0.91 noise band, no
+gain.** One more confirmation that freezing the VLM and learning only a LLaMA-Adapter prefix on
+stereo-depth features does not beat mono on saturated LIBERO. See headline finding above.
