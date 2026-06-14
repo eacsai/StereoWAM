@@ -4,9 +4,10 @@ Round-2 redesign (CODEX HIGH 1-4 all addressed):
     1. HIGH-1 batch order: use Tensor.repeat (NOT repeat_interleave) to match
        QwenPI.forward which does `actions.repeat(N, 1, 1)` → [s0,s1,s0,s1].
        Old repeat_interleave gave [s0,s0,s1,s1] = cross-contamination.
-    2. HIGH-2 coverage assert: install now takes expected_n_total_blocks and
-       checks against len(transformer_blocks), not against count of cross-attn
-       blocks (was tautological). Framework also asserts interleave is OFF.
+    2. HIGH-2/R2 coverage assert: install now takes expected_n_total_blocks,
+       checks len(transformer_blocks), skips self-attn-only interleave blocks
+       when require_all_cross_attn=False, and still asserts every true
+       cross-attn block was patched.
     3. HIGH-3 fuse-before-to_out: don't keep the original attn1 untouched.
        Replace block.attn1 with ControlVLAAttention wrapper that runs trunk
        SDPA + branch SDPA, SUMS, then applies trunk's to_out ONCE — matches
@@ -175,33 +176,39 @@ def install_controlvla_branches(
         action_dit_model: LayerwiseFlowmatchingActionHead.model (DiT instance).
         ffs_token_dim: dim of FFS tokens fed to to_k_z/to_v_z.
         expected_n_total_blocks: if given, raise unless len(transformer_blocks) ==
-            this. CODEX FIX (round-2 HIGH-2): the prior assertion compared
-            n_patched against count(cross_attn != None) — tautological, didn't
-            catch interleave_self_attention=True silently halving coverage.
-            Caller should pass the architectural truth (e.g. config num_layers).
+            this. Caller should pass the architectural truth (e.g. config
+            num_layers).
         require_all_cross_attn: if True (default), raise if any block has
-            cross_attention_dim is None (= self-attn interleave). Forces the
-            user to explicitly disable interleave_self_attention in DiT config
-            before launching, so "per-layer ControlVLA" is honestly per-layer.
+            cross_attention_dim is None (= self-attn interleave). If False,
+            self-attn-only blocks are skipped and the function still asserts
+            that every true cross-attn block was patched.
     """
     n_total = len(action_dit_model.transformer_blocks)
+    n_cross_attn = 0
     n_patched = 0
     n_self_attn = 0
     for idx, block in enumerate(action_dit_model.transformer_blocks):
         if block.cross_attention_dim is None:
             n_self_attn += 1
             continue
+        n_cross_attn += 1
         block.attn1 = ControlVLAAttention(block.attn1, ffs_token_dim=ffs_token_dim)
         n_patched += 1
 
     print(
-        f"[ControlVLA] swapped attn1 in {n_patched}/{n_total} cross-attn blocks "
-        f"(self_attn_interleave_blocks={n_self_attn}, ffs_token_dim={ffs_token_dim})"
+        f"[ControlVLA] swapped attn1 in {n_patched}/{n_cross_attn} cross-attn blocks "
+        f"({n_total} total, self_attn_interleave_blocks={n_self_attn}, "
+        f"ffs_token_dim={ffs_token_dim})"
     )
 
     if n_patched == 0:
         raise RuntimeError(
             "[ControlVLA] install patched 0 blocks — DiT has no cross-attention."
+        )
+    if n_patched != n_cross_attn:
+        raise RuntimeError(
+            f"[ControlVLA] patched {n_patched} blocks but DiT exposes "
+            f"{n_cross_attn} cross-attn blocks. Refusing partial ControlVLA coverage."
         )
     if expected_n_total_blocks is not None and n_total != expected_n_total_blocks:
         raise RuntimeError(
