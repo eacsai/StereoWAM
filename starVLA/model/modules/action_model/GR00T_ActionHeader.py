@@ -341,6 +341,8 @@ class FlowmatchingActionHead(nn.Module):
 
         # state and action embedding along sequence dimension.
         future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
+        if getattr(self, "_ffs_spatial_bias", None) is not None:
+            future_tokens = future_tokens + self._ffs_spatial_bias
         sa_embs = (
             torch.cat((state_features, future_tokens, action_features), dim=1)
             if state_features is not None
@@ -394,6 +396,8 @@ class FlowmatchingActionHead(nn.Module):
 
             # Join vision, language, state and action embedding along sequence dimension.
             future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
+            if getattr(self, "_ffs_spatial_bias", None) is not None:
+                future_tokens = future_tokens + self._ffs_spatial_bias
             sa_embs = (
                 torch.cat((state_features, future_tokens, action_features), dim=1)
                 if state_features is not None
