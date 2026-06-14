@@ -349,3 +349,78 @@ _最后更新: 2026-06-10 by Claude（增 §10 StereoWorld 代码深读 + cam_ro
 **训练配方（实锤）**：AdamW lr 1e-4 cosine+5%warmup，wd 1e-2，bf16，DeepSpeed ZeRO-1；batch 16/卡；**LIBERO 8 卡 10 epochs（全局 128）/ RoboTwin 64 卡 5 epochs（全局 1024）**（README.md:259）。数据 = LIBERO 4 套件 lerobot + RoboTwin 27,500 demos（HF 下载），33 帧窗口=32 动作+9 视频帧（4:1）。
 
 **对我们（2 H100）**：① "省具身预训练 + 借大模型先验" 学得了（同 DepthVLA 套路）；② 但它端到端训 6B（视频 DiT 没冻）→ **Wan2.2-5B 我们 2 卡放不下,要换轻量 video DiT 或改"冻骨干只训小专家"**（偏离其 co-train 核心，而 ablation 证删 co-train 真机 90%→10%）；③ "训练 co-train 塑表征、推理砍未来" 实证支持我们 stereo-4D 的"训练预测未来 4D、推理一次前向"。
+
+
+## §12 ControlVLA 官方代码深读 + 我们 #7 一致性核对
+
+> **一句话结论**：我们的 `_our_controlvla_impl/controlvla_branch.py`（#7 并行 K/V 控制支路）在**所有受力轴上忠实复刻**了 ControlVLA 官方"活路径"的 K/V 控制机制；唯二的实质差异都是**有意为之的适配**（控制条件从物体掩码 token 换成 FFS 立体 token；条件编码器从微调改成硬冻结），不破坏"ControlVLA 式并行 K/V 支路"这个 claim。**跑 #7 前没有必须修的 mechanism 级 divergence**，只有一个可选的小加固（给支路 K/V 也清零 bias，但我们本来 bias=False，所以其实已经干净）。
+
+### (a) ControlVLA 是什么 + 它的 K/V 控制机制
+
+**ControlVLA**（论文 "ControlVLA: Few-shot Object-centric Adaptation for Pre-trained VLA"）= 在一个**预训练好的 VLA**（官方基于 diffusion_policy 的 action-diffusion transformer）上，加一条 **ControlNet 风格的零初始化控制支路**，用极少样本把**物体中心信号**注入冻结的策略里。核心思想跟 ControlNet 一样：冻结预训练主干 + 训练一条"出生即零贡献、慢慢长出来"的旁支。
+
+**⚠️ 文件陷阱（核对官方时第一坑）**：仓里有两套同名的 "control" 实现，**只有一套是真货**：
+- ❌ `transformer/control_transformer.py` + `diffusion/transformer_for_action_control_diffusion.py` = **废弃的旧变体**。它的控制 attention 整段被注释掉，实际跑的是 `memory = torch.cat([memory, control_memory])` 再做**一次普通 softmax**（= 把控制 token 拼进 memory 做单 softmax）。这**不是** ControlVLA 出货的机制，对比时引用它会误判。
+- ✅ **真正出货的 K/V 机制 = 这三个文件**：
+  - `transformer/modules.py` — 核心 attention 数学（`KVControlMultiheadAttention` + `control_multi_head_attention_forward` + `control_scaled_dot_product_attention`）
+  - `transformer/kvcontrol_transformer.py` — decoder 层把上面那个 attention 接进每个 cross-attn block
+  - `diffusion/transformer_for_action_kvcontrol_diffusion.py` — 外层 action-diffusion 包装 + 零初始化 + 冻结/训练划分
+
+**官方 K/V 支路怎么工作（核心数学，`modules.py` L311-338）**：每个 cross-attn decoder 层里，给一个**共享的 Query Q**（来自 action/去噪 token），跑**两个独立 softmax 再相加**：
+
+```
+对每个 cross-attn 层:
+    Q       = 主干 in_proj 投出的 query                       # 支路不另投 Q（control-Q 被丢弃）
+    K_t,V_t = in_proj 投 memory（VL/obs 条件）               # 主干键值
+    K_z,V_z = control_in_proj 投 control_memory（物体 token）  # 控制键值，独立投影
+    主干输出   = softmax(Q·K_tᵀ/√d) · V_t
+    控制输出   = softmax(Q·K_zᵀ/√d) · V_z                    # 第二个独立 softmax，不与主干拼键
+    融合      = 主干输出 + 控制输出                            # 在 out_proj 之前相加
+    最终      = 同一个共享 out_proj(融合)                      # 整条只有一个输出投影
+```
+
+关键点（每条都是后面核对的"受力轴"）：
+1. **共享 Q**：控制支路复用主干 Q，自己不投 query（`modules.py:552` 把 control-Q 丢弃 `_, control_k, control_v = ...`）。
+2. **两个独立 softmax 再求和**，不是"把控制键拼进主干键做一次 softmax"。`modules.py:553-554` 那两行 `cat([k, control_k])` 是**被注释掉的**——作者特意选了 separate-softmax-then-sum。
+3. **融合在 out_proj 之前，且共享同一个 out_proj**（`modules.py:709` 只有一次 `linear(..., out_proj_weight)`）。没有可学门控、没有 concat。
+4. **零初始化 = 清零控制输入投影，不是 ZeroConv**。`transformer_for_action_kvcontrol_diffusion.py` 的 `_zero_init_control_weights`（L71-78，由 `zeroinit_control=True` 触发）对每个 `KVControlMultiheadAttention` 做 `constant_(control_in_proj_weight, 0)` + `constant_(control_in_proj_bias, 0)`。这把打包的 [Q;K;V] 控制投影全清零 → 出生时 K_z=V_z=0 → 控制输出 = softmax(Q·0)·0 = 0 → step-0 策略输出 == 预训练策略。
+   - **ZeroConv1d 是红鲱鱼**：`common/zeroconv_layer.py` 里确实有个真零初始化的 `ZeroConv1d`，但它在 K/V 活路径里的引用（`kvcontrol_transformer.py` L243/248）**整段被注释掉**。谁要是说"必须用 ZeroConv 才忠实"，是错的——官方活路径根本没用它。
+5. **冻结/训练**：忠实配方是 `get_control_optim_groups`（按 `if 'control' in pn` 过滤参数），只训练 `control_in_proj_weight/bias` + 控制条件位置嵌入 + 物体编码器，主干被排除出优化器 = 冻结。
+   - ⚠️ **官方出货的 UMI workspace 自己都没严格冻**：`kvcontrol_finetune_..._workspace.py` L61 实际调的是**全量** `get_optimizer`，control-only 那行（L60）被注释掉了。所以出货配置是"全量微调 + warm-start + 零初始化控制支路"，比论文 claim 松。论文真正的"只训控制支路"在那条被注释的路径上。
+6. **条件来源 = 物体中心掩码**：`vision/oc_obs_encoder.py`（默认 config 选的 `OCObsEncoder`）把每个物体的二值分割掩码（B×num_objs×H×W bool）编成**每物体 1 个稀疏 token**（掩码质心的 2D 位置嵌入 + 可学 global_object_embedding，物体缺席则用 empty_object_embedding，可选 graycnn 形状 token）。即"物体在哪 + 在不在"。这是 few-shot **object-centric** adaptation 的本体。
+7. **控制支路无 mask**：`control_scaled_dot_product_attention` 若传入 `is_causal`/`attn_mask` 直接报错（L318/325）——控制注意力永远是全可见无遮挡。
+8. **每层都有**：decoder 是 `_get_clones` 的同一层，每个 `KVControlTransformerDecoderLayer` 各持一个 `KVControlMultiheadAttention`，同一份 control_memory 广播到每层。
+
+### (b) 一致性裁决：逐轴对比 我们的 `controlvla_branch.py`
+
+我们的实现（`ControlVLAAttention`，per cross-attn DiT block 把 `block.attn1` **替换**为 wrapper，原 `Attention` 存为 `self.base`）：
+
+| 轴 | 官方（kvcontrol 活路径） | 我们的 #7 | 裁决 |
+|---|---|---|---|
+| **(1) K_z/V_z 来源 + 共享 Q** | 专用 `control_in_proj` 投 control_memory，复用主干 Q，丢弃 control-Q | `to_k_z(ffs)`/`to_v_z(ffs)` 两个独立无偏 Linear，复用 `base.to_q(hidden_states)` 的同一 Q，不另投 Q（L111/142-146） | **一致** |
+| **(2) 零初始化形式** | 清零打包 `control_in_proj_weight`+`bias`（含没用的 Q 片）→ K_z=V_z=0 | `nn.init.zeros_` 清零 `to_k_z.weight` + `to_v_z.weight`（bias=False，无 bias 可漏，L95-98）。任一清零即足，两个都清是双保险 | **一致** |
+| **(3) 融合点（前/后 out_proj，sum/gate/concat）** | sum 两个值聚合 **在** out_proj **之前**，过**一个共享** out_proj；两个独立 softmax（concat 行注释掉） | `fused = attn_t + attn_z`（L149）在 `base.to_out[0]/[1]` 之前过**一次共享** to_out（L151-154）；两次独立 `F.scaled_dot_product_attention` = 两个独立 softmax | **一致** |
+| **(4) 每层 vs 单点** | 每个 cross-attn decoder 层各一个（clone 广播同一 control_memory） | `install_controlvla_branches` 给**每个** cross-attn block 换 attn1，`require_all_cross_attn=True` 断言全覆盖 + 总块数 guard，所有块读同一 `_STATE.ffs_tokens` | **一致** |
+| **(5) 冻结 vs 训练** | 忠实配方只训 `control*` + 微调物体编码器（低 LR）；**出货 UMI workspace 实际全量微调**（control-only 注释掉） | 训练 = 每层 `to_k_z/to_v_z` + 框架级 `ffs_pos_emb`；**硬冻结 FFS 立体编码器**（`.eval()` + `requires_grad=False` + no_grad）；主干冻结由 launcher FREEZE 管 | **部分**（见下） |
+| **(6) 条件来源** | 稀疏物体中心掩码 token（质心位置 + 物体身份） | 稠密 FFS 立体几何 token（`backbone` concat[L,R] 单目，或 `gru_hidden` net[0] 视差感知；AdaptiveAvgPool 到 8×8=64 token + `ffs_pos_emb`） | **部分**（见下） |
+| **(7) batch/mask/位置嵌入** | 控制支路无 mask；time_emb 拼到 cond 和 control_cond 双流；control_cond 加可学位置嵌入 | 支路 SDPA 不传 attn_mask（主干保留 mask）→ 一致；`ffs_pos_emb` 对应 control_cond_pos_emb；**HIGH-1**：`ffs.repeat(B//B_ffs,1,1)` = [s0,s1,s0,s1] 匹配 `QwenPI.forward` 的 `actions.repeat`（不是 repeat_interleave，否则 [s0,s0,s1,s1] 串扰）；time_emb 没拼进 FFS token（主干仍带 time） | **一致** |
+
+**总裁决：在所有受力轴（机制本身 = 轴 1/2/3/4/7）上 term-for-term 忠实。** 对抗 reviewer 无法在"ControlVLA 式并行 K/V 支路"这个 claim 上挑出机制级破绽：共享 Q、对独立条件流做零初始化独立 K/V 投影、两个独立 softmax 求和、在单个共享输出投影之前融合、每层放置、控制注意力无 mask——全对得上，且对的是**活的 kvcontrol 路径**而非废弃的 concat 路径（如果我们当初是"把 FFS 键拼进 K_t 再做一次 SDPA"，那才会匹配死路径 = 不忠实）。
+
+### (c) 跑 #7 前的 divergence 处理
+
+**必须修的（mechanism 级）：无。** 机制完全一致，可以直接跑。
+
+**可选小加固（不是 bug）**：
+- 官方零清了打包投影的 weight **和** bias；我们的 `to_k_z/to_v_z` 是 `bias=False`，所以根本没有非零 bias 会泄漏 → step-0 已经是干净的字节级零贡献，**不需要额外动作**。（如果将来有人把它们改成 `bias=True`，记得补 `nn.init.zeros_(...bias)`，否则 step-0 parity 破。）
+
+**有意为之、可接受的适配（论文里要明说，别藏）**：
+1. **条件来源换内容（轴 6）**：官方 = 稀疏物体中心掩码 token；我们 = 稠密 FFS 立体几何 token（`backbone` 单目 concat 或 `gru_hidden` net[0] 真视差）。这是往**同一个结构插槽**（action query 经零初始化支路额外注意的一条独立条件流）里换内容——K/V 机制本身 source-agnostic，所以是合法适配，**正是我们工作的 novelty**，论文应明确陈述而非淡化。
+2. **冻结条件编码器（轴 5）**：官方**微调**物体编码器（低 LR）；我们**硬冻结** FFS 立体编码器（它是蒸馏出来的几何 teacher）。这是可辩护的设计选择，要明说它跟 ControlVLA 的"微调条件编码器"配方不同。**反讽点**：官方出货的 UMI workspace 实际是全量微调 + warm-start（control-only 优化器被注释掉），所以连官方代码都比它论文 claim 松——我们靠 launcher FREEZE 冻主干，反而**更接近 ControlVLA 论文声称的"冻预训练、只训控制支路"原意**。
+3. **time_emb 没拼进 FFS 控制 token**：官方把 time 也拼进 control_cond；我们没拼。无所谓——两边主干 cond 流都还带 time，action query 照样看得到 time，不影响控制机制。
+4. **零初始化基底形式**：官方清一个打包 control_in_proj（含没用的 Q 片）；我们清两个独立无偏 K/V Linear。step-0 no-op 功能等价。
+5. **两次 SDPA vs 官方单函数双 softmax**：数学完全相同（两个 softmax 求和）。
+
+**论文撰写建议**：(1) 引用 `modules.py` + `kvcontrol_transformer.py` + `transformer_for_action_kvcontrol_diffusion.py` 作为 spec，**别引** `control_transformer.py`（死路径）；(2) 把"条件源替换"和"冻结编码器"作为有意设计明说；(3) 说明 step-0 字节级 parity 就是 ControlNet 式 warm start，对应官方 `zeroinit_control=True`。
+
+**关键文件锚点**：我们 `_our_controlvla_impl/controlvla_branch.py`（机制，L97-98 零初始化 / L149 融合 / L153-154 共享 to_out）+ `QwenPI_ControlVLA_FFS.py`（条件源 + 冻结）；官方 spec `controlvla_official/diffusion_policy/model/transformer/modules.py`（L311-338 双 softmax 求和 / L552 丢弃 control-Q / L709 共享 out_proj）+ `.../diffusion/transformer_for_action_kvcontrol_diffusion.py`（L71-78 零初始化）。
