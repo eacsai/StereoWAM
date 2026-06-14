@@ -31,6 +31,14 @@ TARGETS=(
   # 2026-06-10 #5 LLaMA-Adapter prefix injection:
   "qwen3p5_0p8b_ffs_llama_adapter_prefix_warmstartB_frozen_30k|20000 30000|ffs"
   "qwen3p5_0p8b_ffs_llama_adapter_prefix_fromscratch_perhead_30k|20000 30000|ffs"
+  # 2026-06-13 #9 FALCON-style action-side spatial inject (fromscratch, ffs eval, right_view,primary):
+  "qwen3p5_0p8b_ffs_falcon_spatial_inject_fromscratch_30k|20000 30000|ffs"
+  # 2026-06-13 #7 ControlVLA-style action-side K/V branch (interleave-ON, ffs eval, right_view,primary):
+  "qwen3p5_0p8b_ffs_controlvla_branch_fromscratch_30k|20000 30000|ffs"
+  "qwen3p5_0p8b_ffs_controlvla_branch_warmstartB_30k|20000 30000|ffs"
+  # 2026-06-13 #8 ValueResidual action-side V branch (interleave-ON, ffs eval, right_view,primary):
+  "qwen3p5_0p8b_ffs_value_residual_fromscratch_30k|20000 30000|ffs"
+  "qwen3p5_0p8b_ffs_value_residual_warmstartB_30k|20000 30000|ffs"
   # 2026-06-11 cam_branch (纯立体 run, 非 FFS -> plain eval, right_view,primary):
   "qwen3p5_0p8b_stereo_cam_branch_prope_fromscratch_30k|20000 30000|plain"
   # 2026-06-12 baseline reproducibility re-runs (seed 42, plain QwenGR00T fromscratch, no FFS/cam_rope/cam_branch).
