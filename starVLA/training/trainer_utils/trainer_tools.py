@@ -70,6 +70,70 @@ def normalize_dotlist_args(args):
     return normalized
 
 
+def _trainer_cfg_get(cfg, key: str, default=None):
+    trainer = getattr(cfg, "trainer", {})
+    if hasattr(trainer, "get"):
+        return trainer.get(key, default)
+    return getattr(trainer, key, default)
+
+
+def parse_train_only_patterns(train_only) -> list[str]:
+    if train_only is None:
+        return []
+    if isinstance(train_only, (list, tuple)):
+        raw = ",".join(str(item) for item in train_only)
+    else:
+        raw = str(train_only)
+    return [pattern.strip() for pattern in raw.split(",") if pattern.strip()]
+
+
+def parse_freeze_patterns(freeze_modules) -> list[str]:
+    if not isinstance(freeze_modules, str):
+        return []
+    return [pattern.strip() for pattern in freeze_modules.split(",") if pattern.strip()]
+
+
+def _matches_train_only(name: str, patterns: list[str]) -> bool:
+    return any(pattern in name for pattern in patterns)
+
+
+def _warn_train_only_ignores_freeze_modules(
+    train_only_patterns: list[str],
+    freeze_patterns: list[str],
+    context: str,
+) -> None:
+    if train_only_patterns and freeze_patterns and is_main_process():
+        print(
+            "[TRAIN_ONLY] train_only is set together with freeze_modules; "
+            f"ignoring freeze_modules in {context} so TRAIN_ONLY remains the single freeze policy: {freeze_patterns}"
+        )
+
+
+def apply_train_only_allowlist(model, train_only) -> list[str]:
+    """Freeze every parameter except names containing one TRAIN_ONLY pattern."""
+    patterns = parse_train_only_patterns(train_only)
+    if not patterns:
+        return []
+
+    trainable_names = []
+    for name, param in model.named_parameters():
+        keep = _matches_train_only(name, patterns)
+        param.requires_grad = keep
+        if keep:
+            trainable_names.append(name)
+
+    if not trainable_names:
+        raise RuntimeError(
+            f"[TRAIN_ONLY] allowlist {patterns} matched 0 parameters; refusing to train nothing."
+        )
+    if is_main_process():
+        print(
+            f"[TRAIN_ONLY] enabled with patterns={patterns}; "
+            f"{len(trainable_names)} parameters remain trainable"
+        )
+    return trainable_names
+
+
 def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler._LRScheduler]:
     """Build AdamW optimizer + LR scheduler from cfg.trainer.
 
@@ -121,14 +185,19 @@ def build_param_lr_groups(model, cfg):
     lr_cfg = cfg.trainer.learning_rate
     base_lr = lr_cfg.get("base", 1e-4)  # default base learning rate
 
-    freeze_modules = cfg.trainer.get("freeze_modules", "")
-    if not isinstance(freeze_modules, str):
-        freeze_modules = ""
-    freeze_patterns = [p.strip() for p in freeze_modules.split(",") if p.strip()]
+    train_only_patterns = parse_train_only_patterns(_trainer_cfg_get(cfg, "train_only", ""))
+    if train_only_patterns:
+        apply_train_only_allowlist(model, ",".join(train_only_patterns))
+
+    freeze_patterns = parse_freeze_patterns(_trainer_cfg_get(cfg, "freeze_modules", ""))
+    if train_only_patterns:
+        _warn_train_only_ignores_freeze_modules(train_only_patterns, freeze_patterns, "optimizer grouping")
+        freeze_patterns = []
 
     used_params = set()
     frozen_params = set()
     param_groups = []
+    param_id_to_name = {id(param): name for name, param in model.named_parameters()}
 
     for freeze_path in freeze_patterns:
         module = model
@@ -151,7 +220,14 @@ def build_param_lr_groups(model, cfg):
             # filter out frozen parameters (freeze_modules paths AND requires_grad=False)
             params = [p for p in module.parameters() if id(p) not in frozen_params and p.requires_grad]
             if params:  # only add param group if there are trainable parameters
-                param_groups.append({"params": params, "lr": lr, "name": module_name})
+                param_groups.append(
+                    {
+                        "params": params,
+                        "lr": lr,
+                        "name": module_name,
+                        "param_names": [param_id_to_name[id(p)] for p in params],
+                    }
+                )
                 used_params.update(id(p) for p in params)
         except AttributeError:
             ReferenceError(f"⚠️ module path `{module_name}` not found in vla")
@@ -159,7 +235,14 @@ def build_param_lr_groups(model, cfg):
     # assign base learning rate to the remaining unused parameters (exclude frozen ones)
     other_params = [p for p in model.parameters() if id(p) not in used_params and id(p) not in frozen_params and p.requires_grad]
     if other_params:
-        param_groups.append({"params": other_params, "lr": base_lr, "name": "base"})
+        param_groups.append(
+            {
+                "params": other_params,
+                "lr": base_lr,
+                "name": "base",
+                "param_names": [param_id_to_name[id(p)] for p in other_params],
+            }
+        )
 
     # CODEX FIX (2026-05-29): never hand requires_grad=False params to the optimizer.
     # Previously only `freeze_modules` paths were excluded; a framework that freezes a
@@ -176,6 +259,24 @@ def build_param_lr_groups(model, cfg):
     n_frozen_total = sum(1 for p in model.parameters() if not p.requires_grad)
     print(f"[optimizer] {n_opt} trainable params in {len(param_groups)} groups; "
           f"excluded {n_frozen_total} frozen (requires_grad=False) params")
+
+    if train_only_patterns:
+        opt_names = {
+            param_id_to_name[id(p)]
+            for group in param_groups
+            for p in group["params"]
+        }
+        expected_names = {
+            name
+            for name, param in model.named_parameters()
+            if _matches_train_only(name, train_only_patterns)
+        }
+        if opt_names != expected_names:
+            raise RuntimeError(
+                "[TRAIN_ONLY] optimizer param set mismatch: "
+                f"missing={sorted(expected_names - opt_names)[:20]} "
+                f"unexpected={sorted(opt_names - expected_names)[:20]}"
+            )
 
     return param_groups
 
@@ -221,7 +322,7 @@ import torch.distributed as dist
 
 class TrainerUtils:
     @staticmethod
-    def freeze_backbones(model, freeze_modules=""):
+    def freeze_backbones(model, freeze_modules="", train_only=None):
         """
         directly freeze the specified submodules based on the relative module path list (patterns), no longer recursively find all submodule names:
           - patterns: read from config.trainer.freeze_modules, separated by commas to get the "relative path" list
@@ -240,10 +341,13 @@ class TrainerUtils:
         frozen = []
         print("#"*30)
         print(freeze_modules)
-        if freeze_modules and type(freeze_modules) == str:
-            # split and remove whitespace
-            patterns = [p.strip() for p in freeze_modules.split(",") if p.strip()] if freeze_modules else []
+        patterns = parse_freeze_patterns(freeze_modules)
+        train_only_patterns = parse_train_only_patterns(train_only)
+        if train_only_patterns:
+            _warn_train_only_ignores_freeze_modules(train_only_patterns, patterns, "freeze_backbones")
+            patterns = []
 
+        if patterns:
             for path in patterns:
                 # split the "relative path" by dots, for example "action_model.net" → ["action_model", "net"]
                 attrs = path.split(".")

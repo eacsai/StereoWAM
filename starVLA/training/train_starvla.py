@@ -36,7 +36,12 @@ from starVLA.dataloader import build_dataloader
 from starVLA.model.framework.base_framework import build_framework
 from starVLA.model.framework.share_tools import apply_config_compat
 from starVLA.training.trainer_utils.config_tracker import AccessTrackedConfig, wrap_config
-from starVLA.training.trainer_utils.trainer_tools import TrainerUtils, build_param_lr_groups, setup_optimizer_and_scheduler, normalize_dotlist_args, is_main_process
+from starVLA.training.trainer_utils.trainer_tools import (
+    TrainerUtils,
+    build_param_lr_groups,
+    is_main_process,
+    normalize_dotlist_args,
+)
 
 deepspeed_plugin = DeepSpeedPlugin()
 accelerator = Accelerator(deepspeed_plugin=deepspeed_plugin)
@@ -134,7 +139,16 @@ class VLATrainer(TrainerUtils):
             if (self.config and hasattr(self.config.trainer, "freeze_modules"))
             else None
         )
-        self.model = self.freeze_backbones(self.model, freeze_modules=freeze_modules)
+        train_only = (
+            self.config.trainer.train_only
+            if (self.config and hasattr(self.config.trainer, "train_only"))
+            else None
+        )
+        self.model = self.freeze_backbones(
+            self.model,
+            freeze_modules=freeze_modules,
+            train_only=train_only,
+        )
         self.print_trainable_parameters(self.model)
 
         self.model, self.optimizer, self.vla_train_dataloader = self.setup_distributed_training(
