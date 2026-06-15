@@ -272,6 +272,33 @@ def _depth_position_columns(
     return _insert_position_columns(position_ids, insert_idx.to(position_ids.device), insert_pos)
 
 
+def _neutral_position_columns(
+    position_ids: torch.Tensor,
+    insert_idx: torch.Tensor,
+    num_insert: int,
+) -> torch.Tensor:
+    """Insert neutral columns by repeating the insertion anchor position.
+
+    This is for unordered global summary tokens. Unlike depth tokens, these do
+    not borrow a spatial grid of primary image positions.
+    """
+    seq_len = int(position_ids.shape[-1])
+    leading = tuple(position_ids.shape[:-2])
+    batch_size = int(position_ids.shape[-2])
+    anchor = (insert_idx.to(device=position_ids.device, dtype=torch.long) - 1).clamp(
+        min=0,
+        max=max(seq_len - 1, 0),
+    )
+    view_prefix = (1,) * len(leading)
+    gather_idx = anchor.reshape(*view_prefix, batch_size, 1).expand(
+        *leading,
+        batch_size,
+        num_insert,
+    )
+    insert_pos = torch.gather(position_ids, dim=-1, index=gather_idx)
+    return _insert_position_columns(position_ids, insert_idx.to(position_ids.device), insert_pos)
+
+
 def _compute_insert_idx(cam: torch.Tensor, primary_cam_id: int) -> torch.Tensor:
     # FFS #4 GR00T spec (2026-06-08): the prompt is real text in the message
     # layer; the hook inserts only depth tokens immediately before the primary
@@ -321,8 +348,15 @@ def install_depth_token_hooks(
     primary_cam_id: int = 0,
     cam_rope_state=None,
     image_token_id: Optional[int] = None,
+    position_mode: str = "primary_grid",
 ) -> Tuple[torch.utils.hooks.RemovableHandle, torch.utils.hooks.RemovableHandle]:
     """Install the outer bookkeeping hook and inner sequence-insertion hook."""
+    position_mode = str(position_mode)
+    if position_mode not in {"primary_grid", "neutral"}:
+        raise ValueError(
+            "install_depth_token_hooks position_mode must be 'primary_grid' or 'neutral', "
+            f"got {position_mode!r}"
+        )
     if image_token_id is None:
         image_token_id = int(hf_model.config.image_token_id)
     lm = lm if lm is not None else _locate_language_model(hf_model)
@@ -426,13 +460,20 @@ def install_depth_token_hooks(
                     f"[depth_token_inject] position_ids batch dim {position_ids.shape[-2]} "
                     f"!= batch_size {batch_size}"
                 )
-            kwargs["position_ids"] = _depth_position_columns(
-                position_ids=position_ids,
-                cam=cam.to(position_ids.device),
-                insert_idx=insert_idx.to(position_ids.device),
-                num_insert=num_insert,
-                primary_cam_id=int(primary_cam_id),
-            )
+            if position_mode == "primary_grid":
+                kwargs["position_ids"] = _depth_position_columns(
+                    position_ids=position_ids,
+                    cam=cam.to(position_ids.device),
+                    insert_idx=insert_idx.to(position_ids.device),
+                    num_insert=num_insert,
+                    primary_cam_id=int(primary_cam_id),
+                )
+            else:
+                kwargs["position_ids"] = _neutral_position_columns(
+                    position_ids=position_ids,
+                    insert_idx=insert_idx.to(position_ids.device),
+                    num_insert=num_insert,
+                )
             state.position_ids_after = kwargs["position_ids"].detach()
 
         attention_mask = kwargs.get("attention_mask", None)
@@ -471,9 +512,10 @@ def install_depth_token_hooks(
     inner_handle = lm.register_forward_pre_hook(_inner_pre_hook, with_kwargs=True)
     logger.info(
         "[depth_token_inject] installed outer(insert-index) + inner(sequence insertion) "
-        "hooks (image_token_id=%s, num_cameras=%s, primary_cam_id=%s)",
+        "hooks (image_token_id=%s, num_cameras=%s, primary_cam_id=%s, position_mode=%s)",
         image_token_id,
         num_cameras,
         primary_cam_id,
+        position_mode,
     )
     return outer_handle, inner_handle

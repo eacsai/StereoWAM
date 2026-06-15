@@ -1366,7 +1366,11 @@ class LeRobotSingleDataset(Dataset):
         trajectory_id, base_index = self.all_steps[index]
         raw_data = self.get_step_data(trajectory_id, base_index)
         data = self.transforms(raw_data)
-        return self._pack_sample(data)
+        sample = self._pack_sample(data)
+        sample["traj_id"] = trajectory_id
+        sample["base_index"] = base_index
+        sample["dataset_name"] = self.dataset_name
+        return sample
 
     def _pack_sample(self, data: dict) -> dict:
         """Pack transformed modality data into training sample format."""
@@ -2359,6 +2363,9 @@ class LeRobotMixtureDataset(Dataset):
                 raw_data = dataset.get_step_data(trajectory_id, step)    
                 data = dataset.transforms(raw_data)
                 sample = dataset._pack_sample(data)
+                sample["traj_id"] = trajectory_id
+                sample["base_index"] = step
+                sample["dataset_name"] = dataset.dataset_name
                 
                 return sample
                 

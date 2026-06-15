@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import logging
 import os
 import sys
@@ -257,9 +258,10 @@ def install_ffs_vlm_layer_residual_hooks(
 class QwenGR00TNet0FFSMixin:
     """Shared frozen Fast-FoundationStereo net[0] extraction helpers."""
 
-    def _init_frozen_ffs_net0(self, ffs_cfg, label: str) -> None:
+    def _init_frozen_ffs_net0(self, ffs_cfg, label: str, capture_net0: bool = True) -> None:
         self._ffs_label = label
         ffs_model_path = str(ffs_cfg.get("ffs_model_path"))
+        self._ffs_model_path = ffs_model_path
         self.ffs_image_size = int(ffs_cfg.get("ffs_image_size", 256))
         self.ffs_feat_dim = int(ffs_cfg.get("gru_hidden_dim", 16))
         self.ffs_feature_source = str(ffs_cfg.get("ffs_feature_source", "gru_hidden"))
@@ -287,9 +289,17 @@ class QwenGR00TNet0FFSMixin:
             raise FileNotFoundError(f"{label} FFS model not found: {ffs_model_path}")
 
         expected_sha256 = ffs_cfg.get("ffs_expected_sha256", None)
-        if expected_sha256:
+        self._ffs_expected_sha256 = str(expected_sha256) if expected_sha256 else None
+        cache_dir = ffs_cfg.get("utonia_cache_dir", None)
+        should_hash = bool(expected_sha256) or (
+            cache_dir is not None and str(cache_dir).strip().lower() not in {"", "none", "null"}
+        )
+        actual = None
+        if should_hash:
             with open(ffs_model_path, "rb") as fh:
                 actual = hashlib.sha256(fh.read()).hexdigest()
+        self._ffs_actual_sha256 = actual
+        if expected_sha256:
             if actual != expected_sha256:
                 raise RuntimeError(
                     f"{label} FFS SHA256 mismatch: expected={expected_sha256} got={actual}"
@@ -310,11 +320,12 @@ class QwenGR00TNet0FFSMixin:
             self.ffs.args["mixed_precision"] = False
 
         self._ffs_captured_net0 = None
+        self._ffs_net0_hook_handle = None
+        if capture_net0:
+            def _capture_net0_hook(_module, _inputs, output):
+                self._ffs_captured_net0 = output[0][0]
 
-        def _capture_net0_hook(_module, _inputs, output):
-            self._ffs_captured_net0 = output[0][0]
-
-        self._ffs_net0_hook_handle = self.ffs.update_block.register_forward_hook(_capture_net0_hook)
+            self._ffs_net0_hook_handle = self.ffs.update_block.register_forward_hook(_capture_net0_hook)
 
     def _imgs_to_ffs_tensor(self, batch_images: List, view_idx: int) -> torch.Tensor:
         from torchvision import transforms
@@ -385,6 +396,33 @@ class QwenGR00TNet0FFSMixin:
                 )
         return ffs_feat.detach()
 
+    def _compute_ffs_disparity(self, batch_images: List) -> torch.Tensor:
+        primary = self._imgs_to_ffs_tensor(batch_images, self.primary_idx)
+        right = self._imgs_to_ffs_tensor(batch_images, self.right_view_idx)
+        B = primary.shape[0]
+        with torch.no_grad():
+            if next(self.ffs.parameters()).dtype != torch.float32:
+                self.ffs.float()
+            self.ffs.eval()
+            with torch.amp.autocast("cuda", enabled=False):
+                disp_up = self.ffs(
+                    primary.float(),
+                    right.float(),
+                    iters=int(self.ffs.args.valid_iters),
+                    test_mode=True,
+                )
+        if not torch.is_tensor(disp_up):
+            raise RuntimeError(
+                f"{self._ffs_label} expected FFS test_mode=True to return a Tensor disparity, "
+                f"got {type(disp_up).__name__}"
+            )
+        if disp_up.shape != (B, 1, self.ffs_image_size, self.ffs_image_size):
+            raise RuntimeError(
+                f"{self._ffs_label} FFS disparity shape {tuple(disp_up.shape)} != "
+                f"{(B, 1, self.ffs_image_size, self.ffs_image_size)}"
+            )
+        return disp_up.detach().clone()
+
 
 class QwenGR00TFFSBase(QwenGR00TNet0FFSMixin, Qwen_GR00T):
     """Common GR00T FFS path used by training forward and predict_action."""
@@ -407,7 +445,7 @@ class QwenGR00TFFSBase(QwenGR00TNet0FFSMixin, Qwen_GR00T):
         self.config.framework.qwenvl.vl_hidden_dim = llm_dim
         return llm_dim
 
-    def _prepare_ffs_for_vlm(self, batch_images: List) -> None:
+    def _prepare_ffs_for_vlm(self, batch_images: List, sample_ids=None) -> None:
         raise NotImplementedError
 
     def _cleanup_ffs_after_vlm(self) -> None:
@@ -423,24 +461,57 @@ class QwenGR00TFFSBase(QwenGR00TNet0FFSMixin, Qwen_GR00T):
             )
             return qwenvl_outputs.hidden_states[-1]
 
-    def _encode_last_hidden_with_ffs(self, batch_images: List, instructions: List[str]) -> torch.Tensor:
+    def _encode_last_hidden_with_ffs(
+        self,
+        batch_images: List,
+        instructions: List[str],
+        sample_ids=None,
+    ) -> torch.Tensor:
         qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
             images=batch_images,
             instructions=instructions,
         )
-        self._prepare_ffs_for_vlm(batch_images)
+        prepare_kwargs = {}
+        if "sample_ids" in inspect.signature(self._prepare_ffs_for_vlm).parameters:
+            prepare_kwargs["sample_ids"] = sample_ids
+        self._prepare_ffs_for_vlm(batch_images, **prepare_kwargs)
         try:
             return self._run_qwenvl_forward(qwen_inputs)
         finally:
             self._cleanup_ffs_after_vlm()
+
+    def _sample_ids_from_examples(self, examples: List[dict]):
+        ids = []
+        for example in examples:
+            if all(key in example for key in ("dataset_name", "traj_id", "base_index")):
+                ids.append((example["dataset_name"], example["traj_id"], example["base_index"]))
+            else:
+                ids.append(None)
+        return ids if any(sample_id is not None for sample_id in ids) else None
+
+    def _encode_last_hidden_with_optional_sample_ids(
+        self,
+        batch_images: List,
+        instructions: List[str],
+        sample_ids=None,
+    ) -> torch.Tensor:
+        encode_kwargs = {}
+        if "sample_ids" in inspect.signature(self._encode_last_hidden_with_ffs).parameters:
+            encode_kwargs["sample_ids"] = sample_ids
+        return self._encode_last_hidden_with_ffs(batch_images, instructions, **encode_kwargs)
 
     def forward(self, examples: List[dict] = None, **kwargs):
         batch_images = [example["image"] for example in examples]
         instructions = [example["lang"] for example in examples]
         actions = [example["action"] for example in examples]
         state = [example["state"] for example in examples] if "state" in examples[0] else None
+        sample_ids = self._sample_ids_from_examples(examples)
 
-        last_hidden = self._encode_last_hidden_with_ffs(batch_images, instructions)
+        last_hidden = self._encode_last_hidden_with_optional_sample_ids(
+            batch_images,
+            instructions,
+            sample_ids=sample_ids,
+        )
 
         with torch.autocast("cuda", dtype=torch.float32):
             actions = torch.tensor(np.array(actions), device=last_hidden.device, dtype=last_hidden.dtype)
@@ -474,7 +545,11 @@ class QwenGR00TFFSBase(QwenGR00TNet0FFSMixin, Qwen_GR00T):
         if train_obs_image_size:
             batch_images = resize_images(batch_images, target_size=train_obs_image_size)
 
-        last_hidden = self._encode_last_hidden_with_ffs(batch_images, instructions)
+        last_hidden = self._encode_last_hidden_with_optional_sample_ids(
+            batch_images,
+            instructions,
+            sample_ids=None,
+        )
 
         state = (
             torch.from_numpy(np.array(state)).to(last_hidden.device, dtype=last_hidden.dtype)
@@ -488,6 +563,30 @@ class QwenGR00TFFSBase(QwenGR00TNet0FFSMixin, Qwen_GR00T):
     def _ffs_key_prefixes(self) -> Tuple[str, ...]:
         return ("ffs.",)
 
+    def _frozen_encoder_key_prefixes(self) -> Tuple[str, ...]:
+        return ("ffs.",)
+
+    def state_dict(self, *args, **kwargs):
+        state = super().state_dict(*args, **kwargs)
+        frozen_prefixes = self._frozen_encoder_key_prefixes()
+        if not frozen_prefixes:
+            return state
+        state_prefix = kwargs.get("prefix", "")
+        if len(args) >= 2 and isinstance(args[1], str):
+            state_prefix = args[1]
+
+        def is_frozen_key(key: str) -> bool:
+            if key.startswith(frozen_prefixes):
+                return True
+            if state_prefix and key.startswith(state_prefix):
+                return key[len(state_prefix):].startswith(frozen_prefixes)
+            return False
+
+        for key in list(state.keys()):
+            if is_frozen_key(key):
+                state.pop(key)
+        return state
+
     def _is_ffs_key(self, key: str) -> bool:
         return key.startswith(self._ffs_key_prefixes())
 
@@ -499,7 +598,19 @@ class QwenGR00TFFSBase(QwenGR00TNet0FFSMixin, Qwen_GR00T):
         # allow the FFS-adapter keys to be fresh-initialised. This prevents a
         # corrupted/partial FFS checkpoint from silently loading with missing
         # adapter params.
-        own_keys = set(self.state_dict().keys())
+        raw_own_keys = set(super().state_dict().keys())
+        frozen_prefixes = self._frozen_encoder_key_prefixes()
+        own_keys = {key for key in raw_own_keys if not key.startswith(frozen_prefixes)}
+        provided_frozen = {key for key in state_dict.keys() if key.startswith(frozen_prefixes)}
+        if provided_frozen:
+            logger.info(
+                "[GR00T-FFS audit] dropping %d frozen-encoder checkpoint keys; "
+                "encoders are loaded from configured paths",
+                len(provided_frozen),
+            )
+            state_dict = {
+                key: value for key, value in state_dict.items() if not key.startswith(frozen_prefixes)
+            }
         provided_keys = set(state_dict.keys())
         if init_from_baseline:
             # All-or-none per adapter family: a checkpoint carrying SOME keys of an
@@ -507,7 +618,7 @@ class QwenGR00TFFSBase(QwenGR00TNet0FFSMixin, Qwen_GR00T):
             # not a baseline — fresh-initialising the gaps would silently corrupt the
             # run. ('ffs.' frozen-net keys are exempt: loaded + sha-verified separately.)
             for prefix in self._ffs_key_prefixes():
-                if prefix == "ffs.":
+                if prefix in frozen_prefixes:
                     continue
                 own_family = {k for k in own_keys if k.startswith(prefix)}
                 provided_family = {k for k in provided_keys if k.startswith(prefix)}
@@ -518,11 +629,9 @@ class QwenGR00TFFSBase(QwenGR00TNet0FFSMixin, Qwen_GR00T):
                         f"{len(provided_family)} present, {len(own_family - provided_family)} "
                         f"missing (first={sample}). Refusing fresh-init of a truncated family."
                     )
-        allowed_missing = (
-            {key for key in own_keys - provided_keys if self._is_ffs_key(key)}
-            if init_from_baseline
-            else set()
-        )
+        allowed_missing = set(raw_own_keys - own_keys)
+        if init_from_baseline:
+            allowed_missing.update({key for key in own_keys - provided_keys if self._is_ffs_key(key)})
         legacy_cam_rope_keys = (
             {
                 key

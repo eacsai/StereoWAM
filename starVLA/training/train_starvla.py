@@ -438,6 +438,12 @@ def main(cfg) -> None:
     cfg = wrap_config(cfg)
     logger.info("✅ Configuration wrapped for access tracking")
 
+    if os.environ.get("METHOD10_DRYRUN_SEED_BEFORE_BUILD") == "1":
+        rank = dist.get_rank() if dist.is_initialized() else int(os.environ.get("RANK", "0"))
+        seed = cfg.seed + rank if hasattr(cfg, "seed") else rank + 3047
+        set_seed(seed)
+        logger.info("METHOD10 dry-run seeded before model build for shared baseline/cache init")
+
     output_dir = setup_directories(cfg=cfg)
     vla = build_framework(cfg)
     vla_train_dataloader = prepare_data(cfg=cfg, accelerator=accelerator, output_dir=output_dir)
