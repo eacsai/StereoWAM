@@ -32,7 +32,7 @@ PORTS=( 29751 29752 29753 )
 KINDS=( cv_warmstartB vr_fromscratch vr_warmstartB )
 
 log(){ echo "[queue $(date -u +%FT%TZ)] $*" | tee -a "$LOG"; }
-hssh(){ ssh $SSHOPT "root@$1" "$2" 2>/dev/null; }
+hssh(){ timeout 120 ssh $SSHOPT "root@$1" "$2" 2>/dev/null; }
 
 arm_handled(){
   local rid="$1" h
