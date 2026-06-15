@@ -424,3 +424,103 @@ _最后更新: 2026-06-10 by Claude（增 §10 StereoWorld 代码深读 + cam_ro
 **论文撰写建议**：(1) 引用 `modules.py` + `kvcontrol_transformer.py` + `transformer_for_action_kvcontrol_diffusion.py` 作为 spec，**别引** `control_transformer.py`（死路径）；(2) 把"条件源替换"和"冻结编码器"作为有意设计明说；(3) 说明 step-0 字节级 parity 就是 ControlNet 式 warm start，对应官方 `zeroinit_control=True`。
 
 **关键文件锚点**：我们 `_our_controlvla_impl/controlvla_branch.py`（机制，L97-98 零初始化 / L149 融合 / L153-154 共享 to_out）+ `QwenPI_ControlVLA_FFS.py`（条件源 + 冻结）；官方 spec `controlvla_official/diffusion_policy/model/transformer/modules.py`（L311-338 双 softmax 求和 / L552 丢弃 control-Q / L709 共享 out_proj）+ `.../diffusion/transformer_for_action_kvcontrol_diffusion.py`（L71-78 零初始化）。
+
+## §13 3D-VLA 官方代码深读 + 我们点云注入(Utonia)落地评估 (2026-06-14)
+
+> 一句话: 3D-VLA(ICML2024, UMass) = **BLIP-2(LAVIS 框架)+ 冻结 FlanT5-XL**。它的"点云"**不是用点云编码器编的**——是**离线预算好的 1408-d EVA-CLIP/BLIP 特征 lift 到 SAM 分割的体素点云**(3D-LLM 那套"2D 特征抬到 3D");一个 **Q-Former(32 learnable query)** cross-attend 这些点特征压成 32 token → Linear → 拼进 T5 输入嵌入的 `<scene>` 占位符位置。**动作=离散文本 token**(无连续动作头);**goal 点云=独立的 Point-E 扩散**(跟 LLM 只靠指令文本连,不可微耦合)。clone: `code_refs/3dvla`;论文 `papers/2403.09631.pdf`(15 页全读)。
+
+### (a) 3D-VLA 注入机制(受力轴,file:line)
+1. **3D 编码器=离线,不在训练图里**。dataset 直接从磁盘 load `pc_feat (N,1408)` + `pc (N,3)`(`threedvqa_datasets.py:58-61,129-132`)。1408=EVA-ViT-g 宽度(`eva_vit.py:522`);特征是 EVA-CLIP/BLIP 图像特征经 SAM 分割+体素化 lift 到点(路径名 `voxelized_features_sam_nonzero`/`nps_blip`, `:35-43`)。**训练时没有 live ViT/点网**。N=sample_num 固定(默认 8000;config 6400)。
+2. **几何只以"小幅相加正弦 PE"进入**:整数体素 XYZ(clamp 0..255)查固定 `PositionalEncoding1D(1408//3=469)` → reshape 1407 → pad 1408 → `pc_embeds = pc_feat + pos*0.1`(`blip2_t5.py:132-135,146-151`)。这是 LLM 分支里**唯一**的 3D 几何来源(粗、不可学)。
+3. **Q-Former 压缩**:32 个 learnable query(`blip2.py:55-66`, encoder_width=1408, cross_attention_freq=2)先自注意再 cross-attend N 个点特征 → `(B*T,32,768)`(`blip2_t5.py:153-160`; cross-attn K/V=Linear(1408→768))。
+4. **投影 + 拼接进 LLM**:`t5_proj=Linear(768→2048)`(`:130,161`)→ 每帧 32 token;`insert_3d_feats` 把这 32 token splice 进 T5 ENCODER 输入嵌入序列里**每个 `<scene>` 标记之后**(`:167-198`, 倒序遍历 cat 左/特征/右)。T5 当普通词嵌入吃(`inputs_embeds`, `:257-263`)。**单点、嵌入层注入,无逐层 adapter、无注入 LLM 内部 cross-attn**。
+5. **冻结/可训**:FlanT5-XL transformer 块**全冻**,只解冻 {Q-Former, 32 query, t5_proj, T5 输入/输出 embedding 表(因加了新 special token)}(`:121-126`)。从 BLIP2-FlanT5-XL 权重 init(strict=False),**不是**从 3D-LLM ckpt。
+6. **动作=离散文本 token**:tokenizer 加 256×`<aloc>` + 256×`<arot>` + `<gripper0/1>` + `<ACT_SEP>` + 256×`<loc>`(`:104-113`);整模型一个 T5 seq2seq 交叉熵 loss(`forward :200-266`)。**没有连续动作头**(跟我们 GR00T DiT 完全不同范式)。
+7. **goal 点云/图像=独立扩散,非张量耦合**:goal 点云=Point-E `GoalPointDiffusionTransformer`(`pointe/transformer.py:627-706`),把 start 点云**通道拼接**(6→12 ch, `modify_layer` 重建 input_proj, output_proj 零初始化)给噪声 goal,CLIP 文本 condition;DDPM 1024 步 ε-MSE;独立 `train_pe_goal_pcd.py` 训。goal 图像=SD-2 InstructPix2Pix。LLM 只发 `<image>`/`<pcd>` 标记,两个扩散头各自 render。三组件分开训(`launcher/train_{llm,ldm,pe}.sh`),不可微联训。
+
+### (b) 对我们: "左图+深度+内参→点云→Utonia→注入" 落地评估
+**结论: 方案可行且比 3D-VLA 更扎实, 但注入要走 Utonia 自家的【相加】法、不要照搬 3D-VLA 的 Q-Former, 且决定性实验必须上非饱和/OOD 单变量对照。**
+
+- **比 3D-VLA 更扎实**: 3D-VLA 根本没用真点云编码器(它的"点特征"=2D CLIP 特征贴 3D 位置 + 0.1 正弦 PE)。我们用 **真反投影点云(左图+左深度+K)+ 冻结 Utonia(137M PTv3,真几何编码器)**,几何信息比 3D-VLA 强。
+- **注入法选 Utonia 自家的相加, 不照搬 3D-VLA Q-Former**: Utonia 论文 A.3 自己就做了我们要做的事——per image-patch 3D 坐标→伪点云→冻结 Utonia→特征**逐元素加到 2D 视觉 token**(Video-3D LLM 上),操作 Tab.9 Utonia 82.1>Concerto 80.0>Sonata 74.7。对 0.8B 小模型,相加(对齐到左图 token 网格)比 3D-VLA 的"Q-Former 32 token+splice 占位符+离散动作 token+FlanT5"整套轻得多,且我们已有 #2(ControlNet 残差→vl_embs)/#8(残差→action Value)注入机器可复用。**3D-VLA 真正可借的只有"encoder→resampler(Q-Former/Perceiver)→投影→marker splice"这个 pattern**(若点数多需 resampler 压 token);`pointe/perceiver.py SimplePerceiver` 是现成 cross-attn resampler。
+- **注入点**: 跟我们已验证一致——VLM 端加到 vl_embs 的**左图图像 token 位置**(几何对齐,因 Utonia 点特征与左图同源),或动作端。PointVLA/PointACT 证据: 别注进冻结 VLM trunk 深处, action 端/边界更稳。
+- **命门(别忘 6pp 噪声底)**: 我们 ~10 个注入变体在饱和 LIBERO 全噪声带内; 点云/几何收益在文献里**只在 OOD 显**(PointVLA 高度/GeoVLA 视角/Utonia cluttered)。所以**决定性实验 = Utonia 点云特征 vs 我们现有的立体深度特征(FoundationStereo net[0])单变量对照, 上非饱和/OOD split(RoboCasa+右目 / 高度尺度视角扰动)**。若 Utonia 不能在 OOD 上超我们已有的立体注入 + 超 6pp, 就**不值得**加 137M 冻结编码器 + 反投影 + PTv3 forward 的推理开销。
+- **接入步骤(starVLA)**: ① 左深度+K 反投影成点云(右先左后约定下用左/primary 帧); ② 冻结 Utonia forward(channel 整除 6, 注意 granularity rescale); ③ Utonia per-point 特征对齐到左图 token 网格(scatter, 仿 #2/#8 的 primary-token 对齐); ④ 零初始化相加到 vl_embs(step-0=baseline)。⑤ Utonia 权重从 Pointcept 取(pointcept.github.io/Utonia)。
+- 参见 Utonia 笔记 `notes/2603.03283_Utonia.md`、点云 VLA 清单 `notes/pointcloud_vla_litscan.md`、`[[project_experiment_registry]]`(6pp 噪声底)、`[[project_stereo_consistent_4d_proposal]]`(Utonia future work 也指向 4D)。
+
+
+## §14 Utonia 仓库深读 + #4 上下文 token 形式注入点云特征到 starVLA (2026-06-14)
+
+> 仓库 `code_refs/utonia`(github Pointcept/Utonia, 小: 23 .py, 全模型在 `utonia/utonia/model.py`)。论文 `papers/2603.03283.pdf` + 笔记 `notes/2603.03283_Utonia.md`。一句话: Utonia = **RoPE-PTv3 冻结点编码器**, `utonia.load()` 从 HF 下权重(架构 config 在 .pth 里), forward 吃一个 grid-sample 后的 point dict, 返回带 per-point `.feat` 的 Point 对象。我们要把它的 per-point 特征经 **#4 上下文 token 形式**(project→token→插 VLM 序列)塞进 starVLA。
+
+### (a) 核心模型(model.py 一个文件)
+- **Point3DRoPE**(model.py:51-107): head_dim 必须**整除 6**(assert %3==0 + arange step2 + rotate_half), 把 head_dim 三等分对 x/y/z 各加 1D rotary, **作用在原始连续 coord 上**(几何进 attention 的唯一机制)。
+- **SerializedAttention**(model.py:147-333): 序列化(z-order/hilbert)patch 注意力, 每层建一个 rope, `q,k=rope(q,k,point.coord[order])`(model.py:294,298), flash-attn varlen 或手写 softmax。
+- **PointTransformerV3**(model.py:648-849): embedding stem + 5 段 encoder(GridPooling 下采样 + Block) + 4 段 decoder(GridUnpooling 上采样, enc_mode 时跳过)。`forward(data_dict)` 返回 **Point(addict.Dict), 不是裸 tensor**; per-point 特征在 `out.feat`; encoder 每次 pool 存 `pooling_parent`/`pooling_inverse` 供多尺度读出。
+- **⚠️ 真架构 config 不在源码, 在 ckpt["config"] 里**(model.py:885 `PointTransformerV3(**ckpt["config"])`)。源码默认 args 是**坏占位符**(enc_channels/heads 给 head_dim=16 不整除3 → Point3DRoPE assert 崩)。**绝不能用默认实例化**; 必先 `ckpt=utonia.load("utonia",ckpt_only=True); print(ckpt["config"])` 拿真 channels/heads/depths/in_channels/enc_mode。
+- 3 个论文设计里**只有 RoPE-on-coords 在推理仓实现**; Causal Modality Blinding(无 mask) + Granularity Rescale(shift/jitter/rescale_coords 入参但 forward 没用) 是训练期/stub。推理就当 plain RoPE-PTv3。
+- ⚠️ 两 agent 分歧: 一个说释放权重 enc+dec(全分辨率输出), 一个说 enc_mode=True(纯编码器)。**以 ckpt["config"]["enc_mode"] 为准**(pre-flight 打印)。
+
+### (b) 集成 API(要在 starVLA 复刻的配方)
+1. **load+冻结**: `import utonia; model=utonia.load("utonia",repo_id="Pointcept/Utonia").cuda().eval(); [p.requires_grad_(False) for p in model.parameters()]`。CPU/无 flash: `custom_config=dict(enable_flash=False, enc_patch_size=[1024]*5)`。权重落 ~/.cache/utonia/ckpt。
+2. **建点云(我们的左图+深度+K)**: 逐像素反投影 `X=(u-cx)*d/fx, Y=(v-cy)*d/fy, Z=d`(相机系)→ coord(N,3); color(N,3)=左图 RGB 0-255; normal(N,3)= 没有就 `np.zeros_like(coord)`(Utonia 把缺模态当零)。坐标用**米制**。
+3. **transform(强制)**: `t=utonia.transform.default(scale=4.0, apply_z_positive=True, normalize_coord=False)`(scale=4.0=操作粒度, 是**唯一**粒度旋钮, grid_size 固定 0.01 scaled 单位 → 有效体素=0.01/scale)。`point=t({"coord","color","normal"})` → 张量 dict: `coord/grid_coord/color/feat(=cat[coord,color,normal]=9维,须等于 in_channels)/offset/inverse(N_orig→grid 映射)`。多样本 `utonia.data.collate_fn([...])`。
+4. **forward**: `with torch.inference_mode(): out=model(point)`。
+5. **读 per-point 特征**: 走 pooling 链拼多尺度(demo: `for _ in range(2 or 4): parent=out.pop("pooling_parent"); inv=out.pop("pooling_inverse"); parent.feat=cat([parent.feat,out.feat[inv]]); out=parent`)→ 再 `per_point=out.feat[out.inverse]` 映回**原始 N 点(跟像素 1:1)**。**输出维度从 ckpt["config"]/linear-probe head config 读, 别信占位符**(占位 96/512)。
+- **依赖(重, 接入风险)**: py3.10 / CUDA12.4 / **torch 2.5.0**(我们 starVLA 是 torch **2.6.0**+cu124, 版本差一档要验) / spconv-cu124 / torch-scatter / flash-attn(或 enable_flash=False) / huggingface_hub / addict / timm / numpy<=1.26.4。**spconv + torch_scatter 是承重原生依赖**, 4090d/h100b 要先装通。
+
+### (c) #4 上下文 token 形式接入(用户要的)
+**可行, 复用 #4(QwenGR00T_DepthTokenFFS)机器, 换特征源**。流程:
+```
+左图深度+K → 反投影点云 → 冻结 Utonia forward → per-point 特征 out.feat[out.inverse] (N≈像素数, 跟左图 1:1)
+   → reshape 回左图 H×W 网格(因每点=一像素) → AdaptiveAvgPool 到 8×8=64 token(同 #4 对 net[0] 的做法)
+   → 零初始化 Linear 投到 Qwen 宽度 → 插入 VLM 输入序列(keep/strip, 同 #4)
+```
+- **关键: 这一步解决了"Utonia 输出不规则点 vs #4 要规则网格"的矛盾** —— 因为点是从左图反投影来的, per-point 特征能直接 scatter 回图像网格, 再 AdaptiveAvgPool, 既复用 #4、又保图像对齐(也=Utonia A.3 "per image-patch" 的精神)。
+- **落地 = 新框架 `QwenGR00T_UtoniaPointTokenFFS`**(镜像 #4 DepthTokenFFS, 加 "反投影+Utonia forward+多尺度读出+scatter回网格" 前处理, 换掉 FoundationStereo net[0])。零初始化投影 → step-0=baseline。冻结整个 Utonia(eval+requires_grad False+inference_mode)。
+- **pre-flight(接入前必做)**: ① `print(ckpt["config"])` 拿真 in_channels/输出维度/enc_mode; ② 4090d/h100b 装通 spconv+torch_scatter+flash-attn(torch 2.6 vs 2.5 验兼容); ③ 确认反投影点云的 N 和左图网格能对齐 reshape; ④ smoke step-0==baseline。
+- **命门(还是 6pp 噪声底, 决定建不建)**: 这是**第 11 种几何注入**。决定性实验 = **Utonia 点云特征 vs 我们现有 FoundationStereo net[0] 立体特征, 单变量, 上非饱和/OOD split**(RoboCasa+右目 / 高度尺度视角扰动)。Utonia 在 OOD 超不过已有立体注入 + 超不过 6pp → 不值得加这套重点云管线(反投影+137M PTv3+spconv 推理开销)。**真问题不是"能不能用#4装Utonia"(能), 是"它在OOD能不能超已有立体注入"。**
+- 参见 `[[reference_3dvla_utonia_pointcloud]]`(裁决) / §13(3D-VLA, 对比: 3D-VLA 没用真点云编码器) / `notes/2603.03283_Utonia.md` / `[[project_experiment_registry]]`(6pp)。
+
+
+## §15 4D 点云怎么进 VLM(token 预算)+ 注入法对比 + 为何 3D-VLA 整套不适合(2026-06-14)
+
+> 背景: 用户问"输入 4D 帧→4D 点云, 庞大点云怎么喂 VLM", 以及"能不能用固定长度 Query(跟单图 token 等长)学点云特征再 cat 进 VLM 序列"。结论先放: **能, query-resampler 是对的, 且是 3D-VLA 唯一可复用的部分; "3D-VLA 不适合"指它的整套 stack(冻结 FlanT5 + 离散动作文本 token + 离线 2D-lift 假点特征 + 重 Q-Former), 不是 resampler 概念。**
+
+### (a) 铁律: 永远不把【原始点】当 token 喂 —— 点编码器 + 固定 token 预算扛
+原始 4D(T 帧 × N 点)几十万点, 直接当 token 必爆。三层压缩:
+- **空间维(单帧 N 点 → 固定 K token), 三选一**:
+  1. **per-patch 对齐 + 相加(Utonia 自家法, 最省, 新增 0 token)**: 一个图像 patch 一个伪点 → Utonia 特征跟视觉 token 1:1 → 逐元素加。token 数 = patch 数不变。代价: 几何分辨率被 patch 网格限。
+  2. **网格池化(#4 法)**: per-point 特征 scatter 回图像网格 → AdaptiveAvgPool 8×8=64 token/帧。
+  3. **学习式 resampler(Q-Former/Perceiver, = 用户的提议)**: K 个 learnable query cross-attend N 点 → K token, **token 数与点数解耦**。
+- **时间维(T 帧, 别堆 T 份完整 token 否则 T×K 爆)**:
+  - (a) **帧聚合**: 多帧位姿对齐聚成一个规范点云再编码一次(Utonia frame-aug 即此)。
+  - (b) **关键帧 + 运动 token**: 少数帧编空间 + 紧凑 scene-flow 编时间。
+  - (c) **跨 4D 固定预算 resampler**: K query cross-attend 整个 4D 点集(加时空 PE)→ 全程 K token, 不随 T/N 长。
+  - (d) token merging/pruning(ToMe 式)编码后合冗余。
+- **0.8B 账**: Qwen 一帧图像 token ~64-256; naive 4D = T×(图像+几何) token, T>2-3 爆。Utonia-add 新增 0; resampler 固定 K(32-64)不随 4D 长。
+
+### (b) 注入法三选一 + 取舍(给我们)
+| 法 | token 增长 | 几何对齐 | 可训练量 | 适用 |
+|---|---|---|---|---|
+| **Utonia-add(per-patch 相加)** | 0(骑在图像 token) | 强(1:1 像素对齐) | 最少(一个零初始化投影) | 单帧/可 per-patch 对齐; 小模型最省; Utonia 验证过 |
+| **#4 网格 token insert(keep/strip)** | +64/帧 | 中(scatter 回网格) | 少 | 单帧, 复用我们现成 #4 机器 |
+| **Query-resampler → cat(用户提议=3D-VLA 可复用核)** | +K(固定, 不随点/帧长) | 弱(需 VLM 学 query↔图像 对应) | 中(resampler 跨注意力 + K query) | **庞大/不可对齐的 4D 点云首选** |
+
+- **关键洞察**: 单帧可对齐 → Utonia-add 最省; **庞大 4D 不可 per-patch 对齐 → resampler(用户提议)才是对的工具**(token 与点数/帧数解耦)。所以用户的直觉对——4D 场景就该用 resampler。
+- K 不必 = 单图 token 长(query 是"摘要"不需对齐图像数量); K=32-64 通常够(3D-VLA 用 32)。等长也行, 只是更贵。
+- ⚠️ resampler 的 cat token 跟图像 token **不天然对齐**, 冻结 VLM 要靠注意力**学**它们的对应(BLIP-2/Flamingo 能做到, 但小模型/饱和数据下比 aligned-add 难收敛)→ 小模型先试 Utonia-add, 4D/大点云再上 resampler。
+
+### (c) 为何 3D-VLA【整套】不适合, 但 resampler【概念】可复用
+3D-VLA 可复用的**只有** "learnable query cross-attend 点特征 → 固定 token → splice 进 LLM 序列" 这个 resampler 机制(= 用户提议)。**不适合的是它整套 stack**:
+1. **骨干 = 冻结 FlanT5-XL(encoder-decoder T5)**; 我们 = Qwen3.5(decoder)+ **GR00T DiT 连续动作头**。范式不同。
+2. **动作 = 离散文本 token**(`<aloc>/<arot>` 由 T5 解码), 无连续动作头; 我们是连续 diffusion 动作。直接搬 = 错范式。
+3. **它的"点特征"不是真点编码器**, 是离线 lift 的 2D EVA-CLIP 特征贴 3D 位置; 我们用**真 Utonia 点特征**, 更扎实。
+4. **Q-Former = 完整 BERT(重)+ 需 BLIP-2 init**; 我们用更轻的 Perceiver/小 cross-attn resampler 就够。
+→ 所以: **借 resampler 概念(用户提议), 接到我们 Qwen+GR00T-DiT + 真 Utonia 特征上**; 不搬 3D-VLA 的 T5/离散动作/Q-Former/2D-lift。
+
+### (d) 给我们的落地建议(按场景)
+- **单帧立体深度/点云(现在)**: Utonia-add(per-patch, 零新增 token) 或 #4 insert —— 最省, 复用现成机器, 先做。
+- **未来 4D 点云**: **resampler(用户提议)固定 K token + 时间维聚合或 scene-flow** —— token 与 4D 规模解耦。但记住 **4D 真价值在运动**: 与其堆 4D 点, 不如编/预测 scene-flow(接 stereo-4D / LaMP)。
+- 命门不变(6pp 噪声底): 不管哪种注入, 决定性实验 = Utonia/点云特征 vs 现有立体 net[0], 单变量, 上 OOD; 超不过 6pp 不值得。
+- 参见 §13(3D-VLA 走查)/ §14(Utonia + #4 接入)/ `notes/2603.03283_Utonia.md` / `[[project_stereo_consistent_4d_proposal]]`。
