@@ -19,7 +19,7 @@ base_vlm=${BASE_VLM:-./playground/Pretrained_models/Qwen3.5-0.8B}
 DATA_ROOT=${DATA_ROOT:-playground/Datasets/LEROBOT_LIBERO_OURRENDER_PW}
 DATA_MIX=${DATA_MIX:-libero_all_sfstereo_leftprimary}
 FRAMEWORK=QwenGR00T_LlamaAdapterPrefixFFS
-B_CKPT=playground/Checkpoints/qwen3p5_0p8b_4suite_stereo_camrope_rightprimary_ourrender_30k/checkpoints/steps_30000_pytorch_model.pt
+B_CKPT=
 
 ffs_model_path=${FFS_MODEL_PATH:-${FFS_REPO_DIR}/weights/20-30-48/model_best_bp2_serialize.pth}
 ffs_sha256=${FFS_SHA256:-98b5a9acf39fbfa795025de8cea95ce123daa40f6b6234d719167751024cf692}

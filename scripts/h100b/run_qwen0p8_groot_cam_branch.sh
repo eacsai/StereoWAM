@@ -18,7 +18,7 @@ base_vlm=${BASE_VLM:-./playground/Pretrained_models/Qwen3.5-0.8B}
 DATA_ROOT=${DATA_ROOT:-playground/Datasets/LEROBOT_LIBERO_OURRENDER_PW}
 DATA_MIX=${DATA_MIX:-libero_all_sfstereo_leftprimary}
 FRAMEWORK=QwenGR00T
-B_CKPT=playground/Checkpoints/qwen3p5_0p8b_4suite_stereo_camrope_rightprimary_ourrender_30k/checkpoints/steps_30000_pytorch_model.pt
+B_CKPT=
 PRETRAINED_CKPT=${PRETRAINED_CKPT-${B_CKPT}}
 
 run_root_dir=./playground/Checkpoints

@@ -17,7 +17,7 @@ set -uo pipefail
 REPO=${REPO:-/mnt/data/wangqiwei/wangqiwei/starVLA}
 CKPT=${CKPT:-$REPO/playground/Checkpoints}
 Q=${Q:-$CKPT/ffs_queue}
-B_CKPT=${B_CKPT:-$CKPT/qwen3p5_0p8b_4suite_stereo_camrope_rightprimary_ourrender_30k/checkpoints/steps_30000_pytorch_model.pt}
+B_CKPT=${B_CKPT:-}
 LAUNCHER=${LAUNCHER:-scripts/h100b/run_qwen0p8_groot_ffs.sh}
 SMOKE=${SMOKE:-scripts/h100b/smoke_groot_ffs.py}
 CONDA_VENV=${CONDA_VENV:-/opt/conda/envs/starvla/bin}

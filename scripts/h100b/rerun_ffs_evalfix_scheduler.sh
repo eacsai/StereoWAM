@@ -16,7 +16,7 @@ cd "$REPO"
 CKPT=$REPO/playground/Checkpoints
 Q=$CKPT/rerun_evalfix_queue
 ARCHIVE=$CKPT/_prebugfix_archive
-B_CKPT=$CKPT/qwen3p5_0p8b_4suite_stereo_camrope_rightprimary_ourrender_30k/checkpoints/steps_30000_pytorch_model.pt
+B_CKPT=
 LAUNCHER=scripts/h100b/run_qwen0p8_groot_ffs.sh
 FFS_REPO=/mnt/data/wangqiwei/wangqiwei/Fast-FoundationStereo
 GPU_FREE_MB=${GPU_FREE_MB:-4000}

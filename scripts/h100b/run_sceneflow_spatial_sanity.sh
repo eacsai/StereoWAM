@@ -22,7 +22,7 @@ export NUM_DEPTH_TOKENS=64
 export POOL_HW=8
 
 # warm-start from baseline B (matches the real #4 keep setup); freeze the VLM trunk
-export PRETRAINED_CKPT=/mnt/data/wangqiwei/wangqiwei/starVLA/playground/Checkpoints/qwen3p5_0p8b_4suite_stereo_camrope_rightprimary_ourrender_30k/checkpoints/steps_30000_pytorch_model.pt
+export PRETRAINED_CKPT=/mnt/data/wangqiwei/wangqiwei/starVLA/
 export FREEZE_MODULES=qwen_vl_interface
 
 # scene-flow head (zero-init -> step-0 must equal baseline)

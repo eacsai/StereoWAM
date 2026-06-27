@@ -45,9 +45,9 @@ def main() -> int:
         "gru_hidden_dim": 16,
         "ffs_image_size": image_size,
         "num_cameras": 2,
-        "primary_idx": 1,
-        "right_view_idx": 0,
-        "primary_cam_id": 1,
+        "left_ref_idx": 1,
+        "primary_view_idx": 0,
+        "inject_cam_id": 1,
         "utonia_ckpt_path": os.environ.get(
             "UTONIA_CKPT_PATH", "./playground/Pretrained_models/Utonia/utonia.pth"
         ),

@@ -11,7 +11,7 @@ SSHOPT="-o StrictHostKeyChecking=no -o ConnectTimeout=30 -o ServerAliveInterval=
 REPO=/mnt/data/wangqiwei/wangqiwei/starVLA
 CK=$REPO/playground/Checkpoints
 LOG=/data/wangqiwei/ICLR2026/starVLA/playground/Checkpoints/wait_method7.log
-B_CKPT=playground/Checkpoints/qwen3p5_0p8b_4suite_stereo_camrope_rightprimary_ourrender_30k/checkpoints/steps_30000_pytorch_model.pt
+B_CKPT=
 TRAIN_ONLY_ALLOW="ffs_pos_emb,.attn1.to_k_z.,.attn1.to_v_z."
 GPU_FREE_MB=4000
 POLL=600

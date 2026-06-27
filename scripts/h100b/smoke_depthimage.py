@@ -57,9 +57,9 @@ def ffs_depth_image_cfg(args: argparse.Namespace) -> dict:
         "gru_hidden_dim": 16,
         "ffs_image_size": args.ffs_image_size,
         "num_cameras": 2,
-        "primary_idx": 1,
-        "right_view_idx": 0,
-        "primary_cam_id": 1,
+        "left_ref_idx": 1,
+        "primary_view_idx": 0,
+        "inject_cam_id": 1,
         "depth_prompt": "Below is the stereo disparity (depth) map of the left view:",
     }
 
