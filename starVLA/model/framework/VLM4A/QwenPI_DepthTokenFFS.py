@@ -291,7 +291,7 @@ class QwenPI_DepthTokenFFS(QwenPI):
                 k.startswith("stereo_cam_embed.")
                 or k.startswith("stereo_cam_rope_layers.")
                 or (
-                    ".language_model.layers." in k
+                    "qwen_vl_interface.model.model.language_model.layers." in k
                     and ".self_attn.stereo_cam_layer." in k
                 )
             )
