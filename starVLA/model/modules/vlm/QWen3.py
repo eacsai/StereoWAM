@@ -58,12 +58,32 @@ class _QWen3_VL_Interface(nn.Module):
                 print("[WARNING] flash_attn not installed, falling back to sdpa")
                 attn_implementation = "sdpa"
 
-        model = Qwen3VLForConditionalGeneration.from_pretrained(
-            model_id,
-            attn_implementation=attn_implementation,
-            dtype=torch.bfloat16,
-            ignore_mismatched_sizes=True, # resize image no longer needed? @TODO check bug
-        )
+        # === ZeRO-3 compat: temporarily disable HF auto `deepspeed.zero.Init` ===
+        # When accelerate launches with stage=3, HfDeepSpeedConfig is registered
+        # globally → transformers.from_pretrained wraps the load in zero.Init,
+        # which partitions parameters to size-0 shards.  That breaks downstream
+        # Copy Init code that needs the full q_proj/k_proj weights to extract
+        # the M-RoPE temporal subspace slice.  We unset the weak ref during load
+        # so params come back full-size, then restore it.  Later in the training
+        # loop, DeepSpeed engine wraps the model and re-partitions normally.
+        try:
+            import transformers.integrations.deepspeed as _ds_integ
+            _saved_ds_weak_ref = _ds_integ._hf_deepspeed_config_weak_ref
+            _ds_integ._hf_deepspeed_config_weak_ref = None
+            _ds_init_unset = True
+        except Exception:
+            _ds_init_unset = False
+
+        try:
+            model = Qwen3VLForConditionalGeneration.from_pretrained(
+                model_id,
+                attn_implementation=attn_implementation,
+                dtype=torch.bfloat16,
+                ignore_mismatched_sizes=True, # resize image no longer needed? @TODO check bug
+            )
+        finally:
+            if _ds_init_unset:
+                _ds_integ._hf_deepspeed_config_weak_ref = _saved_ds_weak_ref
         processor = AutoProcessor.from_pretrained(model_id)
         processor.tokenizer.padding_side = "left"
 
