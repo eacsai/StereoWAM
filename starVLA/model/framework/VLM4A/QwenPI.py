@@ -29,7 +29,6 @@ from starVLA.model.modules.action_model.LayerwiseFM_ActionHeader import Layerwis
 from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 from starVLA.training.trainer_utils.trainer_tools import resize_images
-from starVLA.model.modules.stereo import install_stereo_cam_rope_hooks
 
 ####################################################
 # ⚠️ Warning: This framework has been restructured and is NOT compatible with checkpoints created before 2025-10-20.
@@ -185,47 +184,19 @@ class Qwen_PI(baseframework):
         # only ever read `action_horizon` here.
         self.action_horizon = int(self.config.framework.action_model.action_horizon)
 
-        # === Phase 3 B: Stereo Camera-Frame RoPE (dim expansion, opt-in) ===
-        # Patches each standard attention layer to add q_cam/k_cam projections;
-        # image tokens get a camera-conditioned rotation in the new d_c dim.
-        # Zero Init → step-0 byte-identical to baseline.
+        # === cam_rope removed (inert double-zero no-op) ===
+        # Inert attrs retained for load_state_dict's stereo-key tolerance and the
+        # DepthTokenLoRA subclass's (stripped) hook re-registration.
         self._stereo_cam_rope_state = None
         self._stereo_cam_rope_layers = None
         self._stereo_cam_rope_top_hook_handle = None
         self._stereo_cam_rope_top_hook_fn = None
         self._stereo_cam_rope_reinstall_top_hook = None
         if bool(self.config.framework.qwenvl.get("stereo_cam_rope_enabled", False)):
-            self._stereo_cam_rope_state, scl_modules = install_stereo_cam_rope_hooks(
-                self.qwen_vl_interface.model,
-                d_c=int(self.config.framework.qwenvl.get("stereo_cam_rope_d_c", 16)),
-                num_cameras=int(self.config.framework.qwenvl.get("stereo_cam_rope_num_cameras", 2)),
-                baseline_m=float(self.config.framework.qwenvl.get("stereo_cam_rope_baseline_m", 0.06)),
-                fovy_degrees=float(self.config.framework.qwenvl.get("stereo_cam_rope_fovy_degrees", 45.0)),
-                image_width=int(self.config.framework.qwenvl.get("stereo_cam_rope_image_width", 256)),
-                image_height=int(self.config.framework.qwenvl.get("stereo_cam_rope_image_height", 256)),
-                spatial_merge_size=int(self.config.framework.qwenvl.get("stereo_cam_rope_spatial_merge", 2)),
-                init_mode=str(self.config.framework.qwenvl.get("stereo_cam_rope_init_mode", "zero")),
-                epipolar_mask_enabled=bool(self.config.framework.qwenvl.get("stereo_epipolar_mask_enabled", False)),
+            raise NotImplementedError(
+                "stereo_cam_rope_enabled=True but the cam_rope module was removed "
+                "(inert double-zero). QwenPI no longer installs cam_rope hooks."
             )
-            self._stereo_cam_rope_top_hook_handle = getattr(
-                self._stereo_cam_rope_state, "top_pre_hook_handle", None
-            )
-            self._stereo_cam_rope_top_hook_fn = getattr(self._stereo_cam_rope_state, "top_pre_hook_fn", None)
-            self._stereo_cam_rope_reinstall_top_hook = getattr(
-                self._stereo_cam_rope_state, "reinstall_top_pre_hook", None
-            )
-            # B-1a (codex round-1 fix): fail-closed startup check. install_*_hooks
-            # already raises if no Qwen3_5Attention layers exist, but we double-check
-            # here because future model surgery / freeze_modules cfg may silently
-            # leave the list empty without raising.
-            if not scl_modules:
-                raise RuntimeError(
-                    "stereo_cam_rope_enabled=True but install_stereo_cam_rope_hooks returned 0 layers. "
-                    "Did the model architecture change so no Qwen3_5Attention layers are present?"
-                )
-            # Register the per-layer projection modules as a ModuleList child so
-            # they participate in state_dict / DDP / DeepSpeed sharding.
-            self.stereo_cam_rope_layers = nn.ModuleList(scl_modules)
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
         """Permissive load that survives Phase 3 stereo module toggles.

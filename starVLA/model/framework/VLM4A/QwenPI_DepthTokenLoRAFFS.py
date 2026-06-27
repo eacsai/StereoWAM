@@ -119,48 +119,7 @@ class QwenPI_DepthTokenLoRAFFS(QwenPI_DepthTokenFFS):
         )
         self.qwen_vl_interface.model = get_peft_model(self.qwen_vl_interface.model, lora_config)
         peft_model = self.qwen_vl_interface.model
-        self._reinstall_stereo_cam_rope_outer_hook(peft_model)
         self._reinstall_depth_token_outer_hook(peft_model)
-
-    def _reinstall_stereo_cam_rope_outer_hook(self, top_module) -> None:
-        state = getattr(self, "_stereo_cam_rope_state", None)
-        if state is None:
-            return
-
-        old_handle = getattr(self, "_stereo_cam_rope_top_hook_handle", None)
-        if old_handle is None:
-            old_handle = getattr(state, "top_pre_hook_handle", None)
-
-        reinstall = getattr(self, "_stereo_cam_rope_reinstall_top_hook", None)
-        if reinstall is None:
-            reinstall = getattr(state, "reinstall_top_pre_hook", None)
-        hook_fn = getattr(self, "_stereo_cam_rope_top_hook_fn", None)
-        if hook_fn is None:
-            hook_fn = getattr(state, "top_pre_hook_fn", None)
-
-        if old_handle is None and reinstall is None and hook_fn is None:
-            raise RuntimeError(
-                "[DepthToken-LoRA] stereo cam-rope state has no top-level pre-hook metadata; "
-                "cannot re-register it on the PEFT wrapper"
-            )
-        if old_handle is not None:
-            old_handle.remove()
-
-        if reinstall is not None:
-            new_handle = reinstall(top_module)
-        elif hook_fn is not None:
-            new_handle = top_module.register_forward_pre_hook(hook_fn, with_kwargs=True)
-            setattr(new_handle, "stereo_cam_rope_outer_hook_fn", hook_fn)
-        else:
-            raise RuntimeError(
-                "[DepthToken-LoRA] stereo cam-rope top-level pre-hook callable is unavailable"
-            )
-
-        state.top_pre_hook_handle = new_handle
-        self._stereo_cam_rope_top_hook_handle = new_handle
-        self._stereo_cam_rope_top_hook_fn = getattr(new_handle, "stereo_cam_rope_outer_hook_fn", hook_fn)
-        self._stereo_cam_rope_reinstall_top_hook = getattr(new_handle, "reinstall_outer_hook", None)
-        logger.info("[DepthToken-LoRA] re-registered stereo cam-rope top pre-hook on PEFT wrapper")
 
     def _reinstall_depth_token_outer_hook(self, top_module) -> None:
         handles = getattr(self, "_depth_token_hook_handles", None)

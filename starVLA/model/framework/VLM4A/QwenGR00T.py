@@ -37,7 +37,7 @@ from starVLA.model.modules.action_model.GR00T_ActionHeader import FlowmatchingAc
 from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 from starVLA.training.trainer_utils.trainer_tools import resize_images
-from starVLA.model.modules.stereo import install_cam_branch, install_stereo_cam_rope_hooks
+from starVLA.model.modules.stereo import install_cam_branch
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -204,39 +204,19 @@ class Qwen_GR00T(baseframework):
         self.config = merge_framework_config(QwenGR00TDefaultConfig, config)
         self.qwen_vl_interface = get_vlm_model(config=self.config)
 
-        cam_rope_enabled = bool(self.config.framework.qwenvl.get("stereo_cam_rope_enabled", False))
         cam_branch_enabled = bool(self.config.framework.qwenvl.get("stereo_cam_branch_enabled", False))
-        if cam_rope_enabled and cam_branch_enabled:
-            raise RuntimeError(
-                "stereo_cam_rope_enabled and stereo_cam_branch_enabled are mutually exclusive. "
-                "cam_branch is the parallel PRoPE replacement; disable cam_rope first."
+        # cam_rope (StereoCamRoPELayer d_c branch) was removed — it was a
+        # provably-inert double-zero no-op. Fail closed if a stale config still
+        # asks for it instead of silently ignoring the flag.
+        if bool(self.config.framework.qwenvl.get("stereo_cam_rope_enabled", False)):
+            raise NotImplementedError(
+                "stereo_cam_rope_enabled=True but the cam_rope module was removed "
+                "(inert double-zero). Use stereo_cam_branch_enabled instead."
             )
-
-        # === Stereo Camera-Frame RoPE install (ported from QwenPI) ===
+        # Inert legacy attributes kept so load_state_dict's legacy cam_rope-key
+        # drop (below) still works on old cam_rope-trained baseline checkpoints.
         self._stereo_cam_rope_state = None
         self.stereo_cam_rope_layers = None
-        if cam_rope_enabled:
-            import torch.nn as _nn_for_stereo
-            self._stereo_cam_rope_state, scl_modules = install_stereo_cam_rope_hooks(
-                self.qwen_vl_interface.model,
-                d_c=int(self.config.framework.qwenvl.get("stereo_cam_rope_d_c", 16)),
-                num_cameras=int(self.config.framework.qwenvl.get("stereo_cam_rope_num_cameras", 2)),
-                baseline_m=float(self.config.framework.qwenvl.get("stereo_cam_rope_baseline_m", 0.06)),
-                fovy_degrees=float(self.config.framework.qwenvl.get("stereo_cam_rope_fovy_degrees", 45.0)),
-                image_width=int(self.config.framework.qwenvl.get("stereo_cam_rope_image_width", 256)),
-                image_height=int(self.config.framework.qwenvl.get("stereo_cam_rope_image_height", 256)),
-                spatial_merge_size=int(self.config.framework.qwenvl.get("stereo_cam_rope_spatial_merge", 2)),
-                init_mode=str(self.config.framework.qwenvl.get("stereo_cam_rope_init_mode", "zero")),
-                epipolar_mask_enabled=bool(self.config.framework.qwenvl.get("stereo_epipolar_mask_enabled", False)),
-                right_first=bool(self.config.framework.qwenvl.get("stereo_cam_rope_right_first", True)),
-                extra_image_cam_id=self.config.framework.qwenvl.get("stereo_extra_image_cam_id", None),
-            )
-            if not scl_modules:
-                raise RuntimeError(
-                    "stereo_cam_rope_enabled=True but install_stereo_cam_rope_hooks returned 0 layers. "
-                    "Did the model architecture change so no attention layers found?"
-                )
-            self.stereo_cam_rope_layers = _nn_for_stereo.ModuleList(scl_modules)
 
         # === Parallel PRoPE camera branch install ===
         self._stereo_cam_branch_state = None
