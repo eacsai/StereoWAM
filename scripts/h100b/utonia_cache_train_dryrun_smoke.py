@@ -125,7 +125,7 @@ def main() -> int:
     parser.add_argument("--num-processes", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--ds-config", default="starVLA/config/deepseeds/deepspeed_zero2_ga4.yaml")
-    parser.add_argument("--data-mix", default=os.environ.get("DATA_MIX", "libero_all_sfstereo_rightprimary"))
+    parser.add_argument("--data-mix", default=os.environ.get("DATA_MIX", "libero_all_sfstereo_leftprimary"))
     parser.add_argument("--loss-atol", type=float, default=1e-5)
     parser.add_argument("--loss-rtol", type=float, default=1e-5)
     parser.add_argument("--timeout-sec", type=int, default=3600)

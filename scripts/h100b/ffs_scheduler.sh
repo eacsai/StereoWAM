@@ -39,7 +39,6 @@ log(){ echo "[$LOG_TAG $(ts)] $*"; }
 METHODS=(
 "vlminput|QwenGR00T_VLMInputFFS|qwen3p5_0p8b_ffs_vlminput_warmstartB_30k|29731"
 "controlnet|QwenGR00T_ControlNetFFS|qwen3p5_0p8b_ffs_controlnet_warmstartB_30k|29732"
-"vlmcontrolnet|QwenGR00T_VLMControlNetFFS|qwen3p5_0p8b_ffs_vlmcontrolnet_warmstartB_30k|29733"
 )
 
 cd "$REPO" || { log "FATAL: REPO 不存在 $REPO"; exit 1; }

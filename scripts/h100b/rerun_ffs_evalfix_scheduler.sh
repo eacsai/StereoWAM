@@ -34,9 +34,7 @@ QUEUE=(
   "1|QwenGR00T_VLMInputFFS|qwen3p5_0p8b_ffs_vlminput_fromscratch_fullinject_30k|||identity|29735"
   "2|QwenGR00T_VLMInputFFS|qwen3p5_0p8b_ffs_vlminput_warmstartB_30k|${B_CKPT}|qwen_vl_interface|zero|29731"
   "3|QwenGR00T_ControlNetFFS|qwen3p5_0p8b_ffs_controlnet_warmstartB_30k|${B_CKPT}|qwen_vl_interface|zero|29732"
-  "4|QwenGR00T_VLMControlNetFFS|qwen3p5_0p8b_ffs_vlmcontrolnet_warmstartB_30k|${B_CKPT}|qwen_vl_interface|zero|29733"
   "5|QwenGR00T_ControlNetFFS|qwen3p5_0p8b_ffs_controlnet_warmstartB_camfrozen_30k|${B_CKPT}|qwen_vl_interface,stereo_cam_rope_layers|zero|29743"
-  "6|QwenGR00T_VLMControlNetFFS|qwen3p5_0p8b_ffs_vlmcontrolnet_warmstartB_camfrozen_30k|${B_CKPT}|qwen_vl_interface,stereo_cam_rope_layers|zero|29744"
 )
 
 archive_old(){   # run_id — move a prior (buggy) output dir aside so the launcher's

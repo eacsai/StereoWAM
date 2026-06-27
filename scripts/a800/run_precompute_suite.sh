@@ -21,7 +21,7 @@ echo "[precompute ${SUITE}] start $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   --cache-dir playground/Datasets/utonia_cache_perpatch \
   --suites "${SUITE}" \
   --data-root playground/Datasets/LEROBOT_LIBERO_OURRENDER_PW \
-  --data-mix libero_all_sfstereo_rightprimary \
+  --data-mix libero_all_sfstereo_leftprimary \
   --ffs-model-path /home/wangqiwei/ICLR2026/Fast-FoundationStereo/weights/20-30-48/model_best_bp2_serialize.pth \
   --ffs-expected-sha256 98b5a9acf39fbfa795025de8cea95ce123daa40f6b6234d719167751024cf692 \
   --utonia-ckpt-path ./playground/Pretrained_models/Utonia/utonia.pth \

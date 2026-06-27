@@ -71,7 +71,7 @@ PRETRAINED_CKPT= FREEZE_MODULES= CAM_BRANCH=0 CAM_ROPE=0"
     baseline_stereo)
       envv="NUM_PROCESSES=1 MAX_STEPS=30000 SAVE_INTERVAL=10000 BS=32 \
 DS_CONFIG=starVLA/config/deepseeds/deepspeed_zero2_ga4.yaml FRAMEWORK=QwenGR00T \
-DATA_ROOT=playground/Datasets/LEROBOT_LIBERO_OURRENDER_PW DATA_MIX=libero_all_sfstereo_rightprimary \
+DATA_ROOT=playground/Datasets/LEROBOT_LIBERO_OURRENDER_PW DATA_MIX=libero_all_sfstereo_leftprimary \
 PRETRAINED_CKPT= FREEZE_MODULES= CAM_BRANCH=0 CAM_ROPE=0"
       launcher="scripts/h100b/run_qwen0p8_groot_cam_branch.sh" ;;
     falcon)

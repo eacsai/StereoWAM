@@ -69,15 +69,10 @@ FRAMEWORKS = {
     "#2": "QwenGR00T_ControlNetFFS",
     "controlnet": "QwenGR00T_ControlNetFFS",
     "QwenGR00T_ControlNetFFS": "QwenGR00T_ControlNetFFS",
-    "3": "QwenGR00T_VLMControlNetFFS",
-    "#3": "QwenGR00T_VLMControlNetFFS",
-    "vlm_controlnet": "QwenGR00T_VLMControlNetFFS",
-    "QwenGR00T_VLMControlNetFFS": "QwenGR00T_VLMControlNetFFS",
 }
 FRAMEWORK_ORDER = [
     "QwenGR00T_VLMInputFFS",
     "QwenGR00T_ControlNetFFS",
-    "QwenGR00T_VLMControlNetFFS",
 ]
 PLAIN_FRAMEWORK = "QwenGR00T"
 
@@ -377,10 +372,6 @@ def clear_framework_state(model: nn.Module) -> None:
         from starVLA.model.framework.VLM4A.QwenGR00T_FFSCommon import clear_layer_hook_state
 
         clear_layer_hook_state(model._ffs_layer_hook_state)
-    if hasattr(model, "_vlm_controlnet_state"):
-        from starVLA.model.modules.stereo.vlm_controlnet import clear_state
-
-        clear_state()
     if hasattr(model, "_ffs_captured_net0"):
         model._ffs_captured_net0 = None
 

@@ -3,7 +3,6 @@
 # Select method with:
 #   FRAMEWORK=QwenGR00T_VLMInputFFS
 #   FRAMEWORK=QwenGR00T_ControlNetFFS
-#   FRAMEWORK=QwenGR00T_VLMControlNetFFS
 #   FRAMEWORK=QwenGR00T_DepthTokenFFS
 #   FRAMEWORK=QwenGR00T_DepthImageFFS
 set -e
@@ -33,10 +32,9 @@ ffs_sha256=${FFS_SHA256:-98b5a9acf39fbfa795025de8cea95ce123daa40f6b6234d71916775
 case "${FRAMEWORK}" in
   QwenGR00T_VLMInputFFS) DEFAULT_GPUS=0; DEFAULT_PORT=29731 ;;
   QwenGR00T_ControlNetFFS) DEFAULT_GPUS=1; DEFAULT_PORT=29732 ;;
-  QwenGR00T_VLMControlNetFFS) DEFAULT_GPUS=2; DEFAULT_PORT=29733 ;;
   QwenGR00T_DepthTokenFFS) DEFAULT_GPUS=0; DEFAULT_PORT=29734 ;;
   QwenGR00T_DepthImageFFS) DEFAULT_GPUS=0; DEFAULT_PORT=29735 ;;
-  *) echo "FRAMEWORK must be one of QwenGR00T_VLMInputFFS / QwenGR00T_ControlNetFFS / QwenGR00T_VLMControlNetFFS / QwenGR00T_DepthTokenFFS / QwenGR00T_DepthImageFFS"; exit 1 ;;
+  *) echo "FRAMEWORK must be one of QwenGR00T_VLMInputFFS / QwenGR00T_ControlNetFFS / QwenGR00T_DepthTokenFFS / QwenGR00T_DepthImageFFS"; exit 1 ;;
 esac
 
 run_root_dir=./playground/Checkpoints
@@ -65,7 +63,7 @@ case "${STRIP_DEPTH}" in 0|1) ;; *) echo "[guard] STRIP_DEPTH must be 0 or 1, go
 # forcing the SDPA math backend -> ~4x slower full-finetune steps. Disabling it is
 # mathematically output-equivalent (verified by smoke_camrope_disable_equivalence.py)
 # and restores FA2. Default 1 keeps every pre-existing run type byte-identical.
-CAM_ROPE=${CAM_ROPE:-1}
+CAM_ROPE=${CAM_ROPE:-0}
 case "${CAM_ROPE}" in 0|1) ;; *) echo "[guard] CAM_ROPE must be 0 or 1, got '${CAM_ROPE}'"; exit 3 ;; esac
 CAM_ROPE_BOOL=$([ "${CAM_ROPE}" = "1" ] && echo true || echo false)
 
