@@ -124,7 +124,14 @@ def _utonia_geometry_meta(pc_cfg, grid_hw: Tuple[int, int]) -> dict:
         "depth_max",
         "disp_eps",
     )
-    meta = {"grid_hw": [int(grid_hw[0]), int(grid_hw[1])]}
+    legacy = any(pc_cfg.get(key, None) is not None for key in ("primary_idx", "right_view_idx", "primary_cam_id"))
+    meta = {
+        "grid_hw": [int(grid_hw[0]), int(grid_hw[1])],
+        "view_order": ["right_view", "primary"] if legacy else ["primary", "left_view"],
+        "reference_view": "legacy_primary_after_unrotate" if legacy else "left_view",
+        "net0_frame": "legacy_primary_rotated" if legacy else "left_view",
+        "unrotate": bool(legacy),
+    }
     for key in keys:
         if key == "utonia_feature_dim":
             value = pc_cfg.get(key, UTONIA_FEATURE_DIM)
@@ -366,6 +373,12 @@ def validate_utonia_cache(
                 if cached_geometry.get(key) != expected_geometry.get(key)
             }
             raise RuntimeError(f"Utonia cache geometry mismatch for suite={suite}: {mismatches}")
+        for key in ("view_order", "reference_view", "net0_frame", "unrotate"):
+            if meta.get(key) != expected_geometry.get(key):
+                raise RuntimeError(
+                    f"Utonia cache {key} mismatch for suite={suite}: "
+                    f"meta={meta.get(key)!r} expected={expected_geometry.get(key)!r}"
+                )
 
         image_sha_by_key = _validate_image_sha_samples(
             suite=suite,
@@ -791,7 +804,7 @@ class UtoniaPointCloudMixin:
 
     def _build_pointcloud_samples(self, batch_images: List, pc_cfg) -> Tuple[torch.Tensor, List[PointCloudSample]]:
         disparity = self.compute_ffs_disparity(batch_images)
-        rgb = self._imgs_to_rgb_255_tensor(batch_images, self.primary_idx)
+        rgb = self._imgs_to_rgb_255_tensor(batch_images, self.ffs_image1_idx)
         samples = backproject_disparity_to_pointcloud(
             disparity=disparity,
             left_rgb_255=rgb,
@@ -1203,9 +1216,6 @@ class _BenchModel(UtoniaPointCloudMixin, QwenGR00TNet0FFSMixin, nn.Module):
     def __init__(self, cfg: dict) -> None:
         super().__init__()
         self.num_cameras = 2
-        self.primary_idx = 1
-        self.right_view_idx = 0
-        self.primary_cam_id = 1
         self._init_frozen_ffs_for_disparity(cfg, "[UtoniaCostBench]")
         self._init_frozen_utonia(cfg, "[UtoniaCostBench]")
         self.cfg = cfg
@@ -1242,9 +1252,9 @@ def run_cost_benchmark(args: argparse.Namespace) -> int:
         "gru_hidden_dim": 16,
         "ffs_image_size": args.image_size,
         "num_cameras": 2,
-        "primary_idx": 1,
-        "right_view_idx": 0,
-        "primary_cam_id": 1,
+        "left_ref_idx": 1,
+        "primary_view_idx": 0,
+        "inject_cam_id": 1,
         "utonia_ckpt_path": args.utonia_ckpt_path,
         "utonia_expected_sha256": args.utonia_expected_sha256 or None,
         "utonia_scale": args.utonia_scale,

@@ -20,7 +20,7 @@ For each framework this script checks:
   7. A short 10-step training loop is finite, has non-zero gradients in the
      trainable FFS adapter and action head, and keeps the VLM trunk frozen.
 
-The script deliberately uses synthetic right-first stereo examples so it does
+The script deliberately uses synthetic leftprimary stereo examples so it does
 not depend on the LIBERO dataloader. It still builds the real model, real B
 checkpoint config, real Fast-FoundationStereo weights, and real forward paths.
 """
@@ -58,7 +58,7 @@ DEFAULT_FFS_MODEL = (
 )
 DEFAULT_FFS_SHA256 = "98b5a9acf39fbfa795025de8cea95ce123daa40f6b6234d719167751024cf692"
 DEFAULT_DATA_ROOT = "playground/Datasets/LEROBOT_LIBERO_OURRENDER_PW"
-DEFAULT_DATA_MIX = "libero_all_sfstereo_rightprimary"
+DEFAULT_DATA_MIX = "libero_all_sfstereo_leftprimary"
 
 FRAMEWORKS = {
     "1": "QwenGR00T_VLMInputFFS",
@@ -136,9 +136,9 @@ def ffs_common_cfg(args: argparse.Namespace, hidden_key: str = "inject_hidden_di
         "ffs_image_size": args.ffs_image_size,
         hidden_key: 256,
         "num_cameras": 2,
-        "primary_idx": 1,
-        "right_view_idx": 0,
-        "primary_cam_id": 1,
+        "left_ref_idx": 1,
+        "primary_view_idx": 0,
+        "inject_cam_id": 1,
     }
     return cfg
 
@@ -228,16 +228,13 @@ def make_pattern(seed: int, size: int) -> np.ndarray:
     return base
 
 
-def right_first_pair(seed: int, size: int, shift: int = 6) -> list[Image.Image]:
-    left = make_pattern(seed, size)
-    # A camera to the RIGHT of the left eye sees scene content shifted LEFT
-    # (positive disparity). np.roll with a NEGATIVE shift encodes that; the old
-    # +shift produced inverted stereo polarity (negative disparity), which is why
-    # the identical-collapse / swap-sign checks had to be demoted to warnings.
-    right = np.roll(left, shift=-shift, axis=1)
+def leftprimary_pair(seed: int, size: int, shift: int = 6) -> list[Image.Image]:
+    # leftprimary order: view[0]=primary (base), view[1]=left_view (shifted partner).
+    primary = make_pattern(seed, size)
+    left_view = np.roll(primary, shift=shift, axis=1)
     return [
-        Image.fromarray(right, mode="RGB"),
-        Image.fromarray(left, mode="RGB"),
+        Image.fromarray(primary, mode="RGB"),
+        Image.fromarray(left_view, mode="RGB"),
     ]
 
 
@@ -261,7 +258,7 @@ def make_examples(
         if variant == "identical":
             images = identical_pair(1000 + idx, image_size)
         else:
-            images = right_first_pair(2000 + idx, image_size, shift=6 + idx)
+            images = leftprimary_pair(2000 + idx, image_size, shift=6 + idx)
         action = np.zeros((horizon, action_dim), dtype=np.float32)
         state = np.zeros((1, state_dim), dtype=np.float32)
         action[:, 0] = np.linspace(-0.2, 0.2, horizon, dtype=np.float32)
@@ -352,9 +349,9 @@ def assert_primary_mask(model: nn.Module) -> str:
     grid = state.primary_grid
     if cam is None or grid is None:
         raise AssertionError("hook state did not record per_token_cam_id / primary_grid")
-    primary_cam_id = int(model.primary_cam_id)
+    primary_cam_id = int(model.inject_cam_id)
     if primary_cam_id != 1:
-        raise AssertionError(f"primary_cam_id is {primary_cam_id}, expected 1 for right-first data")
+        raise AssertionError(f"primary_cam_id is {primary_cam_id}, expected 1 for leftprimary data")
 
     details = []
     for b, (h_tok, w_tok) in enumerate(grid):
@@ -464,16 +461,16 @@ def extract_disparity_like(raw_output, batch: int) -> torch.Tensor:
 
 
 def run_ffs_raw(model: nn.Module, images: list) -> tuple[object, torch.Tensor]:
-    primary = model._imgs_to_ffs_tensor(images, model.primary_idx)
-    right = model._imgs_to_ffs_tensor(images, model.right_view_idx)
+    image1 = model._imgs_to_ffs_tensor(images, model.ffs_image1_idx)
+    image2 = model._imgs_to_ffs_tensor(images, model.ffs_image2_idx)
     with torch.inference_mode():
         if next(model.ffs.parameters()).dtype != torch.float32:
             model.ffs.float()
         model._ffs_captured_net0 = None
         with torch.amp.autocast("cuda", enabled=False):
             raw = model.ffs(
-                primary.float(),
-                right.float(),
+                image1.float(),
+                image2.float(),
                 iters=int(model.ffs.args.valid_iters),
                 test_mode=True,
             )
@@ -666,7 +663,7 @@ def check_net0_left_sanity(ctx: FrameworkContext) -> str:
             f"net0_std={net0_same_std:.6g} (net[0]=injected feature; low net0_std=collapsed)"
         )
 
-    pair = right_first_pair(4400, ctx.args.ffs_image_size, shift=8)
+    pair = leftprimary_pair(4400, ctx.args.ffs_image_size, shift=8)
     swapped = [pair[1], pair[0]]
     raw_lr, net0_lr = run_ffs_raw(model, [pair])
     raw_rl, net0_rl = run_ffs_raw(model, [swapped])
@@ -876,7 +873,7 @@ def main() -> int:
     print(f"[setup] checkpoint={args.pretrained_ckpt}")
     print(f"[setup] base_vlm={args.base_vlm}")
     print(f"[setup] ffs_model={args.ffs_model_path}")
-    print(f"[setup] data_mix={args.data_mix} image_order=right_first primary_cam_id=1")
+    print(f"[setup] data_mix={args.data_mix} image_order=leftprimary inject_cam_id=1")
 
     ok = True
     for framework_name in args.frameworks:

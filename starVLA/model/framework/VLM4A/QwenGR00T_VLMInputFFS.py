@@ -28,9 +28,9 @@ class QwenGR00TVLMInputFFSDefaultConfig(QwenGR00TDefaultConfig):
             "ffs_image_size": 256,
             "inject_hidden_dim": 256,
             "num_cameras": 2,
-            "primary_idx": 1,
-            "right_view_idx": 0,
-            "primary_cam_id": 1,
+            "left_ref_idx": 1,
+            "primary_view_idx": 0,
+            "inject_cam_id": 1,
             "inject_gate_init": "zero",
         }
     )
@@ -61,7 +61,7 @@ class QwenGR00T_VLMInputFFS(QwenGR00TFFSBase):
             injector=self.ffs_vlm_injector,
             num_cameras=self.num_cameras,
             spatial_merge_size=spatial_merge,
-            primary_cam_id=self.primary_cam_id,
+            primary_cam_id=self.inject_cam_id,
         )
 
     def _prepare_ffs_for_vlm(self, batch_images):

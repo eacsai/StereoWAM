@@ -36,9 +36,9 @@ class QwenGR00TVLMControlNetFFSDefaultConfig(QwenGR00TDefaultConfig):
             "ffs_image_size": 256,
             "hint_hidden_dim": 256,
             "num_cameras": 2,
-            "primary_idx": 1,
-            "right_view_idx": 0,
-            "primary_cam_id": 1,
+            "left_ref_idx": 1,
+            "primary_view_idx": 0,
+            "inject_cam_id": 1,
             "inject_depths": [3, 7, 11, 15, 19, 23],
         }
     )
@@ -102,7 +102,7 @@ class QwenGR00T_VLMControlNetFFS(QwenGR00TFFSBase):
             inject_depths=self._vlm_controlnet_inject_depths,
             num_cameras=self.num_cameras,
             spatial_merge_size=spatial_merge,
-            primary_cam_id=self.primary_cam_id,
+            primary_cam_id=self.inject_cam_id,
             image_token_id=int(self.qwen_vl_interface.model.config.image_token_id),
         )
 

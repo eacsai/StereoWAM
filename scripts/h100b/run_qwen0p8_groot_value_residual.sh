@@ -20,7 +20,7 @@ config_yaml=./examples/LIBERO/train_files/starvla_cotrain_libero.yaml
 base_vlm=${BASE_VLM:-./playground/Pretrained_models/Qwen3.5-0.8B}
 
 DATA_ROOT=${DATA_ROOT:-playground/Datasets/LEROBOT_LIBERO_OURRENDER_PW}
-DATA_MIX=${DATA_MIX:-libero_all_sfstereo_rightprimary}
+DATA_MIX=${DATA_MIX:-libero_all_sfstereo_leftprimary}
 FRAMEWORK=${FRAMEWORK:-QwenGR00T_ValueResidualFFS}
 B_CKPT=${B_CKPT:-playground/Checkpoints/qwen3p5_0p8b_4suite_stereo_camrope_rightprimary_ourrender_30k/checkpoints/steps_30000_pytorch_model.pt}
 PRETRAINED_CKPT=${PRETRAINED_CKPT-}
@@ -134,9 +134,9 @@ CUDA_VISIBLE_DEVICES=${GPUS} ${CONDA_VENV}/accelerate launch \
   --framework.ffs_value_residual.gru_hidden_dim 16 \
   --framework.ffs_value_residual.ffs_image_size 256 \
   --framework.ffs_value_residual.num_cameras 2 \
-  --framework.ffs_value_residual.primary_idx 1 \
-  --framework.ffs_value_residual.right_view_idx 0 \
-  --framework.ffs_value_residual.primary_cam_id 1 \
+  --framework.ffs_value_residual.left_ref_idx 1 \
+  --framework.ffs_value_residual.primary_view_idx 0 \
+  --framework.ffs_value_residual.inject_cam_id 1 \
   --datasets.vla_data.data_root_dir ${DATA_ROOT} \
   --datasets.vla_data.data_mix ${DATA_MIX} \
   --datasets.vla_data.per_device_batch_size $BS \

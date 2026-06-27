@@ -139,9 +139,9 @@ class QwenGR00TValueResidualFFSDefaultConfig(QwenGR00TDefaultConfig):
             "gru_hidden_dim": 16,
             "ffs_image_size": 256,
             "num_cameras": 2,
-            "primary_idx": 1,
-            "right_view_idx": 0,
-            "primary_cam_id": 1,
+            "left_ref_idx": 1,
+            "primary_view_idx": 0,
+            "inject_cam_id": 1,
         }
     )
 
@@ -238,7 +238,7 @@ class QwenGR00T_ValueResidualFFS(QwenGR00TFFSBase):
             image_token_id=self._image_token_id,
             num_cameras=self.num_cameras,
             spatial_merge_size=self.spatial_merge_size,
-            primary_cam_id=self.primary_cam_id,
+            primary_cam_id=self.inject_cam_id,
             label="GR00T-ValueResidual-FFS",
         )
 

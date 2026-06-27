@@ -17,7 +17,7 @@ config_yaml=./examples/LIBERO/train_files/starvla_cotrain_libero.yaml
 base_vlm=${BASE_VLM:-./playground/Pretrained_models/Qwen3.5-0.8B}
 
 DATA_ROOT=${DATA_ROOT:-playground/Datasets/LEROBOT_LIBERO_OURRENDER_PW}
-DATA_MIX=${DATA_MIX:-libero_all_sfstereo_rightprimary}
+DATA_MIX=${DATA_MIX:-libero_all_sfstereo_leftprimary}
 FRAMEWORK=${FRAMEWORK:-QwenGR00T_UtoniaResamplerFFS}
 PRETRAINED_CKPT=${PRETRAINED_CKPT-}
 
@@ -258,9 +258,9 @@ CUDA_VISIBLE_DEVICES=${GPUS} ${CONDA_VENV}/accelerate launch \
   --framework.utonia_pointcloud.depth_max 3.0 \
   --framework.utonia_pointcloud.disp_eps 0.001 \
   --framework.utonia_pointcloud.num_cameras 2 \
-  --framework.utonia_pointcloud.primary_idx 1 \
-  --framework.utonia_pointcloud.right_view_idx 0 \
-  --framework.utonia_pointcloud.primary_cam_id 1 \
+  --framework.utonia_pointcloud.left_ref_idx 1 \
+  --framework.utonia_pointcloud.primary_view_idx 0 \
+  --framework.utonia_pointcloud.inject_cam_id 1 \
   --framework.utonia_pointcloud.num_point_tokens 64 \
   --framework.utonia_pointcloud.resampler_layers ${RESAMPLER_LAYERS} \
   --framework.utonia_pointcloud.resampler_heads ${RESAMPLER_HEADS} \

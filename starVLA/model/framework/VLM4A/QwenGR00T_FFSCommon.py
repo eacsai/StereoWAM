@@ -5,6 +5,7 @@ import inspect
 import logging
 import os
 import sys
+import contextlib
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
@@ -16,9 +17,46 @@ import torch.nn.functional as F
 from deployment.model_server.tools.image_tools import to_pil_preserve
 from starVLA.model.framework.VLM4A.QwenGR00T import Qwen_GR00T
 from starVLA.model.modules.stereo.cam_rope_hook import compute_per_token_cam_id
+from starVLA.model.modules.stereo.ffs_net0_cache import ffs_tf32_disabled
 from starVLA.training.trainer_utils.trainer_tools import resize_images
 
 logger = logging.getLogger(__name__)
+
+
+def _cfg_get(cfg, key, default=None):
+    if cfg is None:
+        return default
+    if hasattr(cfg, "get"):
+        return cfg.get(key, default)
+    return getattr(cfg, key, default)
+
+
+def _cfg_bool(cfg, key, default=False) -> bool:
+    value = _cfg_get(cfg, key, default)
+    if isinstance(value, str):
+        return value.lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
+def _cfg_contains(cfg, key: str) -> bool:
+    if cfg is None:
+        return False
+    try:
+        return key in cfg
+    except TypeError:
+        return hasattr(cfg, key)
+
+
+def _ffs_stereo_convention() -> str:
+    value = os.environ.get("FFS_STEREO_CONVENTION", "leftprimary").strip().lower()
+    if value in {"", "leftprimary", "clean", "clean_leftprimary"}:
+        return "leftprimary"
+    if value == "legacy_unrotate":
+        return "legacy_unrotate"
+    raise ValueError(
+        "FFS_STEREO_CONVENTION must be 'leftprimary' (default clean path) or "
+        f"'legacy_unrotate', got {value!r}"
+    )
 
 
 _FFS_REPO_DIR = os.environ.get("FFS_REPO_DIR", "/data/wangqiwei/ICLR2026/Fast-FoundationStereo")
@@ -266,23 +304,71 @@ class QwenGR00TNet0FFSMixin:
         self.ffs_feat_dim = int(ffs_cfg.get("gru_hidden_dim", 16))
         self.ffs_feature_source = str(ffs_cfg.get("ffs_feature_source", "gru_hidden"))
         self.num_cameras = int(ffs_cfg.get("num_cameras", 2))
-        self.primary_idx = int(ffs_cfg.get("primary_idx", 1))
-        self.right_view_idx = int(ffs_cfg.get("right_view_idx", 0))
-        self.primary_cam_id = int(ffs_cfg.get("primary_cam_id", 1))
+        if os.environ.get("FFS_DISABLE_UNROTATE", "").strip():
+            raise ValueError(
+                f"{label} no longer accepts FFS_DISABLE_UNROTATE. Use "
+                "FFS_STEREO_CONVENTION=legacy_unrotate for old un-rotate checkpoints, "
+                "or leave FFS_STEREO_CONVENTION unset for the clean leftprimary path."
+            )
 
-        expected = {
-            "primary_idx": (self.primary_idx, 1),
-            "right_view_idx": (self.right_view_idx, 0),
-            "primary_cam_id": (self.primary_cam_id, 1),
-        }
+        self.stereo_convention = _ffs_stereo_convention()
+        self._ffs_unrotate = self.stereo_convention == "legacy_unrotate"
+        if self.stereo_convention == "legacy_unrotate":
+            self.legacy_primary_idx = int(ffs_cfg.get("primary_idx", 1))
+            self.legacy_right_view_idx = int(ffs_cfg.get("right_view_idx", 0))
+            self.inject_cam_id = int(ffs_cfg.get("primary_cam_id", 1))
+            self.primary_view_idx = self.legacy_right_view_idx
+            self.left_ref_idx = self.legacy_primary_idx
+            expected = {
+                "primary_idx": (self.legacy_primary_idx, 1),
+                "right_view_idx": (self.legacy_right_view_idx, 0),
+                "primary_cam_id": (self.inject_cam_id, 1),
+            }
+            self.ffs_image1_idx = self.legacy_primary_idx
+            self.ffs_image2_idx = self.legacy_right_view_idx
+            self.view_order = ("right_view", "primary")
+            self.reference_view = "legacy_primary_after_unrotate"
+            self.net0_frame = "legacy_primary_rotated"
+        else:
+            legacy_keys = [
+                key
+                for key in ("primary_idx", "right_view_idx", "primary_cam_id")
+                if _cfg_contains(ffs_cfg, key)
+            ]
+            if legacy_keys:
+                raise ValueError(
+                    f"{label} clean leftprimary convention refuses legacy FFS keys {legacy_keys}. "
+                    "Use left_ref_idx=1, primary_view_idx=0, inject_cam_id=1 for new runs, "
+                    "or set FFS_STEREO_CONVENTION=legacy_unrotate when evaluating old checkpoints."
+                )
+            self.left_ref_idx = int(ffs_cfg.get("left_ref_idx", 1))
+            self.primary_view_idx = int(ffs_cfg.get("primary_view_idx", 0))
+            self.inject_cam_id = int(ffs_cfg.get("inject_cam_id", 1))
+            expected = {
+                "left_ref_idx": (self.left_ref_idx, 1),
+                "primary_view_idx": (self.primary_view_idx, 0),
+                "inject_cam_id": (self.inject_cam_id, 1),
+            }
+            self.ffs_image1_idx = self.left_ref_idx
+            self.ffs_image2_idx = self.primary_view_idx
+            self.view_order = ("primary", "left_view")
+            self.reference_view = "left_view"
+            self.net0_frame = "left_view"
+
         bad = {k: (got, want) for k, (got, want) in expected.items() if got != want}
         if bad:
-            raise ValueError(
-                f"{label} requires right-first single-frame stereo constants "
-                f"primary_idx=1, right_view_idx=0, primary_cam_id=1; got {bad}"
-            )
+            raise ValueError(f"{label} invalid {self.stereo_convention} stereo constants: {bad}")
         if self.num_cameras != 2:
             raise ValueError(f"{label} requires num_cameras=2, got {self.num_cameras}")
+        # Compatibility aliases for older helper modules. New code should use the
+        # explicit names above.
+        if self.stereo_convention == "legacy_unrotate":
+            self.primary_idx = self.legacy_primary_idx
+            self.right_view_idx = self.legacy_right_view_idx
+        else:
+            self.primary_idx = self.primary_view_idx
+            self.right_view_idx = self.left_ref_idx
+        self.primary_cam_id = self.inject_cam_id
         if self.ffs_feature_source != "gru_hidden":
             raise ValueError(f"{label} only supports ffs_feature_source='gru_hidden'")
         if not os.path.isfile(ffs_model_path):
@@ -290,10 +376,18 @@ class QwenGR00TNet0FFSMixin:
 
         expected_sha256 = ffs_cfg.get("ffs_expected_sha256", None)
         self._ffs_expected_sha256 = str(expected_sha256) if expected_sha256 else None
-        cache_dir = ffs_cfg.get("utonia_cache_dir", None)
-        should_hash = bool(expected_sha256) or (
-            cache_dir is not None and str(cache_dir).strip().lower() not in {"", "none", "null"}
-        )
+        def _cache_dir_enabled(value) -> bool:
+            return value is not None and str(value).strip().lower() not in {"", "none", "null"}
+
+        utonia_cache_enabled = _cache_dir_enabled(ffs_cfg.get("utonia_cache_dir", None))
+        ffs_cache_enabled = _cache_dir_enabled(ffs_cfg.get("ffs_cache_dir", None))
+        self._ffs_pin_tf32_off = ffs_cache_enabled or os.environ.get("FFS_PIN_TF32_OFF", "").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        should_hash = bool(expected_sha256) or utonia_cache_enabled or ffs_cache_enabled
         actual = None
         if should_hash:
             with open(ffs_model_path, "rb") as fh:
@@ -339,7 +433,7 @@ class QwenGR00TNet0FFSMixin:
         out = []
         for example_imgs in batch_images:
             # The dataloader packs camera-major with frames inner: at T>1 the list is
-            # [right_t0, right_t1, left_t0, ...] and a bare index would silently pick
+            # [cam0_t0, cam0_t1, cam1_t0, ...] and a bare index would silently pick
             # a same-camera frame as the "other eye" (garbage disparity). FFS stereo
             # is defined for exactly num_cameras single-frame images per sample.
             if len(example_imgs) != int(self.num_cameras):
@@ -359,10 +453,19 @@ class QwenGR00TNet0FFSMixin:
             out.append(img * 255.0)
         return torch.stack(out, dim=0).to(device).float()
 
+    def _maybe_unrotate(self, t: torch.Tensor) -> torch.Tensor:
+        """Legacy-only 180-degree flip for old un-rotate checkpoints."""
+        return torch.flip(t, dims=(-2, -1)).contiguous() if self._ffs_unrotate else t
+
     def _compute_ffs_feature(self, batch_images: List) -> torch.Tensor:
-        primary = self._imgs_to_ffs_tensor(batch_images, self.primary_idx)
-        right = self._imgs_to_ffs_tensor(batch_images, self.right_view_idx)
-        B = primary.shape[0]
+        image1 = self._imgs_to_ffs_tensor(batch_images, self.ffs_image1_idx)
+        image2 = self._imgs_to_ffs_tensor(batch_images, self.ffs_image2_idx)
+        # Clean path: upright ffs(left_view, primary). FoundationStereo image1 is
+        # the geometric-left/reference view, and net[0] stays in that left_view frame.
+        # Legacy mode reproduces the old un-rotate workaround explicitly.
+        image1 = self._maybe_unrotate(image1)
+        image2 = self._maybe_unrotate(image2)
+        B = image1.shape[0]
         with torch.no_grad():
             if next(self.ffs.parameters()).dtype != torch.float32:
                 self.ffs.float()
@@ -377,16 +480,17 @@ class QwenGR00TNet0FFSMixin:
             # BN/Dropout behaviour is governed by module.training, not by autograd.)
             self.ffs.eval()
             self._ffs_captured_net0 = None
-            with torch.amp.autocast("cuda", enabled=False):
+            tf32_ctx = ffs_tf32_disabled() if getattr(self, "_ffs_pin_tf32_off", False) else contextlib.nullcontext()
+            with tf32_ctx, torch.amp.autocast("cuda", enabled=False):
                 self.ffs(
-                    primary.float(),
-                    right.float(),
+                    image1.float(),
+                    image2.float(),
                     iters=int(self.ffs.args.valid_iters),
                     test_mode=True,
                 )
             if self._ffs_captured_net0 is None:
                 raise RuntimeError(f"{self._ffs_label} update_block net[0] hook did not fire")
-            ffs_feat = self._ffs_captured_net0
+            ffs_feat = self._maybe_unrotate(self._ffs_captured_net0)
             if ffs_feat.shape[0] != B:
                 raise RuntimeError(f"{self._ffs_label} net[0] batch {ffs_feat.shape[0]} != {B}")
             if ffs_feat.shape[1] != self.ffs_feat_dim:
@@ -397,17 +501,20 @@ class QwenGR00TNet0FFSMixin:
         return ffs_feat.detach()
 
     def _compute_ffs_disparity(self, batch_images: List) -> torch.Tensor:
-        primary = self._imgs_to_ffs_tensor(batch_images, self.primary_idx)
-        right = self._imgs_to_ffs_tensor(batch_images, self.right_view_idx)
-        B = primary.shape[0]
+        image1 = self._imgs_to_ffs_tensor(batch_images, self.ffs_image1_idx)
+        image2 = self._imgs_to_ffs_tensor(batch_images, self.ffs_image2_idx)
+        image1 = self._maybe_unrotate(image1)
+        image2 = self._maybe_unrotate(image2)
+        B = image1.shape[0]
         with torch.no_grad():
             if next(self.ffs.parameters()).dtype != torch.float32:
                 self.ffs.float()
             self.ffs.eval()
-            with torch.amp.autocast("cuda", enabled=False):
+            tf32_ctx = ffs_tf32_disabled() if getattr(self, "_ffs_pin_tf32_off", False) else contextlib.nullcontext()
+            with tf32_ctx, torch.amp.autocast("cuda", enabled=False):
                 disp_up = self.ffs(
-                    primary.float(),
-                    right.float(),
+                    image1.float(),
+                    image2.float(),
                     iters=int(self.ffs.args.valid_iters),
                     test_mode=True,
                 )
@@ -416,6 +523,7 @@ class QwenGR00TNet0FFSMixin:
                 f"{self._ffs_label} expected FFS test_mode=True to return a Tensor disparity, "
                 f"got {type(disp_up).__name__}"
             )
+        disp_up = self._maybe_unrotate(disp_up)
         if disp_up.shape != (B, 1, self.ffs_image_size, self.ffs_image_size):
             raise RuntimeError(
                 f"{self._ffs_label} FFS disparity shape {tuple(disp_up.shape)} != "
@@ -500,6 +608,98 @@ class QwenGR00TFFSBase(QwenGR00TNet0FFSMixin, Qwen_GR00T):
             encode_kwargs["sample_ids"] = sample_ids
         return self._encode_last_hidden_with_ffs(batch_images, instructions, **encode_kwargs)
 
+    def _scene_flow_cfg(self):
+        action_cfg = self.config.framework.action_model if self.config and hasattr(self.config, "framework") else {}
+        return _cfg_get(action_cfg, "scene_flow", {}) or {}
+
+    def _scene_flow_enabled(self) -> bool:
+        return _cfg_bool(self._scene_flow_cfg(), "enabled", False)
+
+    def _collect_scene_flow_targets(self, examples: List[dict], device: torch.device):
+        required = ("flow_gt", "flow_valid", "flow_dynamic")
+        if not examples or not all(all(key in example for key in required) for example in examples):
+            return None
+        flow_gt = torch.as_tensor(
+            np.stack([np.asarray(example["flow_gt"], dtype=np.float32) for example in examples]),
+            device=device,
+            dtype=torch.float32,
+        )
+        flow_valid = torch.as_tensor(
+            np.stack([np.asarray(example["flow_valid"], dtype=bool) for example in examples]),
+            device=device,
+            dtype=torch.bool,
+        )
+        flow_dynamic = torch.as_tensor(
+            np.stack([np.asarray(example["flow_dynamic"], dtype=bool) for example in examples]),
+            device=device,
+            dtype=torch.bool,
+        )
+        flow_has_gt = torch.as_tensor(
+            [bool(example.get("flow_has_gt", False)) for example in examples],
+            device=device,
+            dtype=torch.bool,
+        )
+        return flow_gt, flow_valid, flow_dynamic, flow_has_gt
+
+    def _compute_scene_flow_loss(
+        self,
+        flow_pred: torch.Tensor,
+        flow_gt: torch.Tensor,
+        flow_valid: torch.Tensor,
+        flow_dynamic: torch.Tensor,
+        flow_has_gt: torch.Tensor,
+    ):
+        cfg = self._scene_flow_cfg()
+        target_hw = tuple(int(x) for x in flow_gt.shape[1:3])
+        pred = F.interpolate(
+            flow_pred.float(),
+            size=target_hw,
+            mode="bilinear",
+            align_corners=False,
+        )
+        target = flow_gt.permute(0, 3, 1, 2).contiguous().float()
+        valid = flow_valid.bool()
+        raw_dynamic = flow_dynamic.bool()
+        dynamic_outside_valid = raw_dynamic & ~valid
+        dynamic = raw_dynamic & valid
+        mask_mode = str(_cfg_get(cfg, "mask_mode", "dynamic")).lower()
+        if mask_mode == "valid":
+            supervised = valid
+            used_valid_fallback = pred.new_tensor(0.0)
+        elif mask_mode == "dynamic":
+            supervised = dynamic
+            used_valid_fallback = pred.new_tensor(0.0)
+            if _cfg_bool(cfg, "dynamic_fallback_to_valid", True):
+                no_dynamic = dynamic.flatten(1).sum(dim=1) == 0
+                has_valid = valid.flatten(1).sum(dim=1) > 0
+                fallback = no_dynamic & has_valid
+                if bool(fallback.any().item()):
+                    supervised = torch.where(fallback[:, None, None], valid, supervised)
+                    used_valid_fallback = fallback.float().sum()
+        else:
+            raise ValueError(f"Unsupported scene_flow mask_mode={mask_mode!r}; expected 'dynamic' or 'valid'")
+
+        beta = float(_cfg_get(cfg, "smooth_l1_beta", 0.01))
+        diff = F.smooth_l1_loss(pred, target, reduction="none", beta=beta)
+        channel_w = pred.new_tensor((1.0, 1.0, 2.0)).view(1, 3, 1, 1)
+        diff = diff * channel_w
+        mask = supervised.unsqueeze(1).to(dtype=diff.dtype)
+        denom = mask.sum().clamp_min(1.0)
+        flow_loss = (diff * mask).sum() / (denom * 3.0)
+
+        supervised_pixels_per_sample = supervised.flatten(1).sum(dim=1)
+        dynamic_pixels = dynamic.flatten(1).sum(dim=1)
+        metrics = {
+            "flow_supervised_samples": (supervised_pixels_per_sample > 0).float().sum(),
+            "flow_gt_samples": flow_has_gt.float().sum(),
+            "dynamic_pixel_count": dynamic_pixels.float().sum(),
+            "dynamic_outside_valid_pixel_count": dynamic_outside_valid.flatten(1).float().sum(),
+            "flow_supervised_pixel_count": supervised_pixels_per_sample.float().sum(),
+            "nonzero_flow_batches": (dynamic_pixels.sum() > 0).to(dtype=pred.dtype),
+            "flow_valid_fallback_samples": used_valid_fallback,
+        }
+        return flow_loss, metrics
+
     def forward(self, examples: List[dict] = None, **kwargs):
         batch_images = [example["image"] for example in examples]
         instructions = [example["lang"] for example in examples]
@@ -529,9 +729,48 @@ class QwenGR00TFFSBase(QwenGR00TNet0FFSMixin, Qwen_GR00T):
                 state = torch.tensor(np.array(state), device=last_hidden.device, dtype=last_hidden.dtype)
                 state_repeated = state.repeat(repeated_diffusion_steps, 1, 1)
 
-            action_loss = self.action_model(last_hidden_repeated, actions_target_repeated, state_repeated)
+            action_output = self.action_model(last_hidden_repeated, actions_target_repeated, state_repeated)
 
-        return {"action_loss": action_loss}
+        if not isinstance(action_output, dict):
+            return {"action_loss": action_output}
+
+        action_loss = action_output["action_loss"]
+        output = {"action_loss": action_loss}
+        flow_pred = action_output.get("flow_pred", None)
+        if self._scene_flow_enabled() and flow_pred is not None:
+            original_batch = len(examples)
+            if flow_pred.shape[0] != original_batch:
+                if flow_pred.shape[0] % original_batch != 0:
+                    raise RuntimeError(
+                        "scene_flow flow_pred batch is not divisible by the original batch: "
+                        f"{flow_pred.shape[0]} vs {original_batch}"
+                    )
+                flow_pred = flow_pred.view(
+                    flow_pred.shape[0] // original_batch,
+                    original_batch,
+                    *flow_pred.shape[1:],
+                )[0]
+
+            targets = self._collect_scene_flow_targets(examples, device=flow_pred.device)
+            if targets is None:
+                output["flow_loss"] = flow_pred.sum() * 0.0
+                output.update(
+                    {
+                        "flow_supervised_samples": flow_pred.new_tensor(0.0),
+                        "flow_gt_samples": flow_pred.new_tensor(0.0),
+                        "dynamic_pixel_count": flow_pred.new_tensor(0.0),
+                        "dynamic_outside_valid_pixel_count": flow_pred.new_tensor(0.0),
+                        "flow_supervised_pixel_count": flow_pred.new_tensor(0.0),
+                        "nonzero_flow_batches": flow_pred.new_tensor(0.0),
+                        "flow_valid_fallback_samples": flow_pred.new_tensor(0.0),
+                    }
+                )
+            else:
+                flow_loss, flow_metrics = self._compute_scene_flow_loss(flow_pred, *targets)
+                output["flow_loss"] = flow_loss
+                output.update(flow_metrics)
+
+        return output
 
     @torch.inference_mode()
     def predict_action(self, examples: List[dict], **kwargs: str):
@@ -617,7 +856,10 @@ class QwenGR00TFFSBase(QwenGR00TNet0FFSMixin, Qwen_GR00T):
             # FFS family while missing others is a truncated/corrupted FFS checkpoint,
             # not a baseline — fresh-initialising the gaps would silently corrupt the
             # run. ('ffs.' frozen-net keys are exempt: loaded + sha-verified separately.)
-            for prefix in self._ffs_key_prefixes():
+            fresh_init_prefixes = list(self._ffs_key_prefixes())
+            if self._scene_flow_enabled():
+                fresh_init_prefixes.append("action_model.scene_flow_decoder.")
+            for prefix in fresh_init_prefixes:
                 if prefix in frozen_prefixes:
                     continue
                 own_family = {k for k in own_keys if k.startswith(prefix)}
@@ -632,6 +874,14 @@ class QwenGR00TFFSBase(QwenGR00TNet0FFSMixin, Qwen_GR00T):
         allowed_missing = set(raw_own_keys - own_keys)
         if init_from_baseline:
             allowed_missing.update({key for key in own_keys - provided_keys if self._is_ffs_key(key)})
+            if self._scene_flow_enabled():
+                allowed_missing.update(
+                    {
+                        key
+                        for key in own_keys - provided_keys
+                        if key.startswith("action_model.scene_flow_decoder.")
+                    }
+                )
         legacy_cam_rope_keys = (
             {
                 key

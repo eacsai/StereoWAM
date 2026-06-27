@@ -7,7 +7,7 @@ Run on h100b:
 
 The script builds the real QwenGR00T_LlamaAdapterPrefixFFS framework, loads the
 real warm-start B checkpoint through the trainer loader, and uses synthetic
-right-first stereo examples so it does not depend on the LIBERO dataloader.
+leftprimary stereo examples so it does not depend on the LIBERO dataloader.
 """
 from __future__ import annotations
 
@@ -83,9 +83,9 @@ def build_prefix_cfg(args: argparse.Namespace, ckpt_cfg, *, framework_name: str)
         "gru_hidden_dim": 16,
         "ffs_image_size": args.image_size,
         "num_cameras": 2,
-        "primary_idx": 1,
-        "right_view_idx": 0,
-        "primary_cam_id": 1,
+        "left_ref_idx": 1,
+        "primary_view_idx": 0,
+        "inject_cam_id": 1,
         "n_prompts": 10,
         "absorb_dim": 256,
         "gate_per_head": False,
@@ -480,10 +480,10 @@ def check_nonzero_gate_pad_invariance(ctx: PrefixContext) -> str:
 
 def check_summary_bookkeeping_and_indices(ctx: PrefixContext) -> str:
     model = ctx.get_prefix_model()
-    if (model.right_view_idx, model.primary_idx, model.primary_cam_id) != (0, 1, 1):
+    if (model.left_ref_idx, model.primary_view_idx, model.inject_cam_id) != (1, 0, 1):
         raise AssertionError(
-            f"bad FFS view constants: right={model.right_view_idx}, primary={model.primary_idx}, "
-            f"primary_cam_id={model.primary_cam_id}"
+            f"bad FFS view constants: left_ref={model.left_ref_idx}, primary_view={model.primary_view_idx}, "
+            f"inject_cam_id={model.inject_cam_id}"
         )
     _ = qwen_hidden_prefix(model, ctx.get_examples(), grad=False)
     state = model._ffs_prefix_state
@@ -705,7 +705,7 @@ def main() -> int:
     print(f"[setup] checkpoint={args.pretrained_ckpt}")
     print(f"[setup] base_vlm={args.base_vlm}")
     print(f"[setup] ffs_model_path={args.ffs_model_path}")
-    print(f"[setup] data_mix={args.data_mix} image_order=right_first")
+    print(f"[setup] data_mix={args.data_mix} image_order=leftprimary")
 
     ctx = PrefixContext(args=args, ckpt_cfg=ckpt_cfg, ckpt=ckpt, device=device)
     try:

@@ -61,7 +61,7 @@ def _set_depthimage_cam_rope_flag(config):
 
     cfg = OmegaConf.create({}) if config is None else config
     target = getattr(cfg, "_cfg", cfg)
-    primary_cam_id = 1
+    inject_cam_id = 1
     if isinstance(target, str):
         target = OmegaConf.load(target)
         cfg = target
@@ -69,18 +69,18 @@ def _set_depthimage_cam_rope_flag(config):
     if OmegaConf.is_config(target):
         ffs_cfg = OmegaConf.select(target, "framework.ffs_depth_image")
         if ffs_cfg is not None:
-            primary_cam_id = int(ffs_cfg.get("primary_cam_id", primary_cam_id))
+            inject_cam_id = int(ffs_cfg.get("inject_cam_id", inject_cam_id))
         OmegaConf.update(
             target,
             "framework.qwenvl.stereo_extra_image_cam_id",
-            primary_cam_id,
+            inject_cam_id,
             force_add=True,
         )
     elif isinstance(target, dict):
         framework = target.setdefault("framework", {})
         ffs_cfg = framework.get("ffs_depth_image", {})
-        primary_cam_id = int(ffs_cfg.get("primary_cam_id", primary_cam_id))
-        framework.setdefault("qwenvl", {})["stereo_extra_image_cam_id"] = primary_cam_id
+        inject_cam_id = int(ffs_cfg.get("inject_cam_id", inject_cam_id))
+        framework.setdefault("qwenvl", {})["stereo_extra_image_cam_id"] = inject_cam_id
     else:
         raise TypeError(f"Unsupported config type for QwenGR00T_DepthImageFFS: {type(config).__name__}")
     return cfg
@@ -132,9 +132,9 @@ class QwenGR00TDepthImageFFSDefaultConfig(QwenGR00TDefaultConfig):
             "gru_hidden_dim": 16,
             "ffs_image_size": 256,
             "num_cameras": 2,
-            "primary_idx": 1,
-            "right_view_idx": 0,
-            "primary_cam_id": 1,
+            "left_ref_idx": 1,
+            "primary_view_idx": 0,
+            "inject_cam_id": 1,
             "depth_prompt": _DEFAULT_DEPTH_PROMPT,
         }
     )
@@ -159,37 +159,15 @@ class QwenGR00T_DepthImageFFS(QwenGR00TFFSBase):
 
         extra_cam_id = self.config.framework.qwenvl.get("stereo_extra_image_cam_id", None)
         if bool(self.config.framework.qwenvl.get("stereo_cam_rope_enabled", False)):
-            if extra_cam_id is None or int(extra_cam_id) != int(self.primary_cam_id):
+            if extra_cam_id is None or int(extra_cam_id) != int(self.inject_cam_id):
                 raise RuntimeError(
                     "[GR00T-DepthImage-FFS] framework.qwenvl.stereo_extra_image_cam_id "
-                    f"must be set to primary_cam_id={self.primary_cam_id} before QwenGR00T.__init__ "
+                    f"must be set to inject_cam_id={self.inject_cam_id} before QwenGR00T.__init__ "
                     f"installs cam_rope hooks; got {extra_cam_id}"
                 )
 
     def _compute_ffs_disp_image(self, batch_images) -> List[Image.Image]:
-        primary = self._imgs_to_ffs_tensor(batch_images, self.primary_idx)
-        right = self._imgs_to_ffs_tensor(batch_images, self.right_view_idx)
-        batch = int(primary.shape[0])
-        with torch.no_grad():
-            if next(self.ffs.parameters()).dtype != torch.float32:
-                self.ffs.float()
-            self.ffs.eval()
-            with torch.amp.autocast("cuda", enabled=False):
-                disp_up = self.ffs(
-                    primary.float(),
-                    right.float(),
-                    iters=int(self.ffs.args.valid_iters),
-                    test_mode=True,
-                )
-        if not torch.is_tensor(disp_up):
-            raise RuntimeError(
-                f"[GR00T-DepthImage-FFS] expected FFS to return a disparity tensor, got {type(disp_up).__name__}"
-            )
-        if tuple(disp_up.shape[:2]) != (batch, 1):
-            raise RuntimeError(
-                f"[GR00T-DepthImage-FFS] expected disp_up shape (B, 1, H, W) with B={batch}, "
-                f"got {tuple(disp_up.shape)}"
-            )
+        disp_up = self._compute_ffs_disparity(batch_images)
         return render_disp_tensor_as_turbo_pils(disp_up, self.depth_image_size)
 
     def _build_depthimage_qwenvl_inputs(self, batch_images, instructions, depth_pils: List[Image.Image]):
@@ -197,10 +175,10 @@ class QwenGR00T_DepthImageFFS(QwenGR00TFFSBase):
         assert len(depth_pils) == len(batch_images), "Depth image count must match batch size"
         messages = []
         for imgs, instruction, depth_pil in zip(batch_images, instructions, depth_pils):
-            if len(imgs) <= max(self.primary_idx, self.right_view_idx):
+            if len(imgs) <= max(self.primary_view_idx, self.left_ref_idx):
                 raise ValueError(
-                    "[GR00T-DepthImage-FFS] expected right-first stereo images with "
-                    f"at least {max(self.primary_idx, self.right_view_idx) + 1} views, got {len(imgs)}"
+                    "[GR00T-DepthImage-FFS] expected primary,left_view stereo images with "
+                    f"at least {max(self.primary_view_idx, self.left_ref_idx) + 1} views, got {len(imgs)}"
                 )
 
             if "CoT_prompt" in self.config.datasets.vla_data:
@@ -210,8 +188,8 @@ class QwenGR00T_DepthImageFFS(QwenGR00TFFSBase):
                 task_prompt = instruction
 
             content = [
-                {"type": "image", "image": imgs[self.right_view_idx]},
-                {"type": "image", "image": imgs[self.primary_idx]},
+                {"type": "image", "image": imgs[self.primary_view_idx]},
+                {"type": "image", "image": imgs[self.left_ref_idx]},
                 {"type": "text", "text": self.depth_prompt},
                 {"type": "image", "image": depth_pil},
                 {"type": "text", "text": task_prompt},

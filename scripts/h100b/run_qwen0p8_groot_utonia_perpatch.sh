@@ -17,7 +17,7 @@ config_yaml=./examples/LIBERO/train_files/starvla_cotrain_libero.yaml
 base_vlm=${BASE_VLM:-./playground/Pretrained_models/Qwen3.5-0.8B}
 
 DATA_ROOT=${DATA_ROOT:-playground/Datasets/LEROBOT_LIBERO_OURRENDER_PW}
-DATA_MIX=${DATA_MIX:-libero_all_sfstereo_rightprimary}
+DATA_MIX=${DATA_MIX:-libero_all_sfstereo_leftprimary}
 FRAMEWORK=${FRAMEWORK:-QwenGR00T_UtoniaPerPatchAddFFS}
 PRETRAINED_CKPT=${PRETRAINED_CKPT-}
 
@@ -118,8 +118,8 @@ run_required_smoke scripts/h100b/smoke_utonia_perpatch.py
 run_required_smoke scripts/h100b/smoke_utonia_resampler.py
 
 if [ -n "${UTONIA_CACHE_DIR}" ]; then
-  [ "${DATA_MIX}" = "libero_all_sfstereo_rightprimary" ] || {
-    echo "[guard] cached Utonia cache is scoped to DATA_MIX=libero_all_sfstereo_rightprimary, got '${DATA_MIX}'"; exit 3;
+  [ "${DATA_MIX}" = "libero_all_sfstereo_leftprimary" ] || {
+    echo "[guard] cached Utonia cache is scoped to DATA_MIX=libero_all_sfstereo_leftprimary, got '${DATA_MIX}'"; exit 3;
   }
   [ -d "${UTONIA_CACHE_DIR}" ] || { echo "[preflight] missing UTONIA_CACHE_DIR: ${UTONIA_CACHE_DIR}"; exit 1; }
   UTONIA_CACHE_DIR="${UTONIA_CACHE_DIR}" \
@@ -146,8 +146,8 @@ from starVLA.model.modules.stereo.utonia_pointcloud import _sha256_file, validat
 
 cache_dir = Path(os.environ["UTONIA_CACHE_DIR"])
 data_mix = os.environ["DATA_MIX"]
-if data_mix != "libero_all_sfstereo_rightprimary":
-    raise SystemExit(f"[preflight] cached Utonia cache is scoped to libero_all_sfstereo_rightprimary, got {data_mix!r}")
+if data_mix != "libero_all_sfstereo_leftprimary":
+    raise SystemExit(f"[preflight] cached Utonia cache is scoped to libero_all_sfstereo_leftprimary, got {data_mix!r}")
 
 cfg = OmegaConf.load(os.environ["CONFIG_YAML"])
 cfg = OmegaConf.merge(
@@ -188,9 +188,9 @@ pc_cfg.update(
         "depth_max": 3.0,
         "disp_eps": 0.001,
         "num_cameras": 2,
-        "primary_idx": 1,
-        "right_view_idx": 0,
-        "primary_cam_id": 1,
+        "left_ref_idx": 1,
+        "primary_view_idx": 0,
+        "inject_cam_id": 1,
         "num_point_tokens": 64,
         "gate_init": "zero",
     }
@@ -384,9 +384,9 @@ CUDA_VISIBLE_DEVICES=${GPUS} ${CONDA_VENV}/accelerate launch \
   --framework.utonia_pointcloud.depth_max 3.0 \
   --framework.utonia_pointcloud.disp_eps 0.001 \
   --framework.utonia_pointcloud.num_cameras 2 \
-  --framework.utonia_pointcloud.primary_idx 1 \
-  --framework.utonia_pointcloud.right_view_idx 0 \
-  --framework.utonia_pointcloud.primary_cam_id 1 \
+  --framework.utonia_pointcloud.left_ref_idx 1 \
+  --framework.utonia_pointcloud.primary_view_idx 0 \
+  --framework.utonia_pointcloud.inject_cam_id 1 \
   --framework.utonia_pointcloud.num_point_tokens 64 \
   --framework.utonia_pointcloud.gate_init zero \
   "${UTONIA_CACHE_ARGS[@]}" \

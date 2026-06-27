@@ -51,11 +51,29 @@ DATASET_NAMED_MIXTURES = {
         ("libero_spatial_no_noops_1.0.0_lerobot", 1.0, "libero_franka_mono"),
         ("libero_10_no_noops_1.0.0_lerobot", 1.0, "libero_franka_mono"),
     ],
+    "libero_all_stereo": [
+        ("libero_object_no_noops_1.0.0_lerobot", 1.0, "libero_franka_stereo"),
+        ("libero_goal_no_noops_1.0.0_lerobot", 1.0, "libero_franka_stereo"),
+        ("libero_spatial_no_noops_1.0.0_lerobot", 1.0, "libero_franka_stereo"),
+        ("libero_10_no_noops_1.0.0_lerobot", 1.0, "libero_franka_stereo"),
+    ],
+    "libero_spatial_sfstereo_rightprimary": [
+        ("libero_spatial_no_noops_1.0.0_lerobot", 1.0, "libero_franka_sfstereo_rightprimary"),
+    ],
+    "libero_spatial_sfstereo_leftprimary": [
+        ("libero_spatial_no_noops_1.0.0_lerobot", 1.0, "libero_franka_sfstereo_leftprimary"),
+    ],
     "libero_all_sfstereo_rightprimary": [
         ("libero_object_no_noops_1.0.0_lerobot", 1.0, "libero_franka_sfstereo_rightprimary"),
         ("libero_goal_no_noops_1.0.0_lerobot", 1.0, "libero_franka_sfstereo_rightprimary"),
         ("libero_spatial_no_noops_1.0.0_lerobot", 1.0, "libero_franka_sfstereo_rightprimary"),
         ("libero_10_no_noops_1.0.0_lerobot", 1.0, "libero_franka_sfstereo_rightprimary"),
+    ],
+    "libero_all_sfstereo_leftprimary": [
+        ("libero_object_no_noops_1.0.0_lerobot", 1.0, "libero_franka_sfstereo_leftprimary"),
+        ("libero_goal_no_noops_1.0.0_lerobot", 1.0, "libero_franka_sfstereo_leftprimary"),
+        ("libero_spatial_no_noops_1.0.0_lerobot", 1.0, "libero_franka_sfstereo_leftprimary"),
+        ("libero_10_no_noops_1.0.0_lerobot", 1.0, "libero_franka_sfstereo_leftprimary"),
     ],
     "libero_all_3frame_stereo_rightprimary": [
         ("libero_object_no_noops_1.0.0_lerobot", 1.0, "libero_franka_3frame_stereo_rightprimary"),

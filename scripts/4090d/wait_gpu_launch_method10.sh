@@ -75,7 +75,7 @@ build_cmd(){
   common="cd $REPO && RUN_ID=$rid GPUS=$gpu PORT=$port"
   base="NUM_PROCESSES=1 MAX_STEPS=30000 SAVE_INTERVAL=10000 BS=32 \
 DS_CONFIG=starVLA/config/deepseeds/deepspeed_zero2_ga4.yaml \
-DATA_ROOT=playground/Datasets/LEROBOT_LIBERO_OURRENDER_PW DATA_MIX=libero_all_sfstereo_rightprimary \
+DATA_ROOT=playground/Datasets/LEROBOT_LIBERO_OURRENDER_PW DATA_MIX=libero_all_sfstereo_leftprimary \
 CAM_BRANCH=0 CAM_ROPE=0 PRETRAINED_CKPT= FREEZE_MODULES= TRAIN_ONLY="
   case "$kind" in
     utonia_perpatch)

@@ -64,21 +64,21 @@ build_cmd(){
       launcher="scripts/h100b/run_qwen0p8_groot_controlvla.sh"
       base="NUM_PROCESSES=1 MAX_STEPS=30000 SAVE_INTERVAL=10000 BS=32 \
 DS_CONFIG=starVLA/config/deepseeds/deepspeed_zero2_ga4.yaml FRAMEWORK=QwenGR00T_ControlVLAFFS \
-DATA_ROOT=playground/Datasets/LEROBOT_LIBERO_OURRENDER_PW DATA_MIX=libero_all_sfstereo_rightprimary \
+DATA_ROOT=playground/Datasets/LEROBOT_LIBERO_OURRENDER_PW DATA_MIX=libero_all_sfstereo_leftprimary \
 CAM_BRANCH=0 CAM_ROPE=0"
       envv="$base PRETRAINED_CKPT=$B_CKPT FREEZE_MODULES= TRAIN_ONLY=$CV_TRAIN_ONLY" ;;
     vr_fromscratch)
       launcher="scripts/h100b/run_qwen0p8_groot_value_residual.sh"
       base="NUM_PROCESSES=1 MAX_STEPS=30000 SAVE_INTERVAL=10000 BS=32 \
 DS_CONFIG=starVLA/config/deepseeds/deepspeed_zero2_ga4.yaml FRAMEWORK=QwenGR00T_ValueResidualFFS \
-DATA_ROOT=playground/Datasets/LEROBOT_LIBERO_OURRENDER_PW DATA_MIX=libero_all_sfstereo_rightprimary \
+DATA_ROOT=playground/Datasets/LEROBOT_LIBERO_OURRENDER_PW DATA_MIX=libero_all_sfstereo_leftprimary \
 CAM_BRANCH=0 CAM_ROPE=0"
       envv="$base PRETRAINED_CKPT= FREEZE_MODULES= TRAIN_ONLY=" ;;
     vr_warmstartB)
       launcher="scripts/h100b/run_qwen0p8_groot_value_residual.sh"
       base="NUM_PROCESSES=1 MAX_STEPS=30000 SAVE_INTERVAL=10000 BS=32 \
 DS_CONFIG=starVLA/config/deepseeds/deepspeed_zero2_ga4.yaml FRAMEWORK=QwenGR00T_ValueResidualFFS \
-DATA_ROOT=playground/Datasets/LEROBOT_LIBERO_OURRENDER_PW DATA_MIX=libero_all_sfstereo_rightprimary \
+DATA_ROOT=playground/Datasets/LEROBOT_LIBERO_OURRENDER_PW DATA_MIX=libero_all_sfstereo_leftprimary \
 CAM_BRANCH=0 CAM_ROPE=0"
       envv="$base PRETRAINED_CKPT=$B_CKPT FREEZE_MODULES= TRAIN_ONLY=$VR_TRAIN_ONLY" ;;
     *) return 1 ;;

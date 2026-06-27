@@ -36,7 +36,7 @@ DEFAULT_FFS_MODEL = (
 )
 DEFAULT_UTONIA_CKPT = "./playground/Pretrained_models/Utonia/utonia.pth"
 DEFAULT_DATA_ROOT = "playground/Datasets/LEROBOT_LIBERO_OURRENDER_PW"
-DEFAULT_DATA_MIX = "libero_all_sfstereo_rightprimary"
+DEFAULT_DATA_MIX = "libero_all_sfstereo_leftprimary"
 GRID_SHAPE = (1387, 8, 8)
 
 
@@ -58,7 +58,7 @@ def _parse_suites(value: str, available: list[str]) -> list[str]:
     return wanted
 
 
-def _assert_libero_rightprimary_only(data_mix: str, mixture_spec: list[tuple[str, float, str]], suites: list[str]) -> None:
+def _assert_libero_leftprimary_only(data_mix: str, mixture_spec: list[tuple[str, float, str]], suites: list[str]) -> None:
     if str(data_mix) != DEFAULT_DATA_MIX:
         raise ValueError(
             f"Utonia Version-A cache is scoped to {DEFAULT_DATA_MIX}; got data_mix={data_mix!r}"
@@ -68,11 +68,11 @@ def _assert_libero_rightprimary_only(data_mix: str, mixture_spec: list[tuple[str
         (name, robot_type)
         for name, _weight, robot_type in mixture_spec
         if name in selected and (
-            not str(name).startswith("libero_") or robot_type != "libero_franka_sfstereo_rightprimary"
+            not str(name).startswith("libero_") or robot_type != "libero_franka_sfstereo_leftprimary"
         )
     ]
     if bad:
-        raise ValueError(f"Utonia Version-A cache only supports LIBERO right-primary stereo suites; bad={bad}")
+        raise ValueError(f"Utonia Version-A cache only supports LIBERO leftprimary stereo suites; bad={bad}")
 
 
 def _human_bytes(num: float) -> str:
@@ -211,6 +211,10 @@ def _write_meta(
         "ffs_model_sha256": ffs_sha256,
         "utonia_ckpt_path": args.utonia_ckpt_path,
         "utonia_ckpt_sha256": utonia_sha256,
+        "view_order": geometry["view_order"],
+        "reference_view": geometry["reference_view"],
+        "net0_frame": geometry["net0_frame"],
+        "unrotate": geometry["unrotate"],
         "geometry": geometry,
         "image_sha256_samples": image_shas,
     }
@@ -311,7 +315,7 @@ def precompute_suite(model, pc_cfg: dict, dataset, suite_dir: Path, args: argpar
         sample = dataset[row]
         images = sample["image"]
         if len(images) != 2:
-            raise RuntimeError(f"{dataset.dataset_name} row={row} expected 2 right-first images, got {len(images)}")
+            raise RuntimeError(f"{dataset.dataset_name} row={row} expected 2 primary,left_view images, got {len(images)}")
         with torch.inference_mode():
             out = model.compute_utonia_grid([images], pc_cfg, grid_hw=(8, 8), deterministic=True)
         if tuple(out.shape) != (1, *GRID_SHAPE):
@@ -378,7 +382,7 @@ def main() -> int:
     mixture_spec = DATASET_NAMED_MIXTURES[str(cfg.datasets.vla_data.data_mix)]
     available = [name for name, _weight, _robot_type in mixture_spec]
     suites = _parse_suites(args.suites, available)
-    _assert_libero_rightprimary_only(str(cfg.datasets.vla_data.data_mix), mixture_spec, suites)
+    _assert_libero_leftprimary_only(str(cfg.datasets.vla_data.data_mix), mixture_spec, suites)
     dataset = get_vla_dataset(data_cfg=cfg.datasets.vla_data, mode="train", seed=int(cfg.get("seed", 42)))
     by_name = {single.dataset_name: single for single in dataset.datasets}
     pc_cfg = _build_pc_cfg(args, Path(args.cache_dir))

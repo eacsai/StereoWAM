@@ -141,21 +141,21 @@ class QwenGR00T_UtoniaResamplerFFS(UtoniaPointCloudMixin, QwenGR00TFFSBase):
             hf_model=hf_model,
             num_cameras=self.num_cameras,
             spatial_merge_size=spatial_merge,
-            primary_cam_id=self.primary_cam_id,
+            primary_cam_id=self.inject_cam_id,
             cam_rope_state=getattr(self, "_stereo_cam_rope_state", None),
             image_token_id=int(hf_model.config.image_token_id),
         )
 
     def _build_pointtoken_qwenvl_inputs(self, batch_images, instructions):
-        """Build [right image][point prompt text][left image][instruction] messages."""
+        """Build [primary image][point prompt text][left_view image][instruction] messages."""
 
         assert len(batch_images) == len(instructions), "Images and instructions must have the same length"
         messages = []
         for imgs, instruction in zip(batch_images, instructions):
-            if len(imgs) <= max(self.primary_idx, self.right_view_idx):
+            if len(imgs) <= max(self.primary_view_idx, self.left_ref_idx):
                 raise ValueError(
-                    "[GR00T-UtoniaResampler-FFS] expected right-first stereo images with "
-                    f"at least {max(self.primary_idx, self.right_view_idx) + 1} views, got {len(imgs)}"
+                    "[GR00T-UtoniaResampler-FFS] expected primary,left_view stereo images with "
+                    f"at least {max(self.primary_view_idx, self.left_ref_idx) + 1} views, got {len(imgs)}"
                 )
             if "CoT_prompt" in self.config.datasets.vla_data:
                 cot_prompt = self.config.datasets.vla_data.get("CoT_prompt", "")
@@ -163,9 +163,9 @@ class QwenGR00T_UtoniaResamplerFFS(UtoniaPointCloudMixin, QwenGR00TFFSBase):
             else:
                 task_prompt = instruction
             content = [
-                {"type": "image", "image": imgs[self.right_view_idx]},
+                {"type": "image", "image": imgs[self.primary_view_idx]},
                 {"type": "text", "text": self.point_token_prompt},
-                {"type": "image", "image": imgs[self.primary_idx]},
+                {"type": "image", "image": imgs[self.left_ref_idx]},
                 {"type": "text", "text": task_prompt},
             ]
             messages.append([{"role": "user", "content": content}])

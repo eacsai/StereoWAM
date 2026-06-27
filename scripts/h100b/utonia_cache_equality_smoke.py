@@ -42,9 +42,9 @@ def _build_cfg(args: argparse.Namespace, cache_dir: Path | None) -> dict:
         "gru_hidden_dim": 16,
         "ffs_image_size": args.image_size,
         "num_cameras": 2,
-        "primary_idx": 1,
-        "right_view_idx": 0,
-        "primary_cam_id": 1,
+        "left_ref_idx": 1,
+        "primary_view_idx": 0,
+        "inject_cam_id": 1,
         "utonia_ckpt_path": args.utonia_ckpt_path,
         "utonia_expected_sha256": args.utonia_expected_sha256,
         "utonia_scale": float(args.utonia_scale),
@@ -99,6 +99,7 @@ def _write_cache(
         for row in sha_rows
     ]
 
+    geom = _utonia_geometry_meta(pc_cfg, (8, 8))
     with open(suite_dir / "meta.json", "w") as fh:
         json.dump(
             {
@@ -109,7 +110,13 @@ def _write_cache(
                 "all_steps_sha256": _all_steps_sha256(all_steps),
                 "ffs_model_sha256": getattr(model, "_ffs_actual_sha256", None),
                 "utonia_ckpt_sha256": getattr(model, "_utonia_actual_sha256", None),
-                "geometry": _utonia_geometry_meta(pc_cfg, (8, 8)),
+                # leftprimary: validate_utonia_cache reads these 4 keys at meta TOP-LEVEL
+                # (mirror precompute_utonia_cache.py), not only inside "geometry".
+                "view_order": geom["view_order"],
+                "reference_view": geom["reference_view"],
+                "net0_frame": geom["net0_frame"],
+                "unrotate": geom["unrotate"],
+                "geometry": geom,
                 "image_sha256_samples": image_shas,
             },
             fh,

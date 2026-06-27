@@ -63,9 +63,9 @@ def ffs_depth_cfg(args: argparse.Namespace) -> dict:
         "gru_hidden_dim": 16,
         "ffs_image_size": args.ffs_image_size,
         "num_cameras": 2,
-        "primary_idx": 1,
-        "right_view_idx": 0,
-        "primary_cam_id": 1,
+        "left_ref_idx": 1,
+        "primary_view_idx": 0,
+        "inject_cam_id": 1,
         "num_depth_tokens": 16,
         "pool_hw": 4,
     }
@@ -493,7 +493,7 @@ def main() -> int:
     print(f"[setup] checkpoint={args.pretrained_ckpt}")
     print(f"[setup] base_vlm={args.base_vlm}")
     print(f"[setup] ffs_model={args.ffs_model_path}")
-    print("[setup] framework=QwenGR00T_DepthTokenFFS image_order=right_first primary_cam_id=1")
+    print("[setup] framework=QwenGR00T_DepthTokenFFS image_order=leftprimary inject_cam_id=1")
 
     ok = True
     try:

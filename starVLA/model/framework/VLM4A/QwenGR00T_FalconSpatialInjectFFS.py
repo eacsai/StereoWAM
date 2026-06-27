@@ -26,9 +26,9 @@ class QwenGR00TFalconSpatialInjectFFSDefaultConfig(QwenGR00TDefaultConfig):
             "gru_hidden_dim": 16,
             "ffs_image_size": 256,
             "num_cameras": 2,
-            "primary_idx": 1,
-            "right_view_idx": 0,
-            "primary_cam_id": 1,
+            "left_ref_idx": 1,
+            "primary_view_idx": 0,
+            "inject_cam_id": 1,
             "pooling": "amax",
         }
     )

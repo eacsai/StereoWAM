@@ -1069,22 +1069,27 @@ class VLAArenaFrankaDataConfig:
 ###########################################################################################
 
 class Libero4in1_3FrameDataConfig(Libero4in1DataConfig):
+    # 4D temporal: 3 consecutive frames; video + state both load delta [-2,-1,0]
     observation_indices = [-2, -1, 0]
 
 
 class Libero4in1_3FrameMonoDataConfig(Libero4in1_3FrameDataConfig):
+    # 3 consecutive frames, primary ONLY (no wrist, no right_view)
     video_keys = ["video.primary_image"]
 
 
 class Libero4in1_3FrameStereoDataConfig(Libero4in1_3FrameDataConfig):
+    # 3 consecutive frames, stereo = primary + right_view (no wrist)
     video_keys = ["video.primary_image", "video.right_view"]
 
 
 class Libero4in1MonoDataConfig(Libero4in1DataConfig):
+    # single-frame, primary ONLY (no wrist, no right_view)
     video_keys = ["video.primary_image"]
 
 
 class Libero4in1StereoDataConfig(Libero4in1DataConfig):
+    # single-frame, stereo = primary + right_view (no wrist)
     video_keys = ["video.primary_image", "video.right_view"]
 
 
@@ -1098,6 +1103,17 @@ class Libero4in1StereoRightPrimaryDataConfig(Libero4in1DataConfig):
     video_keys = ["video.right_view", "video.primary_image"]
 
 
+class Libero4in1StereoLeftPrimaryDataConfig(Libero4in1DataConfig):
+    # single-frame stereo, clean "leftprimary" convention: primary first, logical left_view second.
+    # WHY left_view == physical right_view: the dataset stores the 2nd camera under the column
+    # `observation.images.right_view`, but after LIBERO's 180-deg render rotation that image is
+    # GEOMETRICALLY the LEFT eye (~17px parallax). _with_standard_video_aliases() relabels the
+    # physical right_view column as `left_view`; we feed [primary, left_view] and FFS runs
+    # ffs(left_view, primary). This fixes the old ffs(primary, right_view) 11x-disparity bug
+    # (memory project_ffs_stereo_order_bug). Dataset on disk is unchanged -- only naming + order.
+    video_keys = ["video.primary_image", "video.left_view"]
+
+
 class Libero4in1_3FrameStereoRightPrimaryDataConfig(Libero4in1_3FrameDataConfig):
     # 3-frame stereo, RIGHT-FIRST: right_view then primary (feedback_stereo_view_order)
     video_keys = ["video.right_view", "video.primary_image"]
@@ -1105,14 +1121,16 @@ class Libero4in1_3FrameStereoRightPrimaryDataConfig(Libero4in1_3FrameDataConfig)
 
 ROBOT_TYPE_CONFIG_MAP = {
     "libero_franka": Libero4in1DataConfig(),
+    "libero_franka_sfstereo": Libero4in1StereoDataConfig(),
     "libero_franka_3frame": Libero4in1_3FrameDataConfig(),
     "libero_franka_3frame_interval0p5s": Libero4in1_3FrameInterval0p5sDataConfig(),
+    "libero_franka_mono": Libero4in1MonoDataConfig(),
+    "libero_franka_stereo": Libero4in1StereoDataConfig(),
     "libero_franka_3frame_mono": Libero4in1_3FrameMonoDataConfig(),
     "libero_franka_3frame_stereo": Libero4in1_3FrameStereoDataConfig(),
     "libero_franka_sfstereo_rightprimary": Libero4in1StereoRightPrimaryDataConfig(),
+    "libero_franka_sfstereo_leftprimary": Libero4in1StereoLeftPrimaryDataConfig(),
     "libero_franka_3frame_stereo_rightprimary": Libero4in1_3FrameStereoRightPrimaryDataConfig(),
-    "libero_franka_mono": Libero4in1MonoDataConfig(),
-    "libero_franka_sfstereo": Libero4in1StereoDataConfig(),
     "oxe_droid": OxeDroidDataConfig(),
     "oxe_bridge": OxeBridgeDataConfig(),
     "oxe_rt1": OxeRT1DataConfig(),
@@ -1126,4 +1144,3 @@ ROBOT_TYPE_CONFIG_MAP = {
 
     "custom_robot_config": SingleFrankaRobotiqDeltaEefDataConfig(),
 }
-

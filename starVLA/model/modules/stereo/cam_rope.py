@@ -14,9 +14,11 @@ SELECTED standard attention layers, so the attention dot product gets an extra
                           camera-conditioned via I_{d_c/4} ⊗ P_t rotation
 
 P_t = lift(K) @ T_t                                              (Eq 5 / 20)
-For LIBERO stereo:
-    T_left  = I_4
-    T_right = translate(+baseline, 0, 0)        # default baseline = 6 cm
+For LIBERO stereo under the clean convention:
+    primary   = geometric right camera
+    left_view = geometric left/reference camera
+    T_left    = I_4
+    T_right   = translate(+baseline, 0, 0)      # default baseline = 6 cm
 
 Init: **Zero** (W_q_cam = W_k_cam = 0). At step 0, q_cam = k_cam = 0 so the
 extended attention output is byte-identical to the unpatched baseline (verified
@@ -77,17 +79,17 @@ def compute_libero_camera_P_stack(
     Returns
     -------
     P_stack : (num_cameras=2, 4, 4) float32 tensor
-        P_stack[0] = P_right = lift(K_norm) @ T_right (right_view, +baseline_m in X) -- RIGHT-FIRST
-        P_stack[1] = P_left  = lift(K_norm) @ T_left  (primary, origin)
+        With right_first=True: P_stack[0] is primary/geometric-right,
+        P_stack[1] is left_view/geometric-left.
 
     Notes
     -----
     LIBERO agentview's default fovy is 45 degrees; render resolution 256x256.
     These are configurable (in case future renders use a different camera).
 
-    right_first (default True): P_stack[0]=right_view(+baseline), [1]=primary(origin),
-    matching the right-first convention (video_keys=[right_view, primary]). Set
-    right_first=False for OLD left-first runs (video_keys=[primary, right_view]).
+    right_first (default True) must stay True for the clean VLM order
+    video_keys=[primary, left_view]: cam id 0 is primary/geometric-right, and
+    cam id 1 is left_view/geometric-left.
     """
     f = (image_height / 2.0) / math.tan(math.radians(fovy_degrees / 2.0))
     K = torch.tensor([
@@ -105,7 +107,7 @@ def compute_libero_camera_P_stack(
     P_left = K_4 @ T_left
     P_right = K_4 @ T_right
     order = [P_right, P_left] if right_first else [P_left, P_right]
-    return torch.stack(order, dim=0)  # right_first(default): cam0=right_view(+baseline); else left-first (old): cam0=primary(origin)
+    return torch.stack(order, dim=0)
 
 
 # --------------------------------------------------------------------------- #
