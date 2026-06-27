@@ -47,7 +47,6 @@ TARGETS=(
   # 2026-06-12 baseline reproducibility re-runs (seed 42, plain QwenGR00T fromscratch, no FFS/cam_rope/cam_branch).
   # 4th field = video_keys: mono MUST eval primary-only; stereo right_view,primary. Checks if mono~91% on saturated LIBERO is real.
   "qwen3p5_0p8b_4suite_monoprimary_ourrender_fromscratch_rerun_30k|20000 30000|plain|primary"
-  "qwen3p5_0p8b_4suite_stereo_rightprimary_ourrender_fromscratch_rerun_30k|20000 30000|plain|right_view,primary"
 )
 
 pick_free_gpus(){ nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits 2>/dev/null \
@@ -57,7 +56,7 @@ ckpt_ready(){ local sz; sz=$($H100B "stat -c %s ${H100B_CKPT}/$1/checkpoints/ste
 # a watcher killed mid-record must NOT leave a truncated block that reads as "done".
 already_done(){ grep -A4 -E "^===== ${1} step=${2} " "$RESULTS" 2>/dev/null | grep -q "libero_10: SR="; }
 
-record(){ local rid="$1" step="$2" vk="${3:-right_view,primary}"
+record(){ local rid="$1" step="$2" vk="${3:-primary,left_view}"
   local edir="playground/Checkpoints/${rid}/eval_step${step}_$(echo "$vk" | tr ',' '_')"
   # Build the whole block first, then append atomically (single write): a kill
   # between header and suite lines would otherwise permanently truncate the record.
@@ -82,7 +81,7 @@ while true; do
   remaining=0
   gaveup=0
   for row in "${TARGETS[@]}"; do
-    IFS='|' read -r rid steps kind vk <<< "$row"; vk="${vk:-right_view,primary}"
+    IFS='|' read -r rid steps kind vk <<< "$row"; vk="${vk:-primary,left_view}"
     for step in $steps; do
       already_done "$rid" "$step" && continue
       key="${rid}|${step}"

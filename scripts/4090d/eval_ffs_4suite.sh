@@ -72,10 +72,10 @@ done
 echo "[ffs] verified ffs_model_path = ${FFS_4090D} in both config files"
 
 # ---- 3. delegate to proven core eval (skips re-pull, keeps our fixed config, derives
-#         right_view,primary + single-frame from DataConfig). Pass GPUS through if given. ----
-echo "[ffs] -> core eval (video_keys auto-derived; expect right_view,primary single-frame)"
+#         video_keys + single-frame from DataConfig). Pass GPUS through if given. ----
+echo "[ffs] -> core eval (video_keys auto-derived from ckpt data_mix; leftprimary -> primary,left_view)"
 if [ -n "$GPUS" ]; then
-  exec bash "$CORE" "$RUN_ID" "$STEP" "right_view,primary" "$GPUS"
+  exec bash "$CORE" "$RUN_ID" "$STEP" "" "$GPUS"
 else
-  exec bash "$CORE" "$RUN_ID" "$STEP" "right_view,primary"
+  exec bash "$CORE" "$RUN_ID" "$STEP" ""
 fi
