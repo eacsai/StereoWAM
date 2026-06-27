@@ -92,9 +92,9 @@ class Args:
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
     num_trials_per_task: int = 50  # Number of rollouts per task
     max_tasks: int = -1  # If > 0, limit the number of tasks evaluated (smoke / quick check). -1 = run all.
-    video_keys: str = "primary,wrist"  # NEW (2026-05-20): comma-separated image keys (primary|wrist|right_view).
+    video_keys: str = "primary,wrist"  # comma-separated image keys (primary|wrist|right_view|left_view).
                                        # Default backward compat. Mono primary-only ckpts: --args.video-keys primary.
-                                       # Stereo ckpts: --args.video-keys primary,right_view.
+                                       # Clean stereo ckpts: --args.video-keys primary,left_view.
 
     obs_indices: str = "0"  # NEW (2026-06-07): full observation_indices from ckpt DataConfig
                             # ("0" single / "-2,-1,0" stride1 / "-4,-2,0" stride2); buffer
@@ -104,7 +104,7 @@ class Args:
                              # Set by eval driver from ckpt config.
 
     stereo_baseline: float = 0.06  # NEW (2026-05-20): rightview camera baseline in meters.
-                                   # Only used when video_keys contains "right_view". 0.06 (6cm) matches
+                                   # Only used when video_keys contains "right_view" or "left_view". 0.06 (6cm) matches
                                    # scripts/4090d/regenerate_libero_stereo.py default — keep in sync.
 
     gripper_convention: str = "openvla"  # NEW (2026-05-21): {"openvla", "libero_raw"}.
@@ -143,7 +143,7 @@ class Args:
     job_name: str = "test"
 
 
-_ALLOWED_VIDEO_KEYS = {"primary", "wrist", "right_view"}
+_ALLOWED_VIDEO_KEYS = {"primary", "wrist", "right_view", "left_view"}
 _ALLOWED_GRIPPER_CONVENTIONS = {"openvla", "libero_raw"}
 
 
@@ -171,7 +171,7 @@ def eval_libero(args: Args) -> None:
         raise ValueError(
             f"--args.video-keys contains unknown keys {unknown_video_keys}. "
             f"Allowed: {sorted(_ALLOWED_VIDEO_KEYS)}. Mono ckpts: 'primary'. "
-            f"Stereo ckpts: 'primary,right_view'. Note: 'rightview' (no underscore) "
+            f"Stereo ckpts: 'primary,left_view'. Note: 'rightview' (no underscore) "
             f"is a common typo for 'right_view'."
         )
     if not requested_video_keys:
@@ -205,9 +205,9 @@ def eval_libero(args: Args) -> None:
     # NEW (2026-05-20): stereo eval flag — derived from video_keys. Drives both env
     # construction (make_stereo_env vs vanilla OffScreenRenderEnv) and per-step
     # rightview frame extraction. Computed once here so the inner loop is hot-path clean.
-    use_stereo = "right_view" in requested_video_keys
+    use_stereo = any(k in requested_video_keys for k in ("right_view", "left_view"))
     if use_stereo:
-        logging.info(f"[stereo] eval with rightview baseline={args.stereo_baseline}m")
+        logging.info(f"[stereo] eval with rendered rightview baseline={args.stereo_baseline}m")
 
     # Initialize LIBERO task suite
     benchmark_dict = benchmark.get_benchmark_dict()
@@ -345,9 +345,10 @@ def eval_libero(args: Args) -> None:
                     observation["observation.state"] = np.expand_dims(state, axis=0)
                 if use_stereo:
                     observation["observation.right_view"] = np.expand_dims(right_img, axis=0)  # (H, W, C)
+                    observation["observation.left_view"] = np.expand_dims(right_img, axis=0)  # logical alias
 
                 # align key with model API. Image list built per --args.video-keys to match
-                # training-time video_keys (mono ckpts: primary only; stereo ckpts: primary,right_view;
+                # training-time video_keys (mono ckpts: primary only; stereo ckpts: primary,left_view;
                 # default backward-compat: primary,wrist).
                 _img_map = {
                     "primary": observation["observation.primary"][0],
@@ -355,6 +356,7 @@ def eval_libero(args: Args) -> None:
                 }
                 if use_stereo:
                     _img_map["right_view"] = observation["observation.right_view"][0]
+                    _img_map["left_view"] = observation["observation.left_view"][0]
                 # multi-frame: append current frame per camera, then sample at obs_indices
                 # offsets (CAMERA-MAJOR, time-ascending, current frame last). Front-pad via
                 # clamp to first buffered frame (mirrors training get_video np.maximum(idx,0)).
@@ -461,6 +463,12 @@ def eval_libero(args: Args) -> None:
     logging.info(f"Total episodes: {total_episodes}")
 
 
+def _is_transient_egl_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    needles = ("egl", "0x8cdd", "not_initialized", "framebuffer", "rendercontext")
+    return any(needle in msg for needle in needles)
+
+
 def _get_libero_env(task, resolution, seed, use_stereo: bool = False, stereo_baseline: float = 0.06):
     """Initializes and returns the LIBERO environment, along with the task description.
 
@@ -474,19 +482,36 @@ def _get_libero_env(task, resolution, seed, use_stereo: bool = False, stereo_bas
     """
     task_description = task.language
     task_bddl_file = pathlib.Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
-    if use_stereo:
-        env = make_stereo_env(
-            bddl_file_name=str(task_bddl_file),
-            baseline=stereo_baseline,
-            resolution=resolution,
-        )
-    else:
-        env_args = {
-            "bddl_file_name": task_bddl_file,
-            "camera_heights": resolution,
-            "camera_widths": resolution,
-        }
-        env = OffScreenRenderEnv(**env_args)
+    attempts = int(os.environ.get("LIBERO_EGL_INIT_RETRIES", "4"))
+    delay = float(os.environ.get("LIBERO_EGL_INIT_RETRY_BASE_SEC", "1.5"))
+    for attempt in range(1, max(attempts, 1) + 1):
+        try:
+            if use_stereo:
+                env = make_stereo_env(
+                    bddl_file_name=str(task_bddl_file),
+                    baseline=stereo_baseline,
+                    resolution=resolution,
+                )
+            else:
+                env_args = {
+                    "bddl_file_name": task_bddl_file,
+                    "camera_heights": resolution,
+                    "camera_widths": resolution,
+                }
+                env = OffScreenRenderEnv(**env_args)
+            break
+        except Exception as exc:
+            if attempt >= max(attempts, 1) or not _is_transient_egl_error(exc):
+                raise
+            sleep_s = delay * attempt
+            logging.warning(
+                "[eval] transient EGL/offscreen init failure on attempt %d/%d: %s; retrying in %.1fs",
+                attempt,
+                attempts,
+                exc,
+                sleep_s,
+            )
+            time.sleep(sleep_s)
     env.seed(seed)  # IMPORTANT: seed seems to affect object positions even when using fixed initial state
     return env, task_description
 
