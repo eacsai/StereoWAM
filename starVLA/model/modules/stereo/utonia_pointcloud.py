@@ -124,13 +124,12 @@ def _utonia_geometry_meta(pc_cfg, grid_hw: Tuple[int, int]) -> dict:
         "depth_max",
         "disp_eps",
     )
-    legacy = any(pc_cfg.get(key, None) is not None for key in ("primary_idx", "right_view_idx", "primary_cam_id"))
     meta = {
         "grid_hw": [int(grid_hw[0]), int(grid_hw[1])],
-        "view_order": ["right_view", "primary"] if legacy else ["primary", "left_view"],
-        "reference_view": "legacy_primary_after_unrotate" if legacy else "left_view",
-        "net0_frame": "legacy_primary_rotated" if legacy else "left_view",
-        "unrotate": bool(legacy),
+        "view_order": ["primary", "left_view"],
+        "reference_view": "left_view",
+        "net0_frame": "left_view",
+        "unrotate": False,
     }
     for key in keys:
         if key == "utonia_feature_dim":

@@ -274,15 +274,6 @@ def _require_optional_meta_value(meta: dict, suite: str, key: str, expected) -> 
 
 
 def _expected_view_constants(ffs_cfg) -> dict:
-    if any(_cfg_get(ffs_cfg, key, None) is not None for key in ("primary_idx", "right_view_idx", "primary_cam_id")):
-        return {
-            "num_cameras": int(_cfg_get(ffs_cfg, "num_cameras", 2)),
-            "primary_idx": int(_cfg_get(ffs_cfg, "primary_idx", 1)),
-            "right_view_idx": int(_cfg_get(ffs_cfg, "right_view_idx", 0)),
-            "primary_cam_id": int(_cfg_get(ffs_cfg, "primary_cam_id", 1)),
-            "ffs_feature_source": str(_cfg_get(ffs_cfg, "ffs_feature_source", "gru_hidden")),
-            "gru_hidden_dim": int(_cfg_get(ffs_cfg, "gru_hidden_dim", 16)),
-        }
     return {
         "num_cameras": int(_cfg_get(ffs_cfg, "num_cameras", 2)),
         "left_ref_idx": int(_cfg_get(ffs_cfg, "left_ref_idx", 1)),
@@ -294,14 +285,6 @@ def _expected_view_constants(ffs_cfg) -> dict:
 
 
 def _view_convention_fingerprint(ffs_cfg) -> dict:
-    legacy = any(_cfg_get(ffs_cfg, key, None) is not None for key in ("primary_idx", "right_view_idx", "primary_cam_id"))
-    if legacy:
-        return {
-            "view_order": ["right_view", "primary"],
-            "reference_view": "legacy_primary_after_unrotate",
-            "net0_frame": "legacy_primary_rotated",
-            "unrotate": True,
-        }
     return {
         "view_order": ["primary", "left_view"],
         "reference_view": "left_view",

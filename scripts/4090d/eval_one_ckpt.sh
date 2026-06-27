@@ -71,7 +71,6 @@ done
 _DM_CONV="$(grep -m1 -E "^[[:space:]]*data_mix:" "$RUN_DIR/config.yaml" 2>/dev/null | sed -E 's/.*data_mix:[[:space:]]*//; s/[^a-zA-Z0-9_]//g')"
 case "$_DM_CONV" in
   *leftprimary*)  export FFS_STEREO_CONVENTION=leftprimary ;;
-  *rightprimary*) export FFS_STEREO_CONVENTION=legacy_unrotate ;;
 esac
 
 # ---- PREFLIGHT GUARD 1 ⭐: derive STEREO camera order from the ckpt's data_mix (see lesson (1) above) ----
@@ -80,7 +79,6 @@ if [ -z "$VIDEO_KEYS" ]; then
   DM="$(grep -m1 -E "^[[:space:]]*data_mix:" "$RUN_DIR/config.yaml" 2>/dev/null | sed -E "s/.*data_mix:[[:space:]]*//; s/[\"' ]//g")"
   case "$DM" in
     *leftprimary*)  VIDEO_KEYS="primary,left_view"; export FFS_STEREO_CONVENTION=leftprimary ;;    # clean convention: primary first, logical left_view second
-    *rightprimary*) VIDEO_KEYS="right_view,primary"; export FFS_STEREO_CONVENTION=legacy_unrotate ;;   # legacy right-first stereo (2026-06-07 convention)
     *primaryright*) VIDEO_KEYS="primary,right_view" ;;   # left-first stereo (older runs)
     *primarywrist*) VIDEO_KEYS="primary,wrist" ;;        # primary + wrist
     *mono*)         VIDEO_KEYS="primary" ;;              # mono

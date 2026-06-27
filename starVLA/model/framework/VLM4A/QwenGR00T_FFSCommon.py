@@ -51,11 +51,8 @@ def _ffs_stereo_convention() -> str:
     value = os.environ.get("FFS_STEREO_CONVENTION", "leftprimary").strip().lower()
     if value in {"", "leftprimary", "clean", "clean_leftprimary"}:
         return "leftprimary"
-    if value == "legacy_unrotate":
-        return "legacy_unrotate"
     raise ValueError(
-        "FFS_STEREO_CONVENTION must be 'leftprimary' (default clean path) or "
-        f"'legacy_unrotate', got {value!r}"
+        f"FFS_STEREO_CONVENTION must be 'leftprimary' (the only supported clean path), got {value!r}"
     )
 
 
@@ -306,54 +303,34 @@ class QwenGR00TNet0FFSMixin:
         self.num_cameras = int(ffs_cfg.get("num_cameras", 2))
         if os.environ.get("FFS_DISABLE_UNROTATE", "").strip():
             raise ValueError(
-                f"{label} no longer accepts FFS_DISABLE_UNROTATE. Use "
-                "FFS_STEREO_CONVENTION=legacy_unrotate for old un-rotate checkpoints, "
-                "or leave FFS_STEREO_CONVENTION unset for the clean leftprimary path."
+                f"{label} no longer accepts FFS_DISABLE_UNROTATE; the FFS path is "
+                "always the clean leftprimary convention now."
             )
 
         self.stereo_convention = _ffs_stereo_convention()
-        self._ffs_unrotate = self.stereo_convention == "legacy_unrotate"
-        if self.stereo_convention == "legacy_unrotate":
-            self.legacy_primary_idx = int(ffs_cfg.get("primary_idx", 1))
-            self.legacy_right_view_idx = int(ffs_cfg.get("right_view_idx", 0))
-            self.inject_cam_id = int(ffs_cfg.get("primary_cam_id", 1))
-            self.primary_view_idx = self.legacy_right_view_idx
-            self.left_ref_idx = self.legacy_primary_idx
-            expected = {
-                "primary_idx": (self.legacy_primary_idx, 1),
-                "right_view_idx": (self.legacy_right_view_idx, 0),
-                "primary_cam_id": (self.inject_cam_id, 1),
-            }
-            self.ffs_image1_idx = self.legacy_primary_idx
-            self.ffs_image2_idx = self.legacy_right_view_idx
-            self.view_order = ("right_view", "primary")
-            self.reference_view = "legacy_primary_after_unrotate"
-            self.net0_frame = "legacy_primary_rotated"
-        else:
-            legacy_keys = [
-                key
-                for key in ("primary_idx", "right_view_idx", "primary_cam_id")
-                if _cfg_contains(ffs_cfg, key)
-            ]
-            if legacy_keys:
-                raise ValueError(
-                    f"{label} clean leftprimary convention refuses legacy FFS keys {legacy_keys}. "
-                    "Use left_ref_idx=1, primary_view_idx=0, inject_cam_id=1 for new runs, "
-                    "or set FFS_STEREO_CONVENTION=legacy_unrotate when evaluating old checkpoints."
-                )
-            self.left_ref_idx = int(ffs_cfg.get("left_ref_idx", 1))
-            self.primary_view_idx = int(ffs_cfg.get("primary_view_idx", 0))
-            self.inject_cam_id = int(ffs_cfg.get("inject_cam_id", 1))
-            expected = {
-                "left_ref_idx": (self.left_ref_idx, 1),
-                "primary_view_idx": (self.primary_view_idx, 0),
-                "inject_cam_id": (self.inject_cam_id, 1),
-            }
-            self.ffs_image1_idx = self.left_ref_idx
-            self.ffs_image2_idx = self.primary_view_idx
-            self.view_order = ("primary", "left_view")
-            self.reference_view = "left_view"
-            self.net0_frame = "left_view"
+        legacy_keys = [
+            key
+            for key in ("primary_idx", "right_view_idx", "primary_cam_id")
+            if _cfg_contains(ffs_cfg, key)
+        ]
+        if legacy_keys:
+            raise ValueError(
+                f"{label} clean leftprimary convention refuses legacy FFS keys {legacy_keys}. "
+                "Use left_ref_idx=1, primary_view_idx=0, inject_cam_id=1 for new runs."
+            )
+        self.left_ref_idx = int(ffs_cfg.get("left_ref_idx", 1))
+        self.primary_view_idx = int(ffs_cfg.get("primary_view_idx", 0))
+        self.inject_cam_id = int(ffs_cfg.get("inject_cam_id", 1))
+        expected = {
+            "left_ref_idx": (self.left_ref_idx, 1),
+            "primary_view_idx": (self.primary_view_idx, 0),
+            "inject_cam_id": (self.inject_cam_id, 1),
+        }
+        self.ffs_image1_idx = self.left_ref_idx
+        self.ffs_image2_idx = self.primary_view_idx
+        self.view_order = ("primary", "left_view")
+        self.reference_view = "left_view"
+        self.net0_frame = "left_view"
 
         bad = {k: (got, want) for k, (got, want) in expected.items() if got != want}
         if bad:
@@ -362,12 +339,8 @@ class QwenGR00TNet0FFSMixin:
             raise ValueError(f"{label} requires num_cameras=2, got {self.num_cameras}")
         # Compatibility aliases for older helper modules. New code should use the
         # explicit names above.
-        if self.stereo_convention == "legacy_unrotate":
-            self.primary_idx = self.legacy_primary_idx
-            self.right_view_idx = self.legacy_right_view_idx
-        else:
-            self.primary_idx = self.primary_view_idx
-            self.right_view_idx = self.left_ref_idx
+        self.primary_idx = self.primary_view_idx
+        self.right_view_idx = self.left_ref_idx
         self.primary_cam_id = self.inject_cam_id
         if self.ffs_feature_source != "gru_hidden":
             raise ValueError(f"{label} only supports ffs_feature_source='gru_hidden'")
@@ -453,18 +426,11 @@ class QwenGR00TNet0FFSMixin:
             out.append(img * 255.0)
         return torch.stack(out, dim=0).to(device).float()
 
-    def _maybe_unrotate(self, t: torch.Tensor) -> torch.Tensor:
-        """Legacy-only 180-degree flip for old un-rotate checkpoints."""
-        return torch.flip(t, dims=(-2, -1)).contiguous() if self._ffs_unrotate else t
-
     def _compute_ffs_feature(self, batch_images: List) -> torch.Tensor:
         image1 = self._imgs_to_ffs_tensor(batch_images, self.ffs_image1_idx)
         image2 = self._imgs_to_ffs_tensor(batch_images, self.ffs_image2_idx)
-        # Clean path: upright ffs(left_view, primary). FoundationStereo image1 is
-        # the geometric-left/reference view, and net[0] stays in that left_view frame.
-        # Legacy mode reproduces the old un-rotate workaround explicitly.
-        image1 = self._maybe_unrotate(image1)
-        image2 = self._maybe_unrotate(image2)
+        # Upright ffs(left_view, primary). FoundationStereo image1 is the
+        # geometric-left/reference view, and net[0] stays in that left_view frame.
         B = image1.shape[0]
         with torch.no_grad():
             if next(self.ffs.parameters()).dtype != torch.float32:
@@ -490,7 +456,7 @@ class QwenGR00TNet0FFSMixin:
                 )
             if self._ffs_captured_net0 is None:
                 raise RuntimeError(f"{self._ffs_label} update_block net[0] hook did not fire")
-            ffs_feat = self._maybe_unrotate(self._ffs_captured_net0)
+            ffs_feat = self._ffs_captured_net0
             if ffs_feat.shape[0] != B:
                 raise RuntimeError(f"{self._ffs_label} net[0] batch {ffs_feat.shape[0]} != {B}")
             if ffs_feat.shape[1] != self.ffs_feat_dim:
@@ -503,8 +469,6 @@ class QwenGR00TNet0FFSMixin:
     def _compute_ffs_disparity(self, batch_images: List) -> torch.Tensor:
         image1 = self._imgs_to_ffs_tensor(batch_images, self.ffs_image1_idx)
         image2 = self._imgs_to_ffs_tensor(batch_images, self.ffs_image2_idx)
-        image1 = self._maybe_unrotate(image1)
-        image2 = self._maybe_unrotate(image2)
         B = image1.shape[0]
         with torch.no_grad():
             if next(self.ffs.parameters()).dtype != torch.float32:
@@ -523,7 +487,6 @@ class QwenGR00TNet0FFSMixin:
                 f"{self._ffs_label} expected FFS test_mode=True to return a Tensor disparity, "
                 f"got {type(disp_up).__name__}"
             )
-        disp_up = self._maybe_unrotate(disp_up)
         if disp_up.shape != (B, 1, self.ffs_image_size, self.ffs_image_size):
             raise RuntimeError(
                 f"{self._ffs_label} FFS disparity shape {tuple(disp_up.shape)} != "
