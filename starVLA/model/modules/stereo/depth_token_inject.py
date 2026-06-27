@@ -30,6 +30,11 @@ logger = logging.getLogger(__name__)
 class DepthTokenProjector(nn.Module):
     """Pool FFS net[0] to 4x4 tokens and project each token to VLM width."""
 
+    @staticmethod
+    def build_pool(pool_hw: int) -> nn.Module:
+        pool_hw = int(pool_hw)
+        return nn.AdaptiveAvgPool2d((pool_hw, pool_hw))
+
     def __init__(
         self,
         in_ch: int = 16,
@@ -47,7 +52,7 @@ class DepthTokenProjector(nn.Module):
         self.llm_dim = int(llm_dim)
         self.num_tokens = int(num_tokens)
         self.pool_hw = int(pool_hw)
-        self.pool = nn.AdaptiveAvgPool2d((pool_hw, pool_hw))
+        self.pool = self.build_pool(pool_hw)
         self.proj = nn.Linear(in_ch, llm_dim)
         nn.init.zeros_(self.proj.weight)
         nn.init.zeros_(self.proj.bias)
@@ -59,7 +64,21 @@ class DepthTokenProjector(nn.Module):
             raise ValueError(
                 f"DepthTokenProjector expected {self.in_ch} channels, got {int(net0.shape[1])}"
             )
-        x = self.pool(net0)                    # (B, C, 4, 4)
+        x = self.pool(net0)                    # (B, C, pool_hw, pool_hw)
+        return self.project_pooled(x)
+
+    def project_pooled(self, pooled_net0: torch.Tensor) -> torch.Tensor:
+        if pooled_net0.dim() != 4:
+            raise ValueError(
+                f"DepthTokenProjector expects pooled (B,C,H,W), got {tuple(pooled_net0.shape)}"
+            )
+        expected = (self.in_ch, self.pool_hw, self.pool_hw)
+        if tuple(int(x) for x in pooled_net0.shape[1:]) != expected:
+            raise ValueError(
+                f"DepthTokenProjector expected pooled tail {expected}, got "
+                f"{tuple(int(x) for x in pooled_net0.shape[1:])}"
+            )
+        x = pooled_net0
         x = x.flatten(2).transpose(1, 2)       # (B, 16, C)
         return self.proj(x.to(self.proj.weight.dtype))                    # (B, 16, D)
 
