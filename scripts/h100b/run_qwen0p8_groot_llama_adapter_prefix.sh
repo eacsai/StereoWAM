@@ -17,7 +17,7 @@ config_yaml=./examples/LIBERO/train_files/starvla_cotrain_libero.yaml
 base_vlm=${BASE_VLM:-./playground/Pretrained_models/Qwen3.5-0.8B}
 
 DATA_ROOT=${DATA_ROOT:-playground/Datasets/LEROBOT_LIBERO_OURRENDER_PW}
-DATA_MIX=${DATA_MIX:-libero_all_sfstereo_rightprimary}
+DATA_MIX=${DATA_MIX:-libero_all_sfstereo_leftprimary}
 FRAMEWORK=QwenGR00T_LlamaAdapterPrefixFFS
 B_CKPT=playground/Checkpoints/qwen3p5_0p8b_4suite_stereo_camrope_rightprimary_ourrender_30k/checkpoints/steps_30000_pytorch_model.pt
 
@@ -55,13 +55,23 @@ case "${run_id}" in
     [ -z "${PRETRAINED_CKPT}" ] || { echo "[guard] fromscratch run needs empty PRETRAINED_CKPT, got '${PRETRAINED_CKPT}'"; exit 3; }
     [ -z "${FREEZE_MODULES}" ] || { echo "[guard] fromscratch run needs FREEZE_MODULES='', got '${FREEZE_MODULES}'"; exit 3; }
     ;;
+  qwen3p5_0p8b_ffs_llama_adapter_prefix_fromscratch_perhead_30k)
+    PRETRAINED_CKPT=${PRETRAINED_CKPT-}
+    FREEZE_MODULES=${FREEZE_MODULES-}
+    [ -z "${PRETRAINED_CKPT}" ] || { echo "[guard] fromscratch perhead run needs empty PRETRAINED_CKPT, got '${PRETRAINED_CKPT}'"; exit 3; }
+    [ -z "${FREEZE_MODULES}" ] || { echo "[guard] fromscratch perhead run needs FREEZE_MODULES='', got '${FREEZE_MODULES}'"; exit 3; }
+    ;;
   *)
     echo "[guard] unsupported RUN_ID='${run_id}'. Use one of:"
     echo "  qwen3p5_0p8b_ffs_llama_adapter_prefix_warmstartB_frozen_30k"
     echo "  qwen3p5_0p8b_ffs_llama_adapter_prefix_fromscratch_30k"
+    echo "  qwen3p5_0p8b_ffs_llama_adapter_prefix_fromscratch_perhead_30k"
     exit 3
     ;;
 esac
+
+# per-head gate iff run_id marked _perhead_ (module supports gate_per_head)
+case "${run_id}" in *_perhead_*) GATE_PER_HEAD_BOOL=true ;; *) GATE_PER_HEAD_BOOL=false ;; esac
 
 [ -n "${ffs_sha256}" ] || { echo "[guard] FFS_SHA256 / ffs_expected_sha256 must be non-empty"; exit 3; }
 
@@ -105,8 +115,8 @@ echo "[launch] DATA_ROOT=${DATA_ROOT} DATA_MIX=${DATA_MIX}"
 echo "[launch] FREEZE_MODULES='${FREEZE_MODULES}'"
 echo "[launch] cam_rope: stereo_cam_rope_enabled=${CAM_ROPE_BOOL} (forced off)"
 echo "[launch] cam_branch: stereo_cam_branch_enabled=${CAM_BRANCH_BOOL}"
-echo "[launch] view indices: right_view_idx=0 primary_idx=1 primary_cam_id=1 num_cameras=2"
-echo "[launch] prefix: n_prompts=10 absorb_dim=256 gate_per_head=false"
+echo "[launch] view indices: left_ref_idx=1 primary_view_idx=0 inject_cam_id=1 num_cameras=2"
+echo "[launch] prefix: n_prompts=10 absorb_dim=256 gate_per_head=${GATE_PER_HEAD_BOOL}"
 DS_GA=$(printf '%s' "${DS_CONFIG}" | grep -oE 'ga[0-9]+' | grep -oE '[0-9]+' | tail -1 || true); DS_GA=${DS_GA:-4}
 echo "[launch] BS=$BS x $NUM_PROCESSES GPU x GA${DS_GA} (${DS_CONFIG##*/}) = eff_$((BS*NUM_PROCESSES*DS_GA)) | MAX_STEPS=$MAX_STEPS | PORT=$PORT | run_id=$run_id"
 
@@ -136,12 +146,12 @@ CUDA_VISIBLE_DEVICES=${GPUS} ${CONDA_VENV}/accelerate launch \
   --framework.ffs_llama_adapter_prefix.gru_hidden_dim 16 \
   --framework.ffs_llama_adapter_prefix.ffs_image_size 256 \
   --framework.ffs_llama_adapter_prefix.num_cameras 2 \
-  --framework.ffs_llama_adapter_prefix.primary_idx 1 \
-  --framework.ffs_llama_adapter_prefix.right_view_idx 0 \
-  --framework.ffs_llama_adapter_prefix.primary_cam_id 1 \
+  --framework.ffs_llama_adapter_prefix.left_ref_idx 1 \
+  --framework.ffs_llama_adapter_prefix.primary_view_idx 0 \
+  --framework.ffs_llama_adapter_prefix.inject_cam_id 1 \
   --framework.ffs_llama_adapter_prefix.n_prompts 10 \
   --framework.ffs_llama_adapter_prefix.absorb_dim 256 \
-  --framework.ffs_llama_adapter_prefix.gate_per_head false \
+  --framework.ffs_llama_adapter_prefix.gate_per_head ${GATE_PER_HEAD_BOOL} \
   --datasets.vla_data.data_root_dir ${DATA_ROOT} \
   --datasets.vla_data.data_mix ${DATA_MIX} \
   --datasets.vla_data.per_device_batch_size $BS \

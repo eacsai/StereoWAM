@@ -237,8 +237,7 @@ class PerLayerPrefixAdapter(nn.Module):
         gate_per_head: bool = False,
     ) -> None:
         super().__init__()
-        if gate_per_head:
-            raise ValueError("[llama_prefix] gate_per_head=True is not part of the finalized spec")
+        self.gate_per_head = bool(gate_per_head)
         self.layer_idx = int(layer_idx)
         self.hidden_dim = int(hidden_dim)
         self.num_attention_heads = int(num_attention_heads)
@@ -254,7 +253,9 @@ class PerLayerPrefixAdapter(nn.Module):
             2 * self.num_key_value_heads * self.head_dim,
             bias=False,
         )
-        self.gate = nn.Parameter(torch.zeros(()))
+        self.gate = nn.Parameter(
+            torch.zeros(self.num_attention_heads) if self.gate_per_head else torch.zeros(())
+        )
         self.last_debug: Dict[str, object] = {}
 
     def _recompute_query(
@@ -340,6 +341,14 @@ class PerLayerPrefixAdapter(nn.Module):
             dropout_p=0.0,
             is_causal=False,
         )
+        if self.gate_per_head:
+            # Faithful LLaMA-Adapter per-head zero-init gate: scale each head's prompt
+            # attention output BEFORE merge + o_proj. o_proj mixes heads, so a per-head
+            # gate must act here, not on the post-o_proj [B,S,H] tensor.
+            per_head_gate = torch.tanh(
+                self.gate.to(device=prefix_out.device, dtype=prefix_out.dtype)
+            ).view(1, -1, 1, 1)
+            prefix_out = prefix_out * per_head_gate
         merged = prefix_out.transpose(1, 2).reshape(batch, seqlen, self.num_attention_heads * self.head_dim)
         projected = _linear_with_detached_params(attn.o_proj, merged.to(dtype=attn.o_proj.weight.dtype))
         projected = projected.to(dtype=hidden_states.dtype)
@@ -411,8 +420,9 @@ class LlamaAdapterPrefixModule(nn.Module):
     def assert_all_gates_zero(self, label: str = "[llama_prefix]") -> None:
         bad = []
         for adapter in self.adapters:
-            if float(adapter.gate.detach().abs().cpu()) != 0.0:
-                bad.append((adapter.layer_idx, float(adapter.gate.detach().cpu())))
+            max_abs = float(adapter.gate.detach().abs().max().cpu())
+            if max_abs != 0.0:
+                bad.append((adapter.layer_idx, max_abs))
         if bad:
             raise RuntimeError(f"{label} expected all prefix gates to be zero after warm-start, got {bad}")
 
@@ -453,7 +463,12 @@ def _make_prefix_forward(
             position_embeddings=position_embeddings,
             valid_query_mask=valid_mask,
         ).to(device=attn_output.device, dtype=attn_output.dtype)
-        gate = torch.tanh(adapter.gate.to(device=attn_output.device, dtype=attn_output.dtype))
+        if adapter.gate_per_head:
+            # per-head gate was already applied inside forward_from_attention (before o_proj)
+            contribution = prefix_out
+        else:
+            gate = torch.tanh(adapter.gate.to(device=attn_output.device, dtype=attn_output.dtype))
+            contribution = gate * prefix_out
 
         if (
             state.logging_frequency > 0
@@ -461,6 +476,13 @@ def _make_prefix_forward(
             and state.last_logged_step.get(layer_idx) != state.forward_step
         ):
             state.last_logged_step[layer_idx] = state.forward_step
+            # compute the .cpu() gate scalar ONLY here (every logging_frequency steps), never
+            # every forward — keeps the gate_per_head=False path free of a per-step GPU->CPU sync,
+            # i.e. byte-behaviorally identical to the pre-per-head original.
+            if adapter.gate_per_head:
+                gate_value = float(torch.tanh(adapter.gate).detach().abs().max().float().cpu())
+            else:
+                gate_value = float(gate.detach().float().cpu())
             image_mask = None
             text_mask = None
             pad_mask = None
@@ -483,7 +505,7 @@ def _make_prefix_forward(
                 "ratio=%.6g row_mean_l2(image/text/pad)=%.6g/%.6g/%.6g",
                 state.forward_step,
                 layer_idx,
-                float(gate.detach().float().cpu()),
+                gate_value,
                 prefix_l2,
                 attn_l2,
                 ratio,
@@ -492,7 +514,7 @@ def _make_prefix_forward(
                 _masked_mean_l2(prefix_out, pad_mask),
             )
 
-        out = attn_output + gate * prefix_out
+        out = attn_output + contribution
         if isinstance(output, tuple):
             return (out, *output[1:])
         return out
@@ -523,6 +545,15 @@ def install_llama_adapter_prefix(
     hidden_dim = _base_hidden_size(hf_model)
     layer_specs: List[Tuple[int, int, int, int]] = []
     for layer_idx, attn in supported:
+        # The zero-gated prefix reuses this layer's o_proj. If o_proj carried a bias, a zero gate
+        # (esp. per-head, gated BEFORE o_proj) would still emit o_proj.bias as a nonzero step-0
+        # prefix contribution, breaking step-0 == baseline. Qwen3.5 attn is bias-free; refuse otherwise.
+        if getattr(getattr(attn, "o_proj", None), "bias", None) is not None:
+            raise RuntimeError(
+                f"[llama_prefix] layer {layer_idx}: attn.o_proj has a bias; the zero-gated prefix "
+                f"reuses o_proj, so a bias would leak a nonzero contribution at step 0. "
+                f"Refusing to install on this architecture."
+            )
         n_heads = int(getattr(attn, "num_attention_heads", getattr(attn, "num_heads", 0)))
         n_kv_heads = int(getattr(attn, "num_key_value_heads", getattr(attn, "num_key_value_heads", 0)))
         head_dim = int(getattr(attn, "head_dim", 0))
