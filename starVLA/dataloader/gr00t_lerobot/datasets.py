@@ -28,7 +28,7 @@ import hashlib
 import io
 import json, torch
 import copy
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from pathlib import Path
 from typing import Sequence
 import os, random
@@ -46,6 +46,7 @@ from starVLA.dataloader.gr00t_lerobot.embodiment_tags import EmbodimentTag
 from starVLA.dataloader.gr00t_lerobot.schema import (
     DatasetMetadata,
     DatasetStatisticalValues,
+    LeRobotModalityField,
     LeRobotModalityMetadata,
     LeRobotStateActionMetadata,
 )
@@ -67,9 +68,61 @@ LE_ROBOT_STEPS_FILENAME = "meta/steps.pkl"
 LE_ROBOT_STATS_FORMAT_VERSION = 2
 EPSILON = 5e-4
 
+
+def _with_standard_video_aliases(meta: LeRobotModalityMetadata) -> LeRobotModalityMetadata:
+    # WHY `left_view` is actually the stored `right_view` column:
+    # Stereo datasets physically store the 2nd camera as `observation.images.right_view`
+    # (it was *named* "right_view" at render time). But the LIBERO render is rotated 180 deg,
+    # so that image is GEOMETRICALLY the LEFT eye of the rig (~17px parallax to primary's left).
+    # The clean "leftprimary" convention relabels that physical column as `left_view` and feeds it
+    # to FFS as image1 = reference = geometric-LEFT. We do NOT modify the dataset on disk (the
+    # column stays `right_view`); we only add a `left_view` alias pointing at the same underlying
+    # column. This aliasing is the fix for the silent stereo-order bug where training fed
+    # ffs(primary, right_view) -> 11x-wrong disparity. See memory project_ffs_stereo_order_bug.
+    if "right_view" in meta.video and "left_view" not in meta.video:
+        meta.video["left_view"] = LeRobotModalityField(original_key=meta.video["right_view"].original_key)
+    return meta
+
 #  LeRobot v3.0 dataset file names 
 LE_ROBOT3_TASKS_FILENAME = "meta/tasks.parquet"
 LE_ROBOT3_EPISODE_FILENAME = "meta/episodes/*/*.parquet"
+
+
+def _cfg_get(cfg, key, default=None):
+    if cfg is None:
+        return default
+    if hasattr(cfg, "get"):
+        return cfg.get(key, default)
+    return getattr(cfg, key, default)
+
+
+def _cfg_bool(cfg, key, default=False) -> bool:
+    value = _cfg_get(cfg, key, default)
+    if isinstance(value, str):
+        return value.lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
+def _npz_scalar(npz, key: str):
+    value = npz[key]
+    if isinstance(value, np.ndarray):
+        value = value.item() if value.shape == () else value.tolist()
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    return value
+
+
+def _apply_spatial_alignment(array: np.ndarray, flip: str) -> np.ndarray:
+    flip = str(flip or "identity").lower()
+    if flip == "identity":
+        return array
+    if flip == "flip_ud":
+        return array[::-1, ...]
+    if flip == "flip_lr":
+        return array[:, ::-1, ...]
+    if flip == "rot180":
+        return array[::-1, ::-1, ...]
+    raise ValueError(f"Unsupported scene-flow sidecar_to_training_flip={flip!r}")
 
 
 def calculate_dataset_statistics(parquet_paths: list[Path]) -> dict:
@@ -625,6 +678,7 @@ class LeRobotSingleDataset(Dataset):
         self.curr_traj_id = None
 
         self._trajectory_ids, self._trajectory_lengths = self._get_trajectories()
+        self._init_scene_flow_sidecars()
         self._modality_keys = self._get_modality_keys()
         self._delta_indices = self._get_delta_indices()
         self._all_steps = self._get_all_steps()
@@ -636,6 +690,194 @@ class LeRobotSingleDataset(Dataset):
 
         # Check if the dataset is valid
         self._check_integrity()
+
+    def _init_scene_flow_sidecars(self) -> None:
+        cfg = _cfg_get(self.data_cfg, "scene_flow", {}) or {}
+        self.scene_flow_enabled = _cfg_bool(cfg, "enabled", False)
+        self.scene_flow_gt_only_sampler = self.scene_flow_enabled and _cfg_bool(cfg, "gt_only_sampler", False)
+        self._scene_flow_episode_to_sidecar: dict[int, dict] = {}
+        self._scene_flow_sidecar_cache: OrderedDict[str, dict] = OrderedDict()
+        self._scene_flow_sidecar_cache_size = int(_cfg_get(cfg, "cache_size", 4))
+        self._scene_flow_hw = int(_cfg_get(cfg, "image_size", 256))
+
+        if not self.scene_flow_enabled:
+            return
+        if self.delete_pause_frame:
+            raise RuntimeError(
+                "scene_flow.enabled=True requires delete_pause_frame=False; "
+                "base_index must stay aligned with sidecar t->t+1 frames."
+            )
+
+        index_path = _cfg_get(cfg, "index_path", None)
+        if not index_path:
+            index_path = self.dataset_path / "meta" / "episode_to_sceneflow_sidecar.json"
+        index_path = Path(index_path)
+        if not index_path.exists():
+            msg = f"[scene-flow] missing sidecar index for {self.dataset_name}: {index_path}"
+            if self.scene_flow_gt_only_sampler:
+                raise FileNotFoundError(msg)
+            print(msg + " (flow supervision will be all-zero)")
+            return
+
+        with open(index_path, "r") as f:
+            index_data = json.load(f)
+        audit = index_data.get("alignment_audit") if isinstance(index_data, dict) else None
+        if not isinstance(audit, dict) or audit.get("enabled") is not True or not audit.get("global_flip"):
+            raise RuntimeError(
+                "scene_flow.enabled=True requires an index built with alignment_audit.enabled=true "
+                f"and a unique global_flip; rebuild/audit the sidecar index: {index_path}"
+            )
+        global_flip = str(audit["global_flip"]).lower()
+        _apply_spatial_alignment(np.zeros((1, 1), dtype=np.uint8), global_flip)
+        expected_flip = str(
+            _cfg_get(
+                cfg,
+                "expected_sidecar_to_training_flip",
+                index_data.get("expected_sidecar_to_training_flip", audit.get("expected_flip", "rot180")),
+            )
+        ).lower()
+        if expected_flip not in {"", "any", "none"} and global_flip != expected_flip:
+            raise RuntimeError(
+                f"scene-flow index global_flip={global_flip!r} but expected {expected_flip!r}; "
+                "identity or another unexpected audit result is a data-alignment red flag"
+            )
+        records = (
+            index_data.get("episodes")
+            or index_data.get("episode_to_sidecar")
+            or index_data.get("mapping")
+            or index_data
+        )
+        sidecar_root = _cfg_get(cfg, "gt_dir", None) or index_data.get("sidecar_root")
+        sidecar_root = Path(sidecar_root) if sidecar_root else None
+
+        for episode_key, info in records.items():
+            if info is None:
+                continue
+            pair_count = None
+            if isinstance(info, str):
+                sidecar = info
+                flip = global_flip
+            else:
+                sidecar = info.get("sidecar") or info.get("sidecar_path")
+                flip = info.get("sidecar_to_training_flip", global_flip)
+                pair_count = info.get("pair_count")
+            if not sidecar:
+                continue
+            flip = str(flip).lower()
+            _apply_spatial_alignment(np.zeros((1, 1), dtype=np.uint8), flip)
+            if flip != global_flip:
+                raise RuntimeError(
+                    f"scene-flow index has per-record flip={flip!r} for episode {episode_key}, "
+                    f"but alignment audit global_flip={global_flip!r}; refusing mixed alignment"
+                )
+            sidecar_path = Path(sidecar)
+            if not sidecar_path.is_absolute():
+                sidecar_path = (sidecar_root / sidecar_path) if sidecar_root else (index_path.parent / sidecar_path)
+            if not sidecar_path.exists():
+                continue
+            record = {
+                "path": sidecar_path,
+                "sidecar_to_training_flip": flip,
+            }
+            if pair_count is not None:
+                record["pair_count"] = int(pair_count)
+            self._scene_flow_episode_to_sidecar[int(episode_key)] = record
+
+        if self.scene_flow_gt_only_sampler and not self._scene_flow_episode_to_sidecar:
+            raise RuntimeError(
+                f"scene_flow.gt_only_sampler=True but no usable sidecars were indexed for {self.dataset_name}"
+            )
+        print(
+            f"[scene-flow] {self.dataset_name}: indexed "
+            f"{len(self._scene_flow_episode_to_sidecar)} GT episodes from {index_path} "
+            f"(sidecar_to_training_flip={global_flip})"
+        )
+
+    @property
+    def scene_flow_gt_episode_ids(self) -> set[int]:
+        return set(self._scene_flow_episode_to_sidecar.keys())
+
+    def _scene_flow_supervised_step_count(self, trajectory_id: int, trajectory_length: int) -> int:
+        sidecar_info = self._scene_flow_episode_to_sidecar.get(int(trajectory_id), {})
+        if not sidecar_info:
+            return 0
+        sidecar_pair_count = int(sidecar_info.get("pair_count", max(int(trajectory_length) - 1, 0)))
+        return min(max(int(trajectory_length) - 1, 0), max(sidecar_pair_count, 0))
+
+    def _validate_scene_flow_sidecar(self, npz, path: Path) -> None:
+        expected = {
+            "schema_version": 4,
+            "flow_frame": "camera",
+            "gt_method": "sim_rerender_analytic",
+            "camera_name": "agentview",
+            "body_quat_order": "wxyz",
+        }
+        for key, value in expected.items():
+            if key not in npz:
+                raise KeyError(f"{path} missing required scene-flow metadata key {key!r}")
+            actual = _npz_scalar(npz, key)
+            if actual != value:
+                raise ValueError(f"{path} has {key}={actual!r}, expected {value!r}")
+        pixel_convention = _npz_scalar(npz, "pixel_convention")
+        if pixel_convention not in {"original_rgb_row_order", "training_rgb_row_order"}:
+            raise ValueError(f"{path} has unsupported pixel_convention={pixel_convention!r}")
+        for key in ("flow_3d", "valid_mask", "dynamic_mask"):
+            if key not in npz:
+                raise KeyError(f"{path} missing required scene-flow array {key!r}")
+
+    def _load_scene_flow_sidecar(self, path: Path) -> dict:
+        cache_key = str(path)
+        if cache_key in self._scene_flow_sidecar_cache:
+            self._scene_flow_sidecar_cache.move_to_end(cache_key)
+            return self._scene_flow_sidecar_cache[cache_key]
+
+        with np.load(path, allow_pickle=False) as npz:
+            self._validate_scene_flow_sidecar(npz, path)
+            sidecar = {
+                "flow_3d": np.asarray(npz["flow_3d"], dtype=np.float32),
+                "valid_mask": np.asarray(npz["valid_mask"], dtype=bool),
+                "dynamic_mask": np.asarray(npz["dynamic_mask"], dtype=bool),
+            }
+
+        self._scene_flow_sidecar_cache[cache_key] = sidecar
+        while len(self._scene_flow_sidecar_cache) > self._scene_flow_sidecar_cache_size:
+            self._scene_flow_sidecar_cache.popitem(last=False)
+        return sidecar
+
+    def _empty_scene_flow_sample(self) -> dict:
+        hw = self._scene_flow_hw
+        return {
+            "flow_gt": np.zeros((hw, hw, 3), dtype=np.float32),
+            "flow_valid": np.zeros((hw, hw), dtype=bool),
+            "flow_dynamic": np.zeros((hw, hw), dtype=bool),
+            "flow_has_gt": False,
+            "flow_sidecar_path": "",
+            "flow_sidecar_to_training_flip": "identity",
+        }
+
+    def _get_scene_flow_sample(self, trajectory_id: int, base_index: int) -> dict:
+        if not self.scene_flow_enabled:
+            return {}
+        info = self._scene_flow_episode_to_sidecar.get(int(trajectory_id))
+        if info is None:
+            return self._empty_scene_flow_sample()
+
+        sidecar = self._load_scene_flow_sidecar(info["path"])
+        if base_index < 0 or base_index >= sidecar["flow_3d"].shape[0]:
+            empty = self._empty_scene_flow_sample()
+            empty["flow_sidecar_path"] = str(info["path"])
+            empty["flow_sidecar_to_training_flip"] = str(info["sidecar_to_training_flip"])
+            return empty
+
+        flip = str(info["sidecar_to_training_flip"])
+        return {
+            "flow_gt": _apply_spatial_alignment(sidecar["flow_3d"][base_index], flip).copy(),
+            "flow_valid": _apply_spatial_alignment(sidecar["valid_mask"][base_index], flip).copy(),
+            "flow_dynamic": _apply_spatial_alignment(sidecar["dynamic_mask"][base_index], flip).copy(),
+            "flow_has_gt": True,
+            "flow_sidecar_path": str(info["path"]),
+            "flow_sidecar_to_training_flip": flip,
+        }
 
     @property
     def dataset_path(self) -> Path:
@@ -743,7 +985,9 @@ class LeRobotSingleDataset(Dataset):
         # 1.1. State and action modalities
         simplified_modality_meta: dict[str, dict] = {}
         with open(modality_meta_path, "r") as f:
-            le_modality_meta = LeRobotModalityMetadata.model_validate(json.load(f))
+            le_modality_meta = _with_standard_video_aliases(
+                LeRobotModalityMetadata.model_validate(json.load(f))
+            )
         for modality in ["state", "action"]:
             simplified_modality_meta[modality] = {}
             le_state_action_meta: dict[str, LeRobotStateActionMetadata] = getattr(
@@ -981,6 +1225,10 @@ class LeRobotSingleDataset(Dataset):
             try:
                 with open(steps_path, "rb") as f:
                     cached_data = pickle.load(f)
+                if cached_data.get("config_key") != config_key:
+                    raise ValueError(
+                        f"cache config_key={cached_data.get('config_key')} does not match current {config_key}"
+                    )
                 return cached_data["steps"]
             except Exception as e:
                 # include EOFError / PickleError / KeyError
@@ -1027,6 +1275,15 @@ class LeRobotSingleDataset(Dataset):
             "delete_pause_frame": self.delete_pause_frame,
             "dataset_name": self.dataset_name,
         }
+        if getattr(self, "scene_flow_gt_only_sampler", False):
+            cfg = _cfg_get(self.data_cfg, "scene_flow", {}) or {}
+            config_dict.update(
+                {
+                    "scene_flow_gt_only_sampler": True,
+                    "scene_flow_index_path": str(_cfg_get(cfg, "index_path", "")),
+                    "scene_flow_gt_dir": str(_cfg_get(cfg, "gt_dir", "")),
+                }
+            )
         # Create a hash of the configuration
         config_str = str(sorted(config_dict.items()))
         return hashlib.md5(config_str.encode()).hexdigest()[:12]  #
@@ -1070,7 +1327,16 @@ class LeRobotSingleDataset(Dataset):
             if not trajectory_skipped:
                 processed_trajectories += 1
         
-            for base_index in range(trajectory_length):
+            if self.scene_flow_gt_only_sampler:
+                supervised_steps = self._scene_flow_supervised_step_count(trajectory_id, int(trajectory_length))
+                if supervised_steps <= 0:
+                    skipped_trajectories += 1
+                    continue
+                step_count = supervised_steps
+            else:
+                step_count = int(trajectory_length)
+
+            for base_index in range(step_count):
                 all_steps.append((trajectory_id, base_index))
                 
         # Print summary statistics
@@ -1276,7 +1542,7 @@ class LeRobotSingleDataset(Dataset):
         ), f"Please provide a {LE_ROBOT_MODALITY_FILENAME} file in {self.dataset_path}"
         with open(modality_meta_path, "r") as f:
             modality_meta = LeRobotModalityMetadata.model_validate(json.load(f))
-        return modality_meta
+        return _with_standard_video_aliases(modality_meta)
 
     def _get_lerobot_info_meta(self) -> dict:
         """Get the metadata for the LeRobot dataset."""
@@ -1401,6 +1667,17 @@ class LeRobotSingleDataset(Dataset):
             state = np.concatenate(state, axis=1).astype(np.float16)
             sample["state"] = state
 
+        for flow_key in (
+            "flow_gt",
+            "flow_valid",
+            "flow_dynamic",
+            "flow_has_gt",
+            "flow_sidecar_path",
+            "flow_sidecar_to_training_flip",
+        ):
+            if flow_key in data:
+                sample[flow_key] = data[flow_key]
+
         if __import__("os").environ.get("MF_DEBUG") and getattr(type(self), "_mfdbg_n", 0) < 6:
             type(self)._mfdbg_n = getattr(type(self), "_mfdbg_n", 0) + 1
             import numpy as _npd
@@ -1442,6 +1719,7 @@ class LeRobotSingleDataset(Dataset):
             for key in self.modality_keys[modality]:
                 data[key] = self.get_data_by_modality(trajectory_id, modality, key, base_index)
         data = self._apply_action_mode(data)
+        data.update(self._get_scene_flow_sample(trajectory_id, base_index))
         return data
 
     def get_trajectory_data(self, trajectory_id: int) -> pd.DataFrame:
@@ -2178,6 +2456,16 @@ class LeRobotMixtureDataset(Dataset):
         self._getitem_count = 0
         # 2. Dataset sampling weights
         self._dataset_sampling_weights = np.array(dataset_sampling_weights)
+        scene_flow_cfg = _cfg_get(self.data_cfg, "scene_flow", {}) or {}
+        self._scene_flow_gt_only_sampler = _cfg_bool(scene_flow_cfg, "enabled", False) and _cfg_bool(
+            scene_flow_cfg,
+            "gt_only_sampler",
+            False,
+        )
+        if self._scene_flow_gt_only_sampler:
+            for i, dataset in enumerate(self.datasets):
+                if not getattr(dataset, "scene_flow_gt_episode_ids", set()):
+                    self._dataset_sampling_weights[i] = 0.0
         
         if self.balance_dataset_weights:
             self._dataset_sampling_weights *= self._dataset_lengths
@@ -2185,16 +2473,23 @@ class LeRobotMixtureDataset(Dataset):
         # Check for zero or negative weights before normalization
         if np.any(self._dataset_sampling_weights <= 0):
             print(f"Warning: Found zero or negative sampling weights: {self._dataset_sampling_weights}")
-            # Set minimum weight to prevent division issues
-            self._dataset_sampling_weights = np.maximum(self._dataset_sampling_weights, 1e-8)
+            if self._scene_flow_gt_only_sampler:
+                if not np.any(self._dataset_sampling_weights > 0):
+                    raise RuntimeError("scene_flow.gt_only_sampler=True but no mixture dataset has GT sidecars")
+            else:
+                # Set minimum weight to prevent division issues
+                self._dataset_sampling_weights = np.maximum(self._dataset_sampling_weights, 1e-8)
         
         # Normalize weights
         weights_sum = self._dataset_sampling_weights.sum()
         if weights_sum == 0 or np.isnan(weights_sum):
             print(f"Error: Invalid weights sum: {weights_sum}")
-            # Fallback to equal weights
-            self._dataset_sampling_weights = np.ones(len(self.datasets)) / len(self.datasets)
-            print(f"Fallback to equal weights")
+            if self._scene_flow_gt_only_sampler:
+                raise RuntimeError("scene_flow.gt_only_sampler=True produced zero dataset sampling weight")
+            else:
+                # Fallback to equal weights
+                self._dataset_sampling_weights = np.ones(len(self.datasets)) / len(self.datasets)
+                print(f"Fallback to equal weights")
         else:
             self._dataset_sampling_weights /= weights_sum
 
@@ -2204,18 +2499,40 @@ class LeRobotMixtureDataset(Dataset):
             trajectory_sampling_weights = np.ones(len(dataset.trajectory_lengths))
             if self.balance_trajectory_weights:
                 trajectory_sampling_weights *= dataset.trajectory_lengths
+            if self._scene_flow_gt_only_sampler:
+                gt_records = getattr(dataset, "_scene_flow_episode_to_sidecar", {})
+                gt_mask = np.array(
+                    [
+                        int(tid) in gt_records
+                        and dataset._scene_flow_supervised_step_count(tid, dataset.trajectory_lengths[j]) > 0
+                        for j, tid in enumerate(dataset.trajectory_ids)
+                    ],
+                    dtype=bool,
+                )
+                trajectory_sampling_weights = np.where(gt_mask, trajectory_sampling_weights, 0.0)
             
             # Check for zero or negative weights before normalization
             if np.any(trajectory_sampling_weights <= 0):
                 print(f"Warning: Dataset {i} has zero or negative trajectory weights")
-                trajectory_sampling_weights = np.maximum(trajectory_sampling_weights, 1e-8)
+                if self._scene_flow_gt_only_sampler:
+                    if not np.any(trajectory_sampling_weights > 0):
+                        raise RuntimeError(
+                            f"scene_flow.gt_only_sampler=True but dataset {dataset.dataset_name} has no GT episodes"
+                        )
+                else:
+                    trajectory_sampling_weights = np.maximum(trajectory_sampling_weights, 1e-8)
             
             # Normalize weights
             weights_sum = trajectory_sampling_weights.sum()
             if weights_sum == 0 or np.isnan(weights_sum):
                 print(f"Error: Dataset {i} has invalid trajectory weights sum: {weights_sum}")
-                # Fallback to equal weights
-                trajectory_sampling_weights = np.ones(len(dataset.trajectory_lengths)) / len(dataset.trajectory_lengths)
+                if self._scene_flow_gt_only_sampler:
+                    raise RuntimeError(
+                        f"scene_flow.gt_only_sampler=True produced zero trajectory weight for {dataset.dataset_name}"
+                    )
+                else:
+                    # Fallback to equal weights
+                    trajectory_sampling_weights = np.ones(len(dataset.trajectory_lengths)) / len(dataset.trajectory_lengths)
             else:
                 trajectory_sampling_weights /= weights_sum
             
@@ -2314,7 +2631,12 @@ class LeRobotMixtureDataset(Dataset):
         trajectory_id = dataset.trajectory_ids[trajectory_index]
 
         # Sample step
-        base_index = rng.choice(dataset.trajectory_lengths[trajectory_index])
+        trajectory_length = int(dataset.trajectory_lengths[trajectory_index])
+        if self._scene_flow_gt_only_sampler and int(trajectory_id) in getattr(dataset, "scene_flow_gt_episode_ids", set()):
+            supervised_steps = dataset._scene_flow_supervised_step_count(trajectory_id, trajectory_length)
+            base_index = rng.choice(max(supervised_steps, 1))
+        else:
+            base_index = rng.choice(trajectory_length)
         return dataset, trajectory_id, base_index
 
     

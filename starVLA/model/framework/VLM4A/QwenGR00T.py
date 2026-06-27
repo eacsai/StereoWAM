@@ -124,6 +124,38 @@ class QwenGR00TDefaultConfig:
             "num_inference_timesteps": 4,
             # Number of vision tokens fed to action head
             "num_target_vision_tokens": 32,
+            # Auxiliary dense scene-flow head. Default off means no decoder module,
+            # no hidden-state return from DiT, and no extra loss path.
+            "scene_flow": {
+                "enabled": False,
+                "flow_lambda": 0.05,
+                "online_grad_norm_enabled": False,
+                "target_grad_ratio": 0.05,
+                "lambda_min": 1.0e-3,
+                "lambda_max": 1.0e4,
+                "lambda_ema_decay": 0.97,
+                "online_grad_norm_every_n_steps": 10,
+                "probe_samples": 4,
+                "lambda_jump_cap": 2.0,
+                "lambda_warmup_steps": 100,
+                "min_supervised_pixels": 128.0,
+                "grad_norm_epsilon": 1.0e-12,
+                "grid_size": 16,
+                "hidden_layer": -1,
+                "decoder_layers": 2,
+                "decoder_heads": 8,
+                "decoder_mlp_ratio": 4.0,
+                "mask_mode": "dynamic",
+                "dynamic_fallback_to_valid": True,
+                "smooth_l1_beta": 0.01,
+                "step0_flow_warmup_steps": 1,
+                "step0_action_loss_audit": True,
+                "step0_action_loss_audit_atol": 1.0e-4,
+                "grad_ratio_steps": 20,
+                "grad_ratio_min_warn": 0.01,
+                "grad_ratio_failure_warn_every": 10,
+                "grad_ratio_raise_on_failure": False,
+            },
             # === DiT Transformer sub-config ===
             "diffusion_model_cfg": {
                 # Cross-attention dim (aligned to VLM hidden_size at runtime)
@@ -370,9 +402,18 @@ class Qwen_GR00T(baseframework):
                 state = torch.tensor(np.array(state), device=last_hidden.device, dtype=last_hidden.dtype)
                 state_repeated = state.repeat(repeated_diffusion_steps, 1, 1)
 
-            action_loss = self.action_model(
+            action_output = self.action_model(
                 last_hidden_repeated, actions_target_repeated, state_repeated
             )  # (B, chunk_len, action_dim)
+            if isinstance(action_output, dict):
+                if "flow_pred" in action_output:
+                    raise RuntimeError(
+                        "scene_flow.enabled=True is wired for QwenGR00T FFS training paths; "
+                        "plain QwenGR00T.forward has no scene-flow GT/loss connection."
+                    )
+                action_loss = action_output["action_loss"]
+            else:
+                action_loss = action_output
 
         return {"action_loss": action_loss}
 

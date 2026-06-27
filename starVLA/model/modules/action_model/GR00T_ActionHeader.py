@@ -193,6 +193,87 @@ DiTConfig = {
 }
 
 
+class SceneFlowDecoderLayer(nn.Module):
+    def __init__(self, embed_dim: int, num_heads: int, mlp_ratio: float = 4.0):
+        super().__init__()
+        self.query_norm = nn.LayerNorm(embed_dim)
+        self.self_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+        self.cross_query_norm = nn.LayerNorm(embed_dim)
+        self.cross_kv_norm = nn.LayerNorm(embed_dim)
+        self.cross_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+        self.mlp_norm = nn.LayerNorm(embed_dim)
+        hidden_dim = int(embed_dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, embed_dim),
+        )
+
+    def forward(self, queries: torch.Tensor, future_hidden: torch.Tensor) -> torch.Tensor:
+        q = self.query_norm(queries)
+        queries = queries + self.self_attn(q, q, q, need_weights=False)[0]
+
+        q = self.cross_query_norm(queries)
+        kv = self.cross_kv_norm(future_hidden)
+        queries = queries + self.cross_attn(q, kv, kv, need_weights=False)[0]
+
+        queries = queries + self.mlp(self.mlp_norm(queries))
+        return queries
+
+
+class SceneFlowDecoder(nn.Module):
+    """Learned 2D query decoder over GR00T future tokens.
+
+    The final projection is zero-initialized so enabling this head does not
+    perturb action forward outputs at step 0.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int,
+        grid_size: int = 16,
+        num_layers: int = 2,
+        num_heads: int = 8,
+        mlp_ratio: float = 4.0,
+    ):
+        super().__init__()
+        if embed_dim % num_heads != 0:
+            raise ValueError(f"SceneFlowDecoder embed_dim={embed_dim} must divide num_heads={num_heads}")
+        self.grid_size = int(grid_size)
+        num_queries = self.grid_size * self.grid_size
+        self.input_norm = nn.LayerNorm(embed_dim)
+        self.queries = nn.Parameter(torch.empty(num_queries, embed_dim))
+        nn.init.normal_(self.queries, mean=0.0, std=0.02)
+        self.layers = nn.ModuleList(
+            [
+                SceneFlowDecoderLayer(
+                    embed_dim=embed_dim,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        self.output_norm = nn.LayerNorm(embed_dim)
+        self.flow_head = nn.Linear(embed_dim, 3)
+        nn.init.zeros_(self.flow_head.weight)
+        nn.init.zeros_(self.flow_head.bias)
+
+    def forward(self, future_hidden: torch.Tensor) -> torch.Tensor:
+        future_hidden = self.input_norm(future_hidden)
+        queries = self.queries.unsqueeze(0).expand(future_hidden.shape[0], -1, -1)
+        queries = queries.to(device=future_hidden.device, dtype=future_hidden.dtype)
+        for layer in self.layers:
+            queries = layer(queries, future_hidden)
+        flow_tokens = self.flow_head(self.output_norm(queries))
+        return flow_tokens.view(
+            future_hidden.shape[0],
+            self.grid_size,
+            self.grid_size,
+            3,
+        ).permute(0, 3, 1, 2).contiguous()
+
+
 class FlowmatchingActionHead(nn.Module):
     def __init__(
         self,
@@ -281,6 +362,23 @@ class FlowmatchingActionHead(nn.Module):
         # ------------------------------------------------------------------
         self.future_tokens = nn.Embedding(config.num_target_vision_tokens, self.input_embedding_dim)
         nn.init.normal_(self.future_tokens.weight, mean=0.0, std=0.02)
+        self.num_target_vision_tokens = int(config.num_target_vision_tokens)
+
+        scene_flow_cfg = getattr(config, "scene_flow", {}) or {}
+        scene_flow_enabled = scene_flow_cfg.get("enabled", False)
+        if isinstance(scene_flow_enabled, str):
+            scene_flow_enabled = scene_flow_enabled.lower() in {"1", "true", "yes", "y", "on"}
+        self.scene_flow_enabled = bool(scene_flow_enabled)
+        self.scene_flow_hidden_layer = int(scene_flow_cfg.get("hidden_layer", -1))
+        self.scene_flow_decoder = None
+        if self.scene_flow_enabled:
+            self.scene_flow_decoder = SceneFlowDecoder(
+                embed_dim=self.input_embedding_dim,
+                grid_size=int(scene_flow_cfg.get("grid_size", 16)),
+                num_layers=int(scene_flow_cfg.get("decoder_layers", 2)),
+                num_heads=int(scene_flow_cfg.get("decoder_heads", 8)),
+                mlp_ratio=float(scene_flow_cfg.get("decoder_mlp_ratio", 4.0)),
+            )
 
         # ------------------------------------------------------------------
         # Positional embedding over the action sequence
@@ -350,18 +448,37 @@ class FlowmatchingActionHead(nn.Module):
         )
 
         # Join VLM features with state and action embedding along sequence dimension.
-        model_output = self.model(
+        model_result = self.model(
             hidden_states=sa_embs,
             encoder_hidden_states=vl_embs,
             encoder_attention_mask=encoder_attention_mask,
             timestep=t_discretized,
-            return_all_hidden_states=False,  # NOTE (YL): not using flare now
+            return_all_hidden_states=self.scene_flow_enabled,
         )
+        if self.scene_flow_enabled:
+            model_output, all_hidden_states = model_result
+        else:
+            model_output = model_result
+
         pred = self.action_decoder(model_output)
         pred_actions = pred[:, -actions.shape[1] :]
 
         # Slice out only the action portion of pred and target.
         loss = ((pred_actions - velocity) ** 2).mean()
+        if self.scene_flow_enabled:
+            state_len = state_features.shape[1] if state_features is not None else 0
+            hidden = all_hidden_states[self.scene_flow_hidden_layer]
+            future_hidden = hidden[:, state_len : state_len + self.num_target_vision_tokens, :]
+            if future_hidden.shape[1] != self.num_target_vision_tokens:
+                raise RuntimeError(
+                    "Failed to slice GR00T future tokens for scene flow: "
+                    f"got {future_hidden.shape[1]} tokens, expected {self.num_target_vision_tokens}"
+                )
+            flow_pred = self.scene_flow_decoder(future_hidden)
+            return {
+                "action_loss": loss,
+                "flow_pred": flow_pred,
+            }
         return loss
 
     @torch.no_grad()

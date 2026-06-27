@@ -15,7 +15,7 @@ export WANDB_MODE=disabled
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export FFS_REPO_DIR=${FFS_REPO_DIR:-/mnt/data/wangqiwei/wangqiwei/Fast-FoundationStereo}
 
-cd /mnt/data/wangqiwei/wangqiwei/starVLA
+cd /data/wangqiwei/ICLR2026/starVLA
 export PYTHONPATH=$(pwd):${FFS_REPO_DIR}:${PYTHONPATH:-}
 
 CONDA_VENV=${CONDA_VENV:-/opt/conda/envs/starvla/bin}
