@@ -185,6 +185,43 @@ class BasicTransformerBlock(nn.Module):
         return hidden_states
 
 
+class MotionCoupler(nn.Module):
+    """Zero-init gated cross-attention that injects a DETACHED external "motion"
+    hidden (from a separate scene-flow DiT) into the action DiT, as a residual.
+
+    Design (spec §4, round-2 N1/N4):
+    - dropout forced to 0.0 so the branch consumes NO RNG (train-mode step-0 identity).
+    - a zero-initialized final Linear (`zero_proj`) is the LAST op before the residual
+      add, so at init this path outputs exactly 0 -> enabling the coupler is
+      byte-identical to baseline at step 0.
+    - keep it a clean side module (not an attn1 wrapper), so trunk keys are untouched.
+    """
+
+    def __init__(self, dim, motion_dim, num_attention_heads, attention_head_dim, norm_eps=1e-5):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim, eps=norm_eps, elementwise_affine=True)
+        self.attn = Attention(
+            query_dim=dim,
+            cross_attention_dim=motion_dim,
+            heads=num_attention_heads,
+            dim_head=attention_head_dim,
+            dropout=0.0,
+            bias=False,
+            out_bias=True,
+        )
+        self.zero_proj = nn.Linear(dim, dim)
+        nn.init.zeros_(self.zero_proj.weight)
+        nn.init.zeros_(self.zero_proj.bias)
+
+    def forward(self, hidden_states, motion_hidden, motion_attention_mask=None):
+        out = self.attn(
+            self.norm(hidden_states),
+            encoder_hidden_states=motion_hidden,
+            attention_mask=motion_attention_mask,
+        )
+        return self.zero_proj(out)
+
+
 class DiT(ModelMixin, ConfigMixin):
     _supports_gradient_checkpointing = True
 
@@ -210,6 +247,7 @@ class DiT(ModelMixin, ConfigMixin):
         positional_embeddings: Optional[str] = "sinusoidal",
         interleave_self_attention=False,
         cross_attention_dim: Optional[int] = None,
+        motion_coupler_dim: Optional[int] = None,
         **kwargs,
     ):
         super().__init__()
@@ -252,6 +290,24 @@ class DiT(ModelMixin, ConfigMixin):
             ]
         self.transformer_blocks = nn.ModuleList(all_blocks)
 
+        # Optional zero-init motion coupler at each CROSS-ATTN (even) block only
+        # (self-attn/odd blocks get no coupler). motion_coupler_dim = the external
+        # scene-flow DiT hidden width; None -> disabled (baseline, unchanged).
+        self.motion_coupler = None
+        if motion_coupler_dim is not None:
+            couplers = {}
+            for idx in range(self.config.num_layers):
+                use_self_attn = idx % 2 == 1 and interleave_self_attention
+                if not use_self_attn:
+                    couplers[str(idx)] = MotionCoupler(
+                        self.inner_dim,
+                        motion_coupler_dim,
+                        self.config.num_attention_heads,
+                        self.config.attention_head_dim,
+                        norm_eps=self.config.norm_eps,
+                    )
+            self.motion_coupler = nn.ModuleDict(couplers)
+
         # Output blocks
         self.norm_out = nn.LayerNorm(self.inner_dim, elementwise_affine=False, eps=1e-6)
         self.proj_out_1 = nn.Linear(self.inner_dim, 2 * self.inner_dim)
@@ -268,6 +324,9 @@ class DiT(ModelMixin, ConfigMixin):
         timestep: Optional[torch.LongTensor] = None,
         return_all_hidden_states: bool = False,
         encoder_attention_mask=None,
+        motion_hidden: Optional[torch.Tensor] = None,
+        motion_attention_mask=None,
+        motion_gate: Optional[torch.Tensor] = None,
     ):
         # Encode timesteps
         temb = self.timestep_encoder(timestep)
@@ -296,6 +355,22 @@ class DiT(ModelMixin, ConfigMixin):
                     encoder_attention_mask=encoder_attention_mask,
                     temb=temb,
                 )
+                # Zero-init motion coupler on cross-attn (even) blocks. No-op at
+                # init (zero_proj) and when motion_hidden is None (baseline).
+                if (
+                    motion_hidden is not None
+                    and self.motion_coupler is not None
+                    and str(idx) in self.motion_coupler
+                ):
+                    _coup = self.motion_coupler[str(idx)](
+                        hidden_states, motion_hidden, motion_attention_mask
+                    )
+                    # Per-sample gate on the coupler residual (scene DiT past-flow branch:
+                    # has_past_flow). A trained zero_proj has nonzero bias, so masking the
+                    # coupler INPUT is insufficient — gate the OUTPUT residual. Shape (B,1,1).
+                    if motion_gate is not None:
+                        _coup = _coup * motion_gate
+                    hidden_states = hidden_states + _coup
             all_hidden_states.append(hidden_states)
 
         # Output processing

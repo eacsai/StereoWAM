@@ -152,6 +152,22 @@ class VLATrainer(TrainerUtils):
     def _scene_flow_enabled(self) -> bool:
         return _cfg_bool(self._scene_flow_cfg(), "enabled", False)
 
+    def _scene_predictor_cfg(self):
+        framework = _cfg_get(self.config, "framework", {})
+        return _cfg_get(framework, "scene_predictor", {}) or {}
+
+    def _scene_predictor_enabled(self) -> bool:
+        return _cfg_bool(self._scene_predictor_cfg(), "enabled", False)
+
+    def _scene_predictor_lambda(self) -> float:
+        return float(_cfg_get(self._scene_predictor_cfg(), "flow_lambda", 0.1))
+
+    def _loss_mode(self) -> str:
+        m = str(_cfg_get(_cfg_get(self.config, "trainer", {}), "loss_mode", "joint")).strip().lower()
+        if m not in {"joint", "flow_only"}:
+            raise ValueError(f"trainer.loss_mode must be 'joint' or 'flow_only', got {m!r} (review H5)")
+        return m
+
     def _maybe_validate_ffs_cache_startup(self) -> None:
         maybe_validate_ffs_cache_startup(
             accelerator=self.accelerator,
@@ -1053,6 +1069,37 @@ class VLATrainer(TrainerUtils):
                 total_loss = action_loss
                 if self._scene_flow_enabled() and flow_loss is not None:
                     total_loss = action_loss + flow_weight * flow_loss
+                elif self._scene_predictor_enabled():
+                    # Scene-flow dual-DiT cascade (independent of the legacy aux path).
+                    sup_cells = output_dict.get("flow_supervised_cells", None)
+                    if self._loss_mode() == "flow_only":
+                        if flow_loss is None:
+                            raise RuntimeError(
+                                "loss_mode=flow_only but forward returned no flow_loss "
+                                "(scene_predictor stage-1 needs flow GT in the batch)."
+                            )
+                        # Zero-supervision guard (review H2): an all-empty mask makes
+                        # flow_loss==0 -> silent no-op training. Refuse. NOTE flow_only
+                        # assumes the action head is FROZEN via freeze_modules (else its
+                        # params get no grad -> DeepSpeed/DDP unused-param hang; review M3).
+                        if sup_cells is not None and float(sup_cells) <= 0:
+                            raise RuntimeError(
+                                "loss_mode=flow_only but the batch has ZERO supervised scene "
+                                "cells (empty masks / flow_has_gt all False). Check GT sidecars / "
+                                "gt_only_sampler; refusing a no-op step."
+                            )
+                        total_loss = flow_loss
+                    elif flow_loss is not None:
+                        total_loss = action_loss + self._scene_predictor_lambda() * flow_loss
+                    else:
+                        # joint + scene_predictor enabled but NO flow_loss (no sample had the
+                        # scene target key) -> would silently train action-only for the whole
+                        # run. Fail loud (review H3).
+                        raise RuntimeError(
+                            "scene_predictor.enabled + loss_mode=joint but forward returned no "
+                            "flow_loss (no sample had the scene target key). Check data_mix / "
+                            "scene_predictor.target_key / GT sidecars."
+                        )
 
             self.accelerator.backward(total_loss)
 
@@ -1103,6 +1150,14 @@ class VLATrainer(TrainerUtils):
                     metrics[f"scene_flow/{key}"] = value
             metrics.update(grad_ratio_metrics)
             metrics.update(audit_metrics)
+        if self._scene_predictor_enabled() and flow_loss is not None:
+            # scene-flow dual-DiT cascade metrics (review H6 — the legacy block above is
+            # gated on _scene_flow_enabled, so the new path logged nothing before).
+            metrics["scene_predictor/flow_loss"] = flow_loss.item()
+            metrics["scene_predictor/lambda"] = self._scene_predictor_lambda()
+            _sc = output_dict.get("flow_supervised_cells", None)
+            if torch.is_tensor(_sc):
+                metrics["scene_predictor/supervised_cells"] = _sc.item()
         if self._scene_flow_online_grad_norm_enabled():
             metrics.update(self._scene_flow_online_state_metrics())
             metrics.update(online_gradnorm_metrics)

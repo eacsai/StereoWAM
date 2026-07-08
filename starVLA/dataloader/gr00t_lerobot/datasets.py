@@ -28,9 +28,10 @@ import hashlib
 import io
 import json, torch
 import copy
+import sqlite3
 from collections import OrderedDict, defaultdict
 from pathlib import Path
-from typing import Sequence
+from typing import Sequence, Tuple, List
 import os, random
 import numpy as np
 import pandas as pd
@@ -51,9 +52,9 @@ from starVLA.dataloader.gr00t_lerobot.schema import (
     LeRobotStateActionMetadata,
 )
 from starVLA.dataloader.gr00t_lerobot.transform import ComposedModalityTransform
+from starVLA.dataloader.gr00t_lerobot.transform.state_action import StateActionTransform
 
 from functools import partial
-from typing import Tuple, List
 import pickle
 import gc
 
@@ -110,6 +111,17 @@ def _npz_scalar(npz, key: str):
     if isinstance(value, bytes):
         value = value.decode("utf-8")
     return value
+
+
+def _cache_key_part(value):
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _all_steps_sha256(all_steps: Sequence[Tuple[object, object]]) -> str:
+    payload = json.dumps(list(all_steps), sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _apply_spatial_alignment(array: np.ndarray, flip: str) -> np.ndarray:
@@ -682,6 +694,7 @@ class LeRobotSingleDataset(Dataset):
         self._modality_keys = self._get_modality_keys()
         self._delta_indices = self._get_delta_indices()
         self._all_steps = self._get_all_steps()
+        self._init_ortho_cache()
         self.set_transforms_metadata(self.metadata)
         self.set_epoch(0)
 
@@ -691,6 +704,112 @@ class LeRobotSingleDataset(Dataset):
         # Check if the dataset is valid
         self._check_integrity()
 
+    def _init_ortho_cache(self) -> None:
+        cfg = _cfg_get(self.data_cfg, "ortho_cache", {}) or {}
+        self.ortho_cache_enabled = _cfg_bool(cfg, "enabled", False)
+        self._ortho_cache_conn = None
+        self._ortho_cache_view = str(_cfg_get(cfg, "view", "grid")).lower()
+        self._ortho_cache_position = str(_cfg_get(cfg, "position", "last")).lower()
+        if not self.ortho_cache_enabled:
+            return
+        if self._ortho_cache_view not in {"grid", "axo"}:
+            raise ValueError(f"ortho_cache.view must be 'grid' or 'axo', got {self._ortho_cache_view!r}")
+        if self._ortho_cache_position not in {"last", "first"}:
+            raise ValueError(f"ortho_cache.position must be 'last' or 'first', got {self._ortho_cache_position!r}")
+
+        cache_dir = _cfg_get(cfg, "cache_dir", None)
+        if not cache_dir:
+            raise ValueError("ortho_cache.enabled=True requires ortho_cache.cache_dir")
+        suite_dir = Path(cache_dir) / self.dataset_name
+        meta_path = suite_dir / "meta.json"
+        index_path = suite_dir / "index.pkl"
+        db_path = suite_dir / "ortho_views.sqlite"
+        done_path = suite_dir / "done.npy"
+        for path in (meta_path, index_path, db_path, done_path):
+            if not path.exists():
+                raise FileNotFoundError(f"ortho_cache missing {path} for {self.dataset_name}")
+
+        with open(meta_path, "r") as fh:
+            meta = json.load(fh)
+        if meta.get("suite") != self.dataset_name:
+            raise RuntimeError(f"ortho_cache meta suite={meta.get('suite')!r} != {self.dataset_name!r}")
+        data_mix = _cfg_get(cfg, "expected_data_mix", None)
+        if data_mix is not None and str(meta.get("data_mix")) != str(data_mix):
+            raise RuntimeError(
+                f"ortho_cache data_mix={meta.get('data_mix')!r} != expected {data_mix!r}"
+            )
+        video_backend = _cfg_get(cfg, "expected_video_backend", None)
+        if video_backend is not None and str(meta.get("video_backend")) != str(video_backend):
+            raise RuntimeError(
+                f"ortho_cache video_backend={meta.get('video_backend')!r} != expected {video_backend!r}"
+            )
+        all_steps = [(_cache_key_part(t), _cache_key_part(b)) for t, b in self.all_steps]
+        actual_sha = _all_steps_sha256(all_steps)
+        if meta.get("all_steps_sha256") != actual_sha:
+            raise RuntimeError(
+                f"ortho_cache all_steps_sha256 mismatch for {self.dataset_name}: "
+                f"cache={meta.get('all_steps_sha256')} dataset={actual_sha}"
+            )
+        with open(index_path, "rb") as fh:
+            self._ortho_cache_index = pickle.load(fh)
+        self._ortho_cache_done = np.load(done_path, mmap_mode="r")
+        if tuple(self._ortho_cache_done.shape) != (len(self.all_steps),):
+            raise RuntimeError(
+                f"ortho_cache done shape {self._ortho_cache_done.shape} != {(len(self.all_steps),)} "
+                f"for {self.dataset_name}"
+            )
+        self._ortho_cache_db_path = db_path
+        self._ortho_cache_printed = False
+
+    def _load_ortho_cache_image(self, trajectory_id: int, base_index: int) -> Image.Image:
+        key = (_cache_key_part(trajectory_id), _cache_key_part(base_index))
+        row = self._ortho_cache_index.get(key)
+        if row is None:
+            raise KeyError(f"ortho_cache has no row for suite={self.dataset_name} key={key}")
+        if not bool(self._ortho_cache_done[int(row)]):
+            raise RuntimeError(f"ortho_cache row not done for suite={self.dataset_name} row={row} key={key}")
+        if self._ortho_cache_conn is None:
+            self._ortho_cache_conn = sqlite3.connect(f"file:{self._ortho_cache_db_path}?mode=ro", uri=True)
+        col = "grid_png" if self._ortho_cache_view == "grid" else "axo_png"
+        cursor = self._ortho_cache_conn.execute(f"SELECT {col} FROM ortho_views WHERE row=?", (int(row),))
+        result = cursor.fetchone()
+        if result is None or result[0] is None:
+            raise RuntimeError(
+                f"ortho_cache missing {self._ortho_cache_view} image for suite={self.dataset_name} row={row}"
+            )
+        img = Image.open(io.BytesIO(result[0])).convert("RGB")
+        if os.environ.get("ORTHO_DEBUG_SHAPES") and not self._ortho_cache_printed:
+            self._ortho_cache_printed = True
+            print(
+                f"[ortho-cache] suite={self.dataset_name} view={self._ortho_cache_view} "
+                f"row={row} image_size={img.size}",
+                flush=True,
+        )
+        return img
+
+    def _maybe_append_ortho_cache(self, sample: dict, trajectory_id: int, base_index: int) -> None:
+        if not self.ortho_cache_enabled:
+            return
+        if len(sample["image"]) != 2:
+            raise RuntimeError(
+                f"ortho_cache requires stereo [primary,left_view] before append; "
+                f"dataset={self.dataset_name} has {len(sample['image'])} images"
+            )
+        grid_img = self._load_ortho_cache_image(trajectory_id, base_index)
+        if getattr(self, "_ortho_cache_position", "last") == "first":
+            sample["image"].insert(0, grid_img)
+        else:
+            sample["image"].append(grid_img)
+        sample["ortho_cache_view"] = self._ortho_cache_view
+        if os.environ.get("ORTHO_DEBUG_SHAPES") and getattr(type(self), "_orthodbg_n", 0) < 6:
+            type(self)._orthodbg_n = getattr(type(self), "_orthodbg_n", 0) + 1
+            print(
+                f"[ortho-pack] dataset={self.dataset_name} traj={trajectory_id} "
+                f"base={base_index} n_images={len(sample['image'])} "
+                f"sizes={[im.size for im in sample['image']]}",
+                flush=True,
+            )
+
     def _init_scene_flow_sidecars(self) -> None:
         cfg = _cfg_get(self.data_cfg, "scene_flow", {}) or {}
         self.scene_flow_enabled = _cfg_bool(cfg, "enabled", False)
@@ -699,6 +818,12 @@ class LeRobotSingleDataset(Dataset):
         self._scene_flow_sidecar_cache: OrderedDict[str, dict] = OrderedDict()
         self._scene_flow_sidecar_cache_size = int(_cfg_get(cfg, "cache_size", 4))
         self._scene_flow_hw = int(_cfg_get(cfg, "image_size", 256))
+        # past-flow ControlNet (mirror of framework.scene_predictor.past_flow_controlnet into
+        # the dataloader namespace, per codex review #11): emit the last-K one-step flow fields.
+        pf_cfg = _cfg_get(cfg, "past_flow_controlnet", {}) or {}
+        self.past_flow_enabled = _cfg_bool(pf_cfg, "enabled", False)
+        self.past_flow_k = int(_cfg_get(pf_cfg, "n_past_steps", 2))
+        self.past_flow_spacing = int(_cfg_get(pf_cfg, "spacing_delta", 1))
 
         if not self.scene_flow_enabled:
             return
@@ -838,6 +963,9 @@ class LeRobotSingleDataset(Dataset):
                 "valid_mask": np.asarray(npz["valid_mask"], dtype=bool),
                 "dynamic_mask": np.asarray(npz["dynamic_mask"], dtype=bool),
             }
+            if "pointmap_3d" in npz:  # static-geometry twin target (re-rendered sidecars only)
+                sidecar["pointmap_3d"] = np.asarray(npz["pointmap_3d"], dtype=np.float32)
+                sidecar["pointmap_valid"] = np.asarray(npz["pointmap_valid"], dtype=bool)
 
         self._scene_flow_sidecar_cache[cache_key] = sidecar
         while len(self._scene_flow_sidecar_cache) > self._scene_flow_sidecar_cache_size:
@@ -846,14 +974,22 @@ class LeRobotSingleDataset(Dataset):
 
     def _empty_scene_flow_sample(self) -> dict:
         hw = self._scene_flow_hw
-        return {
+        out = {
             "flow_gt": np.zeros((hw, hw, 3), dtype=np.float32),
             "flow_valid": np.zeros((hw, hw), dtype=bool),
             "flow_dynamic": np.zeros((hw, hw), dtype=bool),
+            "pointmap_gt": np.zeros((hw, hw, 3), dtype=np.float32),
+            "pointmap_valid": np.zeros((hw, hw), dtype=bool),
             "flow_has_gt": False,
             "flow_sidecar_path": "",
             "flow_sidecar_to_training_flip": "identity",
         }
+        if getattr(self, "past_flow_enabled", False):
+            K = self.past_flow_k
+            out["past_flow_gt"] = np.zeros((K, hw, hw, 3), dtype=np.float32)
+            out["past_flow_valid"] = np.zeros((K, hw, hw), dtype=bool)
+            out["has_past_flow"] = False
+        return out
 
     def _get_scene_flow_sample(self, trajectory_id: int, base_index: int) -> dict:
         if not self.scene_flow_enabled:
@@ -870,7 +1006,7 @@ class LeRobotSingleDataset(Dataset):
             return empty
 
         flip = str(info["sidecar_to_training_flip"])
-        return {
+        out = {
             "flow_gt": _apply_spatial_alignment(sidecar["flow_3d"][base_index], flip).copy(),
             "flow_valid": _apply_spatial_alignment(sidecar["valid_mask"][base_index], flip).copy(),
             "flow_dynamic": _apply_spatial_alignment(sidecar["dynamic_mask"][base_index], flip).copy(),
@@ -878,6 +1014,27 @@ class LeRobotSingleDataset(Dataset):
             "flow_sidecar_path": str(info["path"]),
             "flow_sidecar_to_training_flip": flip,
         }
+        if "pointmap_3d" in sidecar:  # static-geometry twin target (re-rendered sidecars)
+            out["pointmap_gt"] = _apply_spatial_alignment(sidecar["pointmap_3d"][base_index], flip).copy()
+            out["pointmap_valid"] = _apply_spatial_alignment(sidecar["pointmap_valid"][base_index], flip).copy()
+        if getattr(self, "past_flow_enabled", False):
+            # last-K one-step flow fields (t-D, t-2D, ..., t-KD) as the ControlNet input; SAME
+            # _apply_spatial_alignment as flow_gt (codex #8). has_past_flow=True iff all K exist
+            # (else zero-fill + gate off -> single-frame baseline, made in-distribution by dropout).
+            K, D = self.past_flow_k, self.past_flow_spacing
+            hw = sidecar["flow_3d"].shape[1]
+            past_gt = np.zeros((K, hw, hw, 3), dtype=np.float32)
+            past_valid = np.zeros((K, hw, hw), dtype=bool)
+            has_all = base_index >= K * D
+            if has_all:
+                for k in range(1, K + 1):
+                    idx = base_index - k * D
+                    past_gt[k - 1] = _apply_spatial_alignment(sidecar["flow_3d"][idx], flip)
+                    past_valid[k - 1] = _apply_spatial_alignment(sidecar["valid_mask"][idx], flip)
+            out["past_flow_gt"] = past_gt
+            out["past_flow_valid"] = past_valid
+            out["has_past_flow"] = bool(has_all)
+        return out
 
     @property
     def dataset_path(self) -> Path:
@@ -1636,6 +1793,7 @@ class LeRobotSingleDataset(Dataset):
         sample["traj_id"] = trajectory_id
         sample["base_index"] = base_index
         sample["dataset_name"] = self.dataset_name
+        self._maybe_append_ortho_cache(sample, trajectory_id, base_index)
         return sample
 
     def _pack_sample(self, data: dict) -> dict:
@@ -1671,9 +1829,14 @@ class LeRobotSingleDataset(Dataset):
             "flow_gt",
             "flow_valid",
             "flow_dynamic",
+            "pointmap_gt",
+            "pointmap_valid",
             "flow_has_gt",
             "flow_sidecar_path",
             "flow_sidecar_to_training_flip",
+            "past_flow_gt",
+            "past_flow_valid",
+            "has_past_flow",
         ):
             if flow_key in data:
                 sample[flow_key] = data[flow_key]
@@ -2139,9 +2302,11 @@ class LeRobotSingleDataset(Dataset):
                 # Combine statistics from filtered action sub-keys
                 combined_action_stats = combine_modality_stats(filtered_action_stats)
                 
-                # Add mask field based on whether it's gripper or not
+                # mask=False for dimensions whose normalization mode is "binary"
+                _action_norm_modes = _extract_action_normalization_modes(self.transforms)
                 mask = generate_action_mask_for_used_keys(
-                    self.metadata.modalities.action, filtered_action_stats.keys()
+                    self.metadata.modalities.action, filtered_action_stats.keys(),
+                    normalization_modes=_action_norm_modes,
                 )
                 combined_action_stats["mask"] = mask
                 
@@ -2347,38 +2512,64 @@ def combine_modality_stats(modality_stats: dict) -> dict:
     
     return combined_stats
 
-def generate_action_mask_for_used_keys(action_modalities: dict, used_action_keys_ordered) -> list[bool]:
+def _extract_action_normalization_modes(transforms) -> dict:
+    """Extract normalization modes for action keys from a ComposedModalityTransform.
+
+    Returns:
+        dict: {subkey_without_action_prefix -> normalization_mode_str}
     """
-    Generate mask based on action modalities, but only for used keys.
-    Gripper-related are False, others are True.
-    
+    modes = {}
+    for t in transforms.transforms:
+        if isinstance(t, StateActionTransform):
+            for key, mode in t.normalization_modes.items():
+                if key.startswith("action."):
+                    subkey = key[len("action."):]
+                    modes[subkey] = mode
+    return modes
+
+
+def generate_action_mask_for_used_keys(
+    action_modalities: dict,
+    used_action_keys_ordered,
+    normalization_modes: dict | None = None,
+) -> list[bool]:
+    """Generate per-dimension mask for action statistics.
+
+    A dimension gets ``mask=False`` only when its normalization mode is ``"binary"``.
+    This tells the inference code to skip continuous de-normalization for that dimension.
+    All other modes (q99, mean_std, min_max ...) produce ``mask=True``.
+
     Args:
         action_modalities (dict): Configuration information for action modalities.
-        used_action_keys_ordered: Iterable of actually used action keys in the correct order.
-        
+        used_action_keys_ordered: Iterable of actually used action keys (no "action." prefix).
+        normalization_modes (dict | None): Mapping {subkey -> mode} (no "action." prefix).
+            If ``None``, all dimensions default to ``mask=True``.
+
     Returns:
-        list[bool]: List of mask values
+        list[bool]: Per-dimension mask values.
     """
     mask = []
-    
-    # Generate mask in the same order as the statistics were combined
+
     for subkey in used_action_keys_ordered:
         if subkey in action_modalities:
             subkey_config = action_modalities[subkey]
-            
+
             # Get dimension count from shape
             if hasattr(subkey_config, 'shape') and len(subkey_config.shape) > 0:
                 dim_count = subkey_config.shape[0]
             else:
                 dim_count = 1
-            
-            # Check if it's gripper-related
-            is_gripper = "gripper" in subkey.lower()
-            
-            # Generate mask value for each dimension
+
+            # mask=False only when the normalization mode is explicitly "binary"
+            is_binary = (
+                normalization_modes.get(subkey) == "binary"
+                if normalization_modes is not None
+                else False
+            )
+
             for _ in range(dim_count):
-                mask.append(not is_gripper)  # gripper is False, others are True
-    
+                mask.append(not is_binary)
+
     return mask
 
 def get_used_modality_keys(modality_keys: dict) -> tuple[list, list]:
@@ -2688,6 +2879,7 @@ class LeRobotMixtureDataset(Dataset):
                 sample["traj_id"] = trajectory_id
                 sample["base_index"] = step
                 sample["dataset_name"] = dataset.dataset_name
+                dataset._maybe_append_ortho_cache(sample, trajectory_id, step)
                 
                 return sample
                 
@@ -3020,8 +3212,17 @@ class LeRobotMixtureDataset(Dataset):
                 if filtered_action_stats:
                     combined_action_stats = combine_modality_stats(filtered_action_stats)
                     
+                    # Collect action normalization modes from datasets of this tag.
+                    # "binary" takes precedence: if any dataset marks a key as binary, use binary.
+                    _action_norm_modes: dict = {}
+                    for _ds in self.datasets:
+                        if _ds.tag == tag:
+                            for _k, _m in _extract_action_normalization_modes(_ds.transforms).items():
+                                if _k not in _action_norm_modes or _m == "binary":
+                                    _action_norm_modes[_k] = _m
                     mask = generate_action_mask_for_used_keys(
-                        merged_metadata.modalities.action, filtered_action_stats.keys()
+                        merged_metadata.modalities.action, filtered_action_stats.keys(),
+                        normalization_modes=_action_norm_modes,
                     )
                     combined_action_stats["mask"] = mask
                     
@@ -3072,10 +3273,6 @@ class LeRobotMixtureDataset(Dataset):
     def _combine_modality_stats(self, modality_stats: dict) -> dict:
         """Backward compatibility wrapper."""
         return combine_modality_stats(modality_stats)
-
-    def _generate_action_mask_for_used_keys(self, action_modalities: dict, used_action_keys_ordered) -> list[bool]:
-        """Backward compatibility wrapper."""
-        return generate_action_mask_for_used_keys(action_modalities, used_action_keys_ordered)
 
     def _get_dataset_counts(self, tag: str) -> dict:
         """

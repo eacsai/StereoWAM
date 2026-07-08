@@ -408,7 +408,8 @@ class FlowmatchingActionHead(nn.Module):
         return BatchFeature(data=batch)
 
     def forward(
-        self, vl_embs: torch.Tensor, actions: torch.Tensor, state: torch.Tensor = None, encoder_attention_mask=None
+        self, vl_embs: torch.Tensor, actions: torch.Tensor, state: torch.Tensor = None, encoder_attention_mask=None,
+        motion_hidden: torch.Tensor = None, motion_attention_mask=None
     ):
         """
         vl_embs: shape (B, seq_length, feature_dim)
@@ -454,6 +455,8 @@ class FlowmatchingActionHead(nn.Module):
             encoder_attention_mask=encoder_attention_mask,
             timestep=t_discretized,
             return_all_hidden_states=self.scene_flow_enabled,
+            motion_hidden=motion_hidden,
+            motion_attention_mask=motion_attention_mask,
         )
         if self.scene_flow_enabled:
             model_output, all_hidden_states = model_result
@@ -482,7 +485,14 @@ class FlowmatchingActionHead(nn.Module):
         return loss
 
     @torch.no_grad()
-    def predict_action(self, vl_embs: torch.Tensor, state: torch.Tensor = None) -> torch.Tensor:
+    def predict_action(
+        self,
+        vl_embs: torch.Tensor,
+        state: torch.Tensor = None,
+        encoder_attention_mask=None,
+        motion_hidden: torch.Tensor = None,
+        motion_attention_mask=None,
+    ) -> torch.Tensor:
         # Set initial actions as the sampled noise.
         batch_size = vl_embs.shape[0]
         device = vl_embs.device
@@ -525,7 +535,10 @@ class FlowmatchingActionHead(nn.Module):
             model_output = self.model(
                 hidden_states=sa_embs,
                 encoder_hidden_states=vl_embs,
+                encoder_attention_mask=encoder_attention_mask,
                 timestep=timesteps_tensor,
+                motion_hidden=motion_hidden,
+                motion_attention_mask=motion_attention_mask,
             )
             pred = self.action_decoder(model_output)
 

@@ -167,6 +167,41 @@ class QwenGR00TDefaultConfig:
                 "num_layers": 16,
                 "output_dim": 1024,
                 "positional_embeddings": None,
+                # Dual-DiT cascade: width of the scene-flow DiT hidden that the
+                # action DiT's zero-init motion coupler reads. None -> no coupler
+                # (baseline unchanged). Set at runtime from scene_predictor.
+                "motion_coupler_dim": None,
+            },
+        }
+    )
+
+    # === Scene-flow dual-DiT cascade (predicted-motion / static-geometry predictor) ===
+    # Default disabled -> no scene predictor, no coupler, base behavior unchanged.
+    scene_predictor: dict = field(
+        default_factory=lambda: {
+            "enabled": False,
+            "action_model_type": "DiT-B",
+            "grid_size": 16,
+            "field_dim": 3,
+            "hidden_size": 1024,
+            "target_key": "flow_gt",  # "pointmap_gt" for the static-geometry twin
+            "valid_key": "flow_valid",
+            "dynamic_key": "flow_dynamic",
+            "dynamic_fallback_to_valid": False,  # stage-1 standalone: don't learn to predict zero
+            "tap_hidden_index": 10,              # into all_hidden_states=[input]+per-block; avoid final
+            "motion_extract_t_bucket": 0,
+            "motion_extract_noise_mode": "zeros",
+            "detach_conditioning": True,         # v1: detach; False = end-to-end ablation
+            "flow_lambda": 0.1,                  # stage-2 joint weight
+            "smooth_l1_beta": 0.01,
+            "z_weight": 2.0,
+            "diffusion_model_cfg": {
+                "cross_attention_dim": 2048,     # aligned to VLM hidden at runtime
+                "num_layers": 16,
+                "output_dim": 768,
+                "interleave_self_attention": True,
+                "norm_type": "ada_norm",
+                "positional_embeddings": None,
             },
         }
     )
@@ -253,17 +288,133 @@ class Qwen_GR00T(baseframework):
             self.stereo_cam_branch_layers_modules = _nn_for_stereo.ModuleList(branch_modules)
 
         # align dims --> we should put them to config or no?
-        self.config.framework.action_model.diffusion_model_cfg.cross_attention_dim = (
-            self.qwen_vl_interface.model.config.hidden_size
+        _vlm_hidden = self.qwen_vl_interface.model.config.hidden_size
+        self.config.framework.action_model.diffusion_model_cfg.cross_attention_dim = _vlm_hidden
+
+        # === Scene-flow dual-DiT cascade ===
+        # Set the action DiT's motion-coupler width BEFORE building the action head
+        # so the zero-init coupler is constructed. Gated by scene_predictor.enabled
+        # (default False -> unchanged baseline).
+        self._scene_predictor_cfg = getattr(self.config.framework, "scene_predictor", None)
+
+        def _truthy(v):  # string-aware: quoted "false"/"0"/"no" must NOT enable (review M2)
+            return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+        self.scene_predictor_enabled = (
+            _truthy(self._scene_predictor_cfg.get("enabled", False))
+            if (self._scene_predictor_cfg is not None and hasattr(self._scene_predictor_cfg, "get"))
+            else False
         )
+        _coupler_dim = None
+        if self.scene_predictor_enabled:
+            from starVLA.model.modules.action_model.GR00T_ActionHeader import DiTConfig as _DiTCfg
+
+            _sp_type = self._scene_predictor_cfg.get("action_model_type", "DiT-B")
+            _coupler_dim = int(_DiTCfg[_sp_type]["input_embedding_dim"])
+            self.config.framework.action_model.diffusion_model_cfg.motion_coupler_dim = _coupler_dim
+            _legacy_sf = self.config.framework.action_model.get("scene_flow", {}) or {}
+            if hasattr(_legacy_sf, "get") and _truthy(_legacy_sf.get("enabled", False)):
+                raise ValueError(
+                    "scene_predictor.enabled=True conflicts with legacy "
+                    "action_model.scene_flow.enabled=True; enable exactly one."
+                )
+        elif hasattr(self.config.framework.action_model, "diffusion_model_cfg"):
+            # Never build an unused coupler when the cascade is off (else strict baseline
+            # loads fail on missing action_model.model.motion_coupler.* keys — review L1).
+            self.config.framework.action_model.diffusion_model_cfg.motion_coupler_dim = None
 
         self.action_model: FlowmatchingActionHead = get_action_model(config=self.config)
+
+        # Build the scene-flow / static-geometry predictor DiT (shares the VLM as its
+        # upstream encoder via cross-attn). Its tapped hidden conditions the action
+        # DiT through the zero-init motion coupler.
+        self.scene_predictor = None
+        if self.scene_predictor_enabled:
+            from starVLA.model.modules.action_model.flow_matching_head.scene_flow_head import (
+                SceneFieldMatchingHead,
+            )
+
+            sp_cfg = self.config.framework.scene_predictor
+            if hasattr(sp_cfg, "diffusion_model_cfg"):
+                sp_cfg.diffusion_model_cfg.cross_attention_dim = _vlm_hidden
+            self.scene_predictor = SceneFieldMatchingHead(self.config, sp_cfg)
+            # rollout FIFO of last-K self-predicted flow fields (past-flow ControlNet at
+            # inference); persistent across calls, reset per episode via reset_past_flow().
+            self._pf_fifo = []
+            self._pf_K = int(getattr(self.scene_predictor, "n_past_steps", 2))
+            # single-source width: the coupler K/V dim MUST equal the scene DiT hidden width
+            # (review M4). Reject width-changing scene_predictor.diffusion_model_cfg overrides.
+            _scene_inner = int(self.scene_predictor.model.inner_dim)
+            if _scene_inner != _coupler_dim:
+                raise ValueError(
+                    f"scene DiT inner_dim ({_scene_inner}) != action coupler dim ({_coupler_dim}); "
+                    "do not override num_attention_heads/attention_head_dim in "
+                    "scene_predictor.diffusion_model_cfg (it breaks the coupler K/V width)."
+                )
 
         # `action_horizon` is the single source of truth for chunk length.
         # Legacy aliases (`future_action_window_size`, `past_action_window_size`)
         # are normalised upstream by `share_tools.apply_config_compat`, so we
         # only ever read `action_horizon` here.
         self.action_horizon = int(self.config.framework.action_model.action_horizon)
+
+    def _collect_scene_targets(self, examples, device):
+        """Stack per-sample scene-predictor GT into (B,...) tensors for the scene head.
+        Returns None if NO sample has the target key (conditioning-only / step-0 smoke).
+        Fixes (review 2026-07-06): per-sample all-or-none GT (no keying off examples[0]);
+        normalize target HWC->BCHW; targets fp32 + masks bool INDEPENDENT of VLM dtype
+        (else the fp32 loss island uses bf16-rounded targets); honor flow_has_gt."""
+        if self.scene_predictor is None or not examples:
+            return None
+        tk = self.scene_predictor.target_key
+        present = [tk in e for e in examples]
+        if not any(present):
+            return None
+        if not all(present):
+            raise RuntimeError(
+                f"scene_predictor: mixed batch — {sum(present)}/{len(present)} samples have "
+                f"'{tk}'. All-or-none required (mixed cotrain not wired). Fix the sampler/data_mix."
+            )
+
+        def _to_bchw(arr):
+            t = torch.as_tensor(np.asarray(arr), dtype=torch.float32)  # (H,W,3) or (3,H,W)
+            if t.dim() == 3 and t.shape[-1] == 3 and t.shape[0] != 3:
+                t = t.permute(2, 0, 1)  # HWC -> CHW
+            return t.contiguous()
+
+        def _to_kchw(arr):
+            t = torch.as_tensor(np.asarray(arr), dtype=torch.float32)  # (K,H,W,3) or (K,3,H,W)
+            if t.dim() == 4 and t.shape[-1] == 3 and t.shape[1] != 3:
+                t = t.permute(0, 3, 1, 2)  # (K,H,W,3) -> (K,3,H,W)
+            return t.contiguous()
+
+        target = torch.stack([_to_bchw(e[tk]) for e in examples]).to(device)  # (B,3,H,W) fp32
+        batch = {tk: target}
+        for key in (self.scene_predictor.valid_key, self.scene_predictor.dynamic_key):
+            if all(key in e for e in examples):
+                batch[key] = torch.as_tensor(
+                    np.stack([np.asarray(e[key]) for e in examples]), dtype=torch.bool, device=device
+                )
+        # per-sample GT flag (dummy no-GT samples still carry zero flow_gt in the loader)
+        if all("flow_has_gt" in e for e in examples):
+            batch["flow_has_gt"] = torch.as_tensor(
+                [bool(e["flow_has_gt"]) for e in examples], dtype=torch.bool, device=device
+            )
+        # past-flow ControlNet inputs (present only when the dataloader emits them)
+        pf_key = getattr(self.scene_predictor, "past_flow_key", "past_flow_gt")
+        if all(pf_key in e for e in examples):
+            batch[pf_key] = torch.stack([_to_kchw(e[pf_key]) for e in examples]).to(device)  # (B,K,3,H,W)
+            pv_key = getattr(self.scene_predictor, "past_valid_key", "past_flow_valid")
+            if all(pv_key in e for e in examples):
+                batch[pv_key] = torch.as_tensor(
+                    np.stack([np.asarray(e[pv_key]) for e in examples]), dtype=torch.bool, device=device
+                )  # (B,K,H,W)
+            hp_key = getattr(self.scene_predictor, "has_past_key", "has_past_flow")
+            if all(hp_key in e for e in examples):
+                batch[hp_key] = torch.as_tensor(
+                    [bool(e[hp_key]) for e in examples], dtype=torch.bool, device=device
+                )  # (B,)
+        return batch
 
     def load_state_dict(self, state_dict, strict=True, assign=False, init_from_baseline: bool = False):
         """Fail-closed load with warm-start exceptions for inert legacy stereo keys."""
@@ -296,7 +447,7 @@ class Qwen_GR00T(baseframework):
                     len(legacy_keys),
                 )
 
-        if not cam_branch_enabled:
+        if not cam_branch_enabled and not getattr(self, "scene_predictor_enabled", False):
             return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
         provided_keys = set(state_dict.keys())
@@ -304,16 +455,26 @@ class Qwen_GR00T(baseframework):
         def _is_cam_branch_key(key: str) -> bool:
             return key.startswith("stereo_cam_branch_layers_modules.")
 
+        def _is_scene_cascade_key(key: str) -> bool:
+            # Scene-flow dual-DiT cascade families that fresh-init on a plain warm-start
+            # (do NOT strip them from a stage-1 checkpoint — freeze via freeze_modules).
+            return (
+                key.startswith("scene_predictor.")
+                or key.startswith("action_model.motion_coupler.")
+                or ".motion_coupler." in key
+            )
+
         # Missing branch keys are tolerated ONLY for a true baseline checkpoint that
         # has ZERO cam_branch keys. A checkpoint with SOME branch keys is a partial/
         # truncated cam_branch checkpoint — loading it with fresh-initialized gaps
-        # would silently corrupt the run.
+        # would silently corrupt the run. Same all-or-none rule for the scene cascade.
         provided_has_branch = any(_is_cam_branch_key(key) for key in provided_keys)
-        allowed_missing = (
-            {key for key in own_keys - provided_keys if _is_cam_branch_key(key)}
-            if (init_from_baseline and not provided_has_branch)
-            else set()
-        )
+        provided_has_scene = any(_is_scene_cascade_key(key) for key in provided_keys)
+        allowed_missing = set()
+        if init_from_baseline and not provided_has_branch:
+            allowed_missing |= {key for key in own_keys - provided_keys if _is_cam_branch_key(key)}
+        if init_from_baseline and not provided_has_scene:
+            allowed_missing |= {key for key in own_keys - provided_keys if _is_scene_cascade_key(key)}
         suspicious_missing = (own_keys - provided_keys) - allowed_missing
         unexpected = provided_keys - own_keys
 
@@ -352,6 +513,7 @@ class Qwen_GR00T(baseframework):
 
         # Step 1: QWenVL input format
         qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
+        backbone_attention_mask = qwen_inputs.get("attention_mask", None)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             qwenvl_outputs = self.qwen_vl_interface(
                 **qwen_inputs,
@@ -376,26 +538,69 @@ class Qwen_GR00T(baseframework):
             )
             actions_target_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)
             last_hidden_repeated = last_hidden.repeat(repeated_diffusion_steps, 1, 1)
+            backbone_attention_mask_repeated = None
+            if backbone_attention_mask is not None:
+                backbone_attention_mask_repeated = backbone_attention_mask.repeat(repeated_diffusion_steps, 1).to(dtype=torch.bool)
 
             state_repeated = None
             if state is not None:
                 state = torch.tensor(np.array(state), device=last_hidden.device, dtype=last_hidden.dtype)
                 state_repeated = state.repeat(repeated_diffusion_steps, 1, 1)
 
+            # Scene-flow cascade: extract the (detached, GT-free, deterministic)
+            # motion conditioning hidden and repeat it to match the diffusion-step
+            # expansion. fork_rng keeps the action head's RNG stream untouched.
+            motion_hidden_repeated = None
+            _enc_mask = (
+                backbone_attention_mask.to(torch.bool) if backbone_attention_mask is not None else None
+            )
+            # Collect the scene batch ONCE (incl. past-flow inputs); reuse for both the
+            # action-conditioning extract and the supervised flow forward below.
+            _scene_batch = (
+                self._collect_scene_targets(examples, last_hidden.device)
+                if self.scene_predictor_enabled else None
+            )
+            if self.scene_predictor_enabled:
+                with torch.random.fork_rng(
+                    devices=[last_hidden.device.index] if last_hidden.is_cuda else []
+                ):
+                    motion_hidden = self.scene_predictor.extract_conditioning_hidden(
+                        last_hidden, encoder_attention_mask=_enc_mask, past_flow_batch=_scene_batch
+                    )
+                motion_hidden_repeated = motion_hidden.repeat(repeated_diffusion_steps, 1, 1)
+
             action_output = self.action_model(
-                last_hidden_repeated, actions_target_repeated, state_repeated
+                last_hidden_repeated, actions_target_repeated, state_repeated,
+                encoder_attention_mask=backbone_attention_mask_repeated,
+                motion_hidden=motion_hidden_repeated,
             )  # (B, chunk_len, action_dim)
             if isinstance(action_output, dict):
                 if "flow_pred" in action_output:
                     raise RuntimeError(
-                        "scene_flow.enabled=True is wired for QwenGR00T FFS training paths; "
-                        "plain QwenGR00T.forward has no scene-flow GT/loss connection."
+                        "action_model.scene_flow (legacy aux) is not supported together with "
+                        "the scene_predictor cascade; enable exactly one."
                     )
                 action_loss = action_output["action_loss"]
             else:
                 action_loss = action_output
 
-        return {"action_loss": action_loss}
+            losses = {"action_loss": action_loss}
+            if self.scene_predictor_enabled:
+                flow_batch = _scene_batch
+                if flow_batch is not None:
+                    scene_out = self.scene_predictor(
+                        last_hidden, flow_batch, encoder_attention_mask=_enc_mask
+                    )
+                    losses["flow_loss"] = scene_out["flow_loss"]
+                    if "flow_supervised_cells" in scene_out:
+                        losses["flow_supervised_cells"] = scene_out["flow_supervised_cells"]
+
+        return losses
+
+    def reset_past_flow(self):
+        """Clear the rollout past-flow FIFO. Call at each episode boundary (the model server holds
+        ONE persistent framework object across all episodes, else past flow leaks between episodes)."""
+        self._pf_fifo = []
 
     @torch.inference_mode()
     def predict_action(
@@ -425,6 +630,9 @@ class Qwen_GR00T(baseframework):
 
         # Step 1: QWenVL input format
         qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
+        backbone_attention_mask = qwen_inputs.get("attention_mask", None)
+        if backbone_attention_mask is not None:
+            backbone_attention_mask = backbone_attention_mask.to(dtype=torch.bool)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             qwenvl_outputs = self.qwen_vl_interface(
                 **qwen_inputs,
@@ -444,7 +652,41 @@ class Qwen_GR00T(baseframework):
 
         # Step 4: Action Expert Forward
         with torch.autocast("cuda", dtype=torch.float32):
-            pred_actions = self.action_model.predict_action(last_hidden, state)  # (B, chunk_len, action_dim)
+            motion_hidden = None
+            if self.scene_predictor_enabled:
+                _pf_on = getattr(self.scene_predictor, "past_flow_enabled", False)
+                # Build past-flow from the rollout FIFO (last-K self-predicted fields). Empty/
+                # partial FIFO -> None -> gate off (cold start; matches training no-past contract).
+                pf_batch = None
+                if _pf_on and len(getattr(self, "_pf_fifo", [])) >= self._pf_K:
+                    _past = torch.stack(self._pf_fifo[-self._pf_K:], dim=1)  # (B,K,3,g,g) fp32
+                    pf_batch = {
+                        self.scene_predictor.past_flow_key: _past,
+                        self.scene_predictor.has_past_key: torch.ones(
+                            _past.shape[0], dtype=torch.bool, device=_past.device
+                        ),
+                    }
+                with torch.random.fork_rng(
+                    devices=[last_hidden.device.index] if last_hidden.is_cuda else []
+                ):
+                    motion_hidden = self.scene_predictor.extract_conditioning_hidden(
+                        last_hidden, encoder_attention_mask=backbone_attention_mask, past_flow_batch=pf_batch
+                    )
+                    if _pf_on:
+                        # sample the CURRENT field (same past-flow) and push to the FIFO for next chunk
+                        _cur = self.scene_predictor.sample_field(
+                            last_hidden, encoder_attention_mask=backbone_attention_mask, past_flow_batch=pf_batch
+                        )  # (B,3,g,g) fp32
+                if _pf_on:
+                    if not hasattr(self, "_pf_fifo"):
+                        self._pf_fifo = []
+                    self._pf_fifo.append(_cur.detach().float())
+                    if len(self._pf_fifo) > self._pf_K:
+                        self._pf_fifo.pop(0)
+            pred_actions = self.action_model.predict_action(
+                last_hidden, state, encoder_attention_mask=backbone_attention_mask,
+                motion_hidden=motion_hidden,
+            )  # (B, chunk_len, action_dim)
 
         normalized_actions = pred_actions.detach().cpu().numpy()
         return {"normalized_actions": normalized_actions}
