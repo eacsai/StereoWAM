@@ -2,7 +2,7 @@
 # Per-suite Utonia LEFTPRIMARY cache precompute on 4090d (batch=1; run the 4 suites in
 # parallel on idle GPUs to fill them — single process is ~12% util, CPU/IO-bound).
 # Each process writes ONLY its suite subdir -> no shared-file collision. --resume picks up
-# partial progress. 4090d-equivalent of scripts/h100b/run_precompute_suite.sh: .venv,
+# partial progress. 4090d precompute wrapper (Python impl in scripts/tools/): .venv,
 # /data paths, FFS_REPO_DIR on 4090d. Good-neighbour CPU thread cap + nice/ionice.
 # SUITE = $1. Env knobs: CACHE_DIR LIMIT_ROWS CUDA_VISIBLE_DEVICES LOGNAME NPROC_PER_WORKER.
 set -uo pipefail
@@ -18,7 +18,7 @@ export OMP_NUM_THREADS=$NPROC MKL_NUM_THREADS=$NPROC OPENBLAS_NUM_THREADS=$NPROC
        NUMEXPR_NUM_THREADS=$NPROC VECLIB_MAXIMUM_THREADS=$NPROC
 exec > "playground/Checkpoints/${LOGNAME}.log" 2>&1
 echo "[utonia precompute ${SUITE}] start $(date -u +%Y-%m-%dT%H:%M:%SZ) cache=$CACHE_DIR limit=$LIMIT_ROWS gpu=$CUDA_VISIBLE_DEVICES nproc=$NPROC"
-nice -n 10 ionice -c2 -n5 .venv/bin/python scripts/h100b/precompute_utonia_cache.py \
+nice -n 10 ionice -c2 -n5 .venv/bin/python scripts/tools/precompute_utonia_cache.py \
   --cache-dir "$CACHE_DIR" \
   --suites "$SUITE" \
   --data-root playground/Datasets/LEROBOT_LIBERO_OURRENDER_PW \

@@ -35,11 +35,8 @@ from starVLA.model.modules.stereo.ffs_net0_cache import (  # noqa: E402
     validate_ffs_net0_cache,
 )
 
-DEFAULT_FFS_REPO_DIR = "/mnt/data/wangqiwei/wangqiwei/Fast-FoundationStereo"
-DEFAULT_FFS_MODEL = (
-    "/mnt/data/wangqiwei/wangqiwei/Fast-FoundationStereo/"
-    "weights/20-30-48/model_best_bp2_serialize.pth"
-)
+DEFAULT_FFS_REPO_DIR = os.environ.get("FFS_REPO_DIR", "Fast-FoundationStereo")
+DEFAULT_FFS_MODEL = os.path.join(DEFAULT_FFS_REPO_DIR, "weights/20-30-48/model_best_bp2_serialize.pth")
 DEFAULT_FFS_SHA256 = "98b5a9acf39fbfa795025de8cea95ce123daa40f6b6234d719167751024cf692"
 DEFAULT_DATA_ROOT = "playground/Datasets/LEROBOT_LIBERO_OURRENDER_PW"
 DEFAULT_DATA_MIX = "libero_all_sfstereo_leftprimary"

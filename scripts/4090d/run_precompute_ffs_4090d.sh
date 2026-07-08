@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # FFS net0 LEFTPRIMARY cache precompute on 4090d. Single process (FFS is fast, ~tens of min).
-# 4090d-equivalent of scripts/h100b/run_precompute_cache.sh: .venv (not /opt/conda),
+# 4090d precompute wrapper (Python impl in scripts/tools/): .venv (not /opt/conda),
 # /data paths, FFS_REPO_DIR on 4090d. Good-neighbour: CPU thread cap + nice/ionice
 # (4090d is shared; other arm* trainings run concurrently). The precompute script itself
 # is leftprimary-scoped (DEFAULT_DATA_MIX=leftprimary + hard guard).
@@ -18,7 +18,7 @@ export OMP_NUM_THREADS=$NPROC MKL_NUM_THREADS=$NPROC OPENBLAS_NUM_THREADS=$NPROC
        NUMEXPR_NUM_THREADS=$NPROC VECLIB_MAXIMUM_THREADS=$NPROC
 exec > "playground/Checkpoints/${LOGNAME}.log" 2>&1
 echo "[ffs precompute] start $(date -u +%Y-%m-%dT%H:%M:%SZ) cache=$CACHE_DIR suites=$SUITES limit=$LIMIT_ROWS gpu=$CUDA_VISIBLE_DEVICES nproc=$NPROC"
-nice -n 10 ionice -c2 -n5 .venv/bin/python scripts/h100b/precompute_ffs_net0_cache.py \
+nice -n 10 ionice -c2 -n5 .venv/bin/python scripts/tools/precompute_ffs_net0_cache.py \
   --cache-dir "$CACHE_DIR" \
   --suites "$SUITES" \
   --data-root playground/Datasets/LEROBOT_LIBERO_OURRENDER_PW \

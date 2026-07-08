@@ -11,37 +11,24 @@ VIDEO_KEYS_ARG="${3:-}"
 GPUS="${4:-1 3 4 6}"
 
 STARVLA=/data/wangqiwei/ICLR2026/starVLA
-H100B_SSH="ssh -o StrictHostKeyChecking=no -o ConnectTimeout=90 -o ServerAliveInterval=15 root@10.112.2.93"
-H100B_RUN=/mnt/data/wangqiwei/wangqiwei/starVLA/playground/Checkpoints/${RUN_ID}
 LOCAL_RUN=${STARVLA}/playground/Checkpoints/${RUN_ID}
 CKPT=${LOCAL_RUN}/checkpoints/steps_${STEP}_pytorch_model.pt
 
-# ---- 1. transfer ckpt + config + stats from h100b ----
-mkdir -p "${LOCAL_RUN}/checkpoints"
-REMOTE_SZ=$($H100B_SSH "stat -c %s ${H100B_RUN}/checkpoints/steps_${STEP}_pytorch_model.pt" 2>/dev/null | tr -dc 0-9)
-LOCAL_SZ=$( [ -f "$CKPT" ] && stat -c %s "$CKPT" || echo 0 )
-if [ "${REMOTE_SZ:-0}" = "0" ]; then
-  if [ "${LOCAL_SZ:-0}" -gt 1000000 ] && [ -f "${LOCAL_RUN}/config.yaml" ] && [ -f "${LOCAL_RUN}/dataset_statistics.json" ]; then
-    echo "[xfer] h100b unreachable; using existing LOCAL ckpt+config+stats ($(du -h "$CKPT"|cut -f1))"; REMOTE_SZ="$LOCAL_SZ"
-  else
-    echo "[FATAL] remote ckpt steps_${STEP} not on h100b AND no complete local copy"; exit 1
-  fi
+# ---- 1. require a complete local run directory on 4090d ----
+# Source machines are now handled by dedicated pull/watch scripts before eval. This core
+# evaluator is intentionally local-only so it never blocks on retired training endpoints.
+[ -s "$CKPT" ] || { echo "[FATAL] local ckpt missing or empty: $CKPT"; exit 1; }
+if [ ! -s "${LOCAL_RUN}/config.full.yaml" ] && [ ! -s "${LOCAL_RUN}/config.yaml" ]; then
+  echo "[FATAL] local config missing: ${LOCAL_RUN}/config.full.yaml or config.yaml"; exit 1
 fi
-if [ "$LOCAL_SZ" != "$REMOTE_SZ" ]; then
-  echo "[xfer] pulling steps_${STEP} ($((REMOTE_SZ/1000000))MB) from h100b ..."
-  $H100B_SSH "cat ${H100B_RUN}/checkpoints/steps_${STEP}_pytorch_model.pt" > "$CKPT"
-  $H100B_SSH "cat ${H100B_RUN}/config.full.yaml" > "${LOCAL_RUN}/config.full.yaml"
-  $H100B_SSH "cat ${H100B_RUN}/dataset_statistics.json" > "${LOCAL_RUN}/dataset_statistics.json"
+if [ ! -s "${LOCAL_RUN}/config.yaml" ] && [ -s "${LOCAL_RUN}/config.full.yaml" ]; then
   cp "${LOCAL_RUN}/config.full.yaml" "${LOCAL_RUN}/config.yaml"
-  NEW_SZ=$(stat -c %s "$CKPT")
-  [ "$NEW_SZ" = "$REMOTE_SZ" ] || { echo "[FATAL] ckpt size mismatch local=$NEW_SZ remote=$REMOTE_SZ"; exit 2; }
-  echo "[xfer] ckpt OK $(du -h "$CKPT"|cut -f1); config+stats pulled"
-else
-  echo "[xfer] ckpt already local + size matches, skip"
 fi
+[ -s "${LOCAL_RUN}/dataset_statistics.json" ] || { echo "[FATAL] local dataset_statistics.json missing: ${LOCAL_RUN}/dataset_statistics.json"; exit 1; }
+echo "[xfer] using local 4090d ckpt+config+stats ($(du -h "$CKPT"|cut -f1))"
 
 # ---- 1b. derive observation_indices + video_keys (single source = DataConfig; fail-closed) ----
-CFG="${LOCAL_RUN}/config.full.yaml"
+CFG=$( [ -s "${LOCAL_RUN}/config.full.yaml" ] && echo "${LOCAL_RUN}/config.full.yaml" || echo "${LOCAL_RUN}/config.yaml" )
 _DERIVED=$(${STARVLA}/.venv/bin/python - "$CFG" "$STARVLA" <<'PYEOF'
 import sys, yaml
 cfg_path, starvla = sys.argv[1], sys.argv[2]

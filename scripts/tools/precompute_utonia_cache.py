@@ -29,11 +29,8 @@ from starVLA.model.modules.stereo.utonia_pointcloud import (  # noqa: E402
     validate_utonia_cache,
 )
 
-DEFAULT_FFS_REPO_DIR = "/mnt/data/wangqiwei/wangqiwei/Fast-FoundationStereo"
-DEFAULT_FFS_MODEL = (
-    "/mnt/data/wangqiwei/wangqiwei/Fast-FoundationStereo/"
-    "weights/20-30-48/model_best_bp2_serialize.pth"
-)
+DEFAULT_FFS_REPO_DIR = os.environ.get("FFS_REPO_DIR", "Fast-FoundationStereo")
+DEFAULT_FFS_MODEL = os.path.join(DEFAULT_FFS_REPO_DIR, "weights/20-30-48/model_best_bp2_serialize.pth")
 DEFAULT_UTONIA_CKPT = "./playground/Pretrained_models/Utonia/utonia.pth"
 DEFAULT_DATA_ROOT = "playground/Datasets/LEROBOT_LIBERO_OURRENDER_PW"
 DEFAULT_DATA_MIX = "libero_all_sfstereo_leftprimary"

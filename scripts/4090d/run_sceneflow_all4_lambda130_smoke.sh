@@ -3,7 +3,7 @@
 # STATIC lambda=130 (codex-calibrated: flow grad ~1% of action grad into the shared trunk).
 # 4-suite scene-flow GT read per-suite from each dataset's meta/episode_to_sceneflow_sidecar.json
 # (wired 2026-06-16), so FLOW_INDEX is left EMPTY (single path can't serve 4 suites).
-# Authored on 4090d, transferred to /mnt/data (shared h100a/h100b). Run on h100a GPU0.
+# Runs on 4090d (canonical). GPU smoke wrapper for the all-4 scene-flow run.
 # MAX_STEPS / RUN_ID / GPUS overridable via env (for the GPU smoke).
 set -euo pipefail
 cd "$(dirname "$0")/../.."   # repo root
@@ -23,8 +23,8 @@ export NUM_DEPTH_TOKENS=64
 export POOL_HW=8
 
 # warm-start from baseline B; freeze VLM trunk
-export PRETRAINED_CKPT=/mnt/data/wangqiwei/wangqiwei/starVLA/
-export FREEZE_MODULES=qwen_vl_interface
+export PRETRAINED_CKPT=${PRETRAINED_CKPT-/data/wangqiwei/ICLR2026/starVLA/}
+export FREEZE_MODULES=${FREEZE_MODULES-qwen_vl_interface}
 
 # scene-flow head, STATIC lambda=130
 export SCENE_FLOW=1
@@ -40,4 +40,4 @@ export FLOW_STEP0_WARMUP=1
 
 export RUN_ID=${RUN_ID:-qwen0p8_groot_depthtoken_keep_sceneflow_all4_lambda130_warmstartB_30k}
 
-exec bash scripts/h100b/run_qwen0p8_groot_ffs.sh
+exec bash scripts/4090d/run_qwen0p8_groot_ffs_smoke.sh

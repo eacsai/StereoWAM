@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Smoke test for GR00T FFS methods #1/#2/#3.
 
-Run on h100b after the warm-start B checkpoint exists:
+Run on any GPU machine after the warm-start B checkpoint exists:
 
-    python scripts/h100b/smoke_groot_ffs.py --framework all
+    python scripts/tools/smoke_groot_ffs.py --framework all
 
 For each framework this script checks:
   1. Warm-start loading through the trainer utility path succeeds from B.
@@ -669,7 +669,7 @@ def check_net0_left_sanity(ctx: FrameworkContext) -> str:
     # reversed (invalid) pair that yields a different non-negative value. So a sign-flip
     # expectation is architecturally wrong for this net. We keep the swap-sign as a
     # WARNING. Authoritative net[0]=disparity verification is done on REAL frames in
-    # scripts/h100b/diag_ffs_realframes.py (identical REAL frame -> disp ~0; real pair ->
+    # scripts/tools/diag_ffs_realframes.py (identical REAL frame -> disp ~0; real pair ->
     # finite disp), which confirmed correctness; the synthetic sub-tests here are OOD.
     if flip_cos < ctx.args.swap_sign_cos_min and not opposite_mean:
         print(

@@ -12,12 +12,12 @@ export NCCL_DEBUG=WARN
 export NCCL_ASYNC_ERROR_HANDLING=1
 export WANDB_MODE=disabled
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export FFS_REPO_DIR=${FFS_REPO_DIR:-/mnt/data/wangqiwei/wangqiwei/Fast-FoundationStereo}
+export FFS_REPO_DIR=${FFS_REPO_DIR:-/data/wangqiwei/ICLR2026/Fast-FoundationStereo}
 
-cd /mnt/data/wangqiwei/wangqiwei/starVLA
+cd /data/wangqiwei/ICLR2026/starVLA
 export PYTHONPATH=$(pwd):${FFS_REPO_DIR}:${PYTHONPATH:-}
 
-CONDA_VENV=${CONDA_VENV:-/opt/conda/envs/starvla/bin}
+CONDA_VENV=${CONDA_VENV:-/data/wangqiwei/ICLR2026/starVLA/.venv/bin}
 config_yaml=./examples/LIBERO/train_files/starvla_cotrain_libero.yaml
 base_vlm=${BASE_VLM:-./playground/Pretrained_models/Qwen3.5-0.8B}
 
