@@ -91,6 +91,7 @@ class QwenGR00T_UtoniaPromptTokenFFS(UtoniaPointCloudMixin, QwenGR00TFFSBase):
             spatial_merge_size=spatial_merge,
             primary_cam_id=self.inject_cam_id,
             cam_rope_state=getattr(self, "_stereo_cam_rope_state", None),
+            cam_branch_state=getattr(self, "_stereo_cam_branch_state", None),
             image_token_id=int(hf_model.config.image_token_id),
             position_mode="primary_grid",
         )
@@ -182,7 +183,11 @@ class QwenGR00T_UtoniaPromptTokenFFS(UtoniaPointCloudMixin, QwenGR00TFFSBase):
         self._assert_primary_token_count_64(qwen_inputs)
         self._prepare_ffs_for_vlm(batch_images, sample_ids=sample_ids)
         try:
-            return self._run_qwenvl_forward(qwen_inputs)
+            last_hidden = self._run_qwenvl_forward(qwen_inputs)
+            # Fix#1: 64 Utonia point tokens stay inserted mid-sequence ->
+            # extend the action-head mask by num_point_tokens.
+            self._stash_pending_mask(qwen_inputs, num_insert=self.num_point_tokens)
+            return last_hidden
         finally:
             self._cleanup_ffs_after_vlm()
 

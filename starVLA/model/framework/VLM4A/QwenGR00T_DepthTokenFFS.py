@@ -185,6 +185,11 @@ class QwenGR00T_DepthTokenFFS(QwenGR00TFFSBase):
             last_hidden = self._run_qwenvl_forward(qwen_inputs)
             if self.strip_depth_tokens:
                 last_hidden = self._strip_depth_tokens(last_hidden)
+                # Fix#1: depth rows stripped back out -> (B, seq_len) -> plain mask.
+                self._stash_pending_mask(qwen_inputs, num_insert=0)
+            else:
+                # Fix#1: depth tokens kept mid-sequence -> extend by num_depth_tokens.
+                self._stash_pending_mask(qwen_inputs, num_insert=self.num_depth_tokens)
             return last_hidden
         finally:
             self._cleanup_ffs_after_vlm()

@@ -366,6 +366,7 @@ def install_depth_token_hooks(
     spatial_merge_size: int = 2,
     primary_cam_id: int = 0,
     cam_rope_state=None,
+    cam_branch_state=None,
     image_token_id: Optional[int] = None,
     position_mode: str = "primary_grid",
 ) -> Tuple[torch.utils.hooks.RemovableHandle, torch.utils.hooks.RemovableHandle]:
@@ -524,6 +525,17 @@ def install_depth_token_hooks(
                         insert_idx.to(row_id.device),
                         inserted_row,
                     )
+
+        if cam_branch_state is not None and bool(
+            getattr(cam_branch_state, "defer_position_cache_until_token_insert", False)
+        ):
+            refresh = getattr(cam_branch_state, "refresh_from_per_token_cam_id", None)
+            if refresh is None:
+                raise RuntimeError(
+                    "[depth_token_inject] cam_branch defer mode is enabled but "
+                    "refresh_from_per_token_cam_id is missing"
+                )
+            refresh(new_cam, getattr(cam_branch_state, "raw_image_token_counts", None))
 
         return args, kwargs
 

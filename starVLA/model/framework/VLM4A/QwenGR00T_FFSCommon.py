@@ -17,6 +17,10 @@ import torch.nn.functional as F
 from deployment.model_server.tools.image_tools import to_pil_preserve
 from starVLA.model.framework.VLM4A.QwenGR00T import Qwen_GR00T
 from starVLA.model.modules.stereo.cam_rope_hook import compute_per_token_cam_id
+from starVLA.model.modules.stereo.depth_token_inject import (
+    _insert_batched_2d,
+    get_state as get_depth_state,
+)
 from starVLA.model.modules.stereo.ffs_net0_cache import ffs_tf32_disabled
 from starVLA.training.trainer_utils.trainer_tools import resize_images
 
@@ -500,16 +504,29 @@ class QwenGR00TFFSBase(QwenGR00TNet0FFSMixin, Qwen_GR00T):
 
     def __init__(self, config):
         super().__init__(config)
-        # The parallel PRoPE camera branch is NOT validated together with FFS
-        # frameworks: depth-token insertion shifts image rows AFTER cam_branch's
-        # pre-hook caches positions (silent geometry corruption), and the two
-        # load-audit layers do not compose. Refuse the combination outright.
+        # Fix#1: per-call stash for the action-head cross-attention padding
+        # mask. Token-inserting FFS encode-overrides set this to the
+        # length-extended mask; the shared forward / predict_action read it.
+        # Default None => head attends all positions (legacy behaviour).
+        self._pending_encoder_attention_mask = None
+        # FFS + cam_branch is safe only for explicitly supported token-inserting
+        # paths that refresh cam_branch image positions AFTER insertion. Otherwise the
+        # branch would cache pre-insert image rows and silently write geometry to the
+        # wrong tokens. Keep fail-closed for every unsupported FFS framework.
         if bool(self.config.framework.qwenvl.get("stereo_cam_branch_enabled", False)):
-            raise RuntimeError(
-                "[GR00T-FFS] stereo_cam_branch_enabled=True is unsupported with FFS "
-                "frameworks (token insertion invalidates the branch's cached image "
-                "positions). Disable cam_branch or use the plain QwenGR00T framework."
-            )
+            if self.__class__.__name__ != "QwenGR00T_UtoniaPromptTokenFFS":
+                raise RuntimeError(
+                    "[GR00T-FFS] stereo_cam_branch_enabled=True is only supported for "
+                    "QwenGR00T_UtoniaPromptTokenFFS after post-insert cam_branch refresh. "
+                    "Other FFS frameworks remain fail-closed."
+                )
+            cam_branch_state = getattr(self, "_stereo_cam_branch_state", None)
+            if cam_branch_state is None:
+                raise RuntimeError(
+                    "[GR00T-FFS] cam_branch flag is enabled but _stereo_cam_branch_state "
+                    "is missing; install_cam_branch did not run."
+                )
+            cam_branch_state.defer_position_cache_until_token_insert = True
 
     def _sync_actual_vlm_hidden_dim(self) -> int:
         llm_dim = qwen_vlm_hidden_size(self.qwen_vl_interface)
@@ -570,6 +587,34 @@ class QwenGR00TFFSBase(QwenGR00TNet0FFSMixin, Qwen_GR00T):
         if "sample_ids" in inspect.signature(self._encode_last_hidden_with_ffs).parameters:
             encode_kwargs["sample_ids"] = sample_ids
         return self._encode_last_hidden_with_ffs(batch_images, instructions, **encode_kwargs)
+
+    def _stash_pending_mask(self, qwen_inputs, num_insert: int) -> None:
+        # Fix#1 helper: build the action-head cross-attention padding mask for
+        # the FFS path and stash it on self._pending_encoder_attention_mask
+        # (read by the shared forward / predict_action). When an FFS subclass
+        # keeps `num_insert` tokens inserted mid-sequence (Utonia point tokens,
+        # DepthToken depth tokens), last_hidden is (B, seq_len + num_insert); we
+        # rebuild the matching mask by inserting num_insert True (attend) entries
+        # at the SAME insert_idx the LM pre-hook used, via the identical
+        # _insert_batched_2d (depth_token_inject.py:505-510), so it aligns 1:1
+        # with last_hidden. num_insert <= 0 => no insertion (or tokens stripped
+        # back out) => the plain padding mask.
+        base_mask = qwen_inputs.get("attention_mask", None)
+        if base_mask is None:
+            self._pending_encoder_attention_mask = None
+            return
+        base_mask = base_mask.to(dtype=torch.bool)
+        if num_insert <= 0:
+            self._pending_encoder_attention_mask = base_mask
+            return
+        state = get_depth_state()
+        if state is None or state.insert_idx is None:
+            raise RuntimeError(
+                "[FFS Fix#1] expected depth-token insert_idx after the VLM forward, got None"
+            )
+        inserted = base_mask.new_ones((base_mask.shape[0], int(num_insert)))
+        extended = _insert_batched_2d(base_mask, state.insert_idx.to(base_mask.device), inserted)
+        self._pending_encoder_attention_mask = extended.to(dtype=torch.bool)
 
     def _scene_flow_cfg(self):
         action_cfg = self.config.framework.action_model if self.config and hasattr(self.config, "framework") else {}
@@ -670,11 +715,15 @@ class QwenGR00TFFSBase(QwenGR00TNet0FFSMixin, Qwen_GR00T):
         state = [example["state"] for example in examples] if "state" in examples[0] else None
         sample_ids = self._sample_ids_from_examples(examples)
 
+        # Fix#1: clear any stale mask before encode so a path that forgets
+        # to stash cannot reuse the previous batch's mask.
+        self._pending_encoder_attention_mask = None
         last_hidden = self._encode_last_hidden_with_optional_sample_ids(
             batch_images,
             instructions,
             sample_ids=sample_ids,
         )
+        encoder_attention_mask = getattr(self, "_pending_encoder_attention_mask", None)
 
         with torch.autocast("cuda", dtype=torch.float32):
             actions = torch.tensor(np.array(actions), device=last_hidden.device, dtype=last_hidden.dtype)
@@ -686,20 +735,44 @@ class QwenGR00TFFSBase(QwenGR00TNet0FFSMixin, Qwen_GR00T):
             )
             actions_target_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)
             last_hidden_repeated = last_hidden.repeat(repeated_diffusion_steps, 1, 1)
+            encoder_attention_mask_repeated = None
+            if encoder_attention_mask is not None:
+                encoder_attention_mask_repeated = encoder_attention_mask.repeat(repeated_diffusion_steps, 1).to(dtype=torch.bool)
 
             state_repeated = None
             if state is not None:
                 state = torch.tensor(np.array(state), device=last_hidden.device, dtype=last_hidden.dtype)
                 state_repeated = state.repeat(repeated_diffusion_steps, 1, 1)
 
-            action_output = self.action_model(last_hidden_repeated, actions_target_repeated, state_repeated)
+            # Scene-flow cascade coupling: extract the detached, GT-free motion hidden and
+            # feed it to the action DiT zero-init coupler (mirror Qwen_GR00T.forward). This
+            # FFSCommon forward override previously omitted the coupling, so the Utonia cascade
+            # only had an aux flow loss and never coupled scene into action.
+            motion_hidden_repeated = None
+            if getattr(self, "scene_predictor_enabled", False):
+                _enc = encoder_attention_mask.to(torch.bool) if encoder_attention_mask is not None else None
+                with torch.random.fork_rng(
+                    devices=[last_hidden.device.index] if last_hidden.is_cuda else []
+                ):
+                    _mh = self.scene_predictor.extract_conditioning_hidden(last_hidden, encoder_attention_mask=_enc)
+                motion_hidden_repeated = _mh.repeat(repeated_diffusion_steps, 1, 1)
 
-        if not isinstance(action_output, dict):
-            return {"action_loss": action_output}
+            action_output = self.action_model(
+                last_hidden_repeated, actions_target_repeated, state_repeated,
+                encoder_attention_mask=encoder_attention_mask_repeated,
+                motion_hidden=motion_hidden_repeated,
+            )
 
-        action_loss = action_output["action_loss"]
-        output = {"action_loss": action_loss}
-        flow_pred = action_output.get("flow_pred", None)
+        if isinstance(action_output, dict):
+            action_loss = action_output["action_loss"]
+            output = {"action_loss": action_loss}
+            flow_pred = action_output.get("flow_pred", None)
+        else:
+            # Cascade mode: action_model returns the raw action-loss tensor (legacy aux
+            # scene_flow is off). Wrap it and fall through to the scene_predictor block
+            # below instead of returning early, so the cascade flow_loss is computed.
+            output = {"action_loss": action_output}
+            flow_pred = None
         if self._scene_flow_enabled() and flow_pred is not None:
             original_batch = len(examples)
             if flow_pred.shape[0] != original_batch:
@@ -733,6 +806,23 @@ class QwenGR00TFFSBase(QwenGR00TNet0FFSMixin, Qwen_GR00T):
                 output["flow_loss"] = flow_loss
                 output.update(flow_metrics)
 
+        # Scene-flow dual-DiT cascade (my scene_predictor) reading the Utonia-augmented VLM
+        # output (prompt + point tokens injected upstream). Mutually exclusive with the legacy
+        # aux scene_flow above (base __init__ asserts exactly one). For learn_scene_flow
+        # (flow_only) this is the only supervised signal; flow_supervised_cells lets the
+        # trainer zero-supervision guard fire.
+        if getattr(self, "scene_predictor_enabled", False):
+            _sp_enc = encoder_attention_mask.to(torch.bool) if encoder_attention_mask is not None else None
+            flow_batch = self._collect_scene_targets(examples, last_hidden.device)
+            if flow_batch is not None:
+                # fp32 island for the scene DiT (its params are fp32; last_hidden may be bf16).
+                # Matches the base Qwen_GR00T.forward which runs this under autocast(fp32).
+                with torch.autocast("cuda", dtype=torch.float32):
+                    scene_out = self.scene_predictor(last_hidden, flow_batch, encoder_attention_mask=_sp_enc)
+                output["flow_loss"] = scene_out["flow_loss"]
+                if "flow_supervised_cells" in scene_out:
+                    output["flow_supervised_cells"] = scene_out["flow_supervised_cells"]
+
         return output
 
     @torch.inference_mode()
@@ -747,11 +837,13 @@ class QwenGR00TFFSBase(QwenGR00TNet0FFSMixin, Qwen_GR00T):
         if train_obs_image_size:
             batch_images = resize_images(batch_images, target_size=train_obs_image_size)
 
+        self._pending_encoder_attention_mask = None
         last_hidden = self._encode_last_hidden_with_optional_sample_ids(
             batch_images,
             instructions,
             sample_ids=None,
         )
+        encoder_attention_mask = getattr(self, "_pending_encoder_attention_mask", None)
 
         state = (
             torch.from_numpy(np.array(state)).to(last_hidden.device, dtype=last_hidden.dtype)
@@ -759,7 +851,18 @@ class QwenGR00TFFSBase(QwenGR00TNet0FFSMixin, Qwen_GR00T):
             else None
         )
         with torch.autocast("cuda", dtype=torch.float32):
-            pred_actions = self.action_model.predict_action(last_hidden, state)
+            motion_hidden = None
+            if getattr(self, "scene_predictor_enabled", False):
+                with torch.random.fork_rng(
+                    devices=[last_hidden.device.index] if last_hidden.is_cuda else []
+                ):
+                    motion_hidden = self.scene_predictor.extract_conditioning_hidden(
+                        last_hidden, encoder_attention_mask=encoder_attention_mask
+                    )
+            pred_actions = self.action_model.predict_action(
+                last_hidden, state, encoder_attention_mask=encoder_attention_mask,
+                motion_hidden=motion_hidden,
+            )
         return {"normalized_actions": pred_actions.detach().cpu().numpy()}
 
     def _ffs_key_prefixes(self) -> Tuple[str, ...]:

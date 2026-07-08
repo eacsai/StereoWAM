@@ -305,6 +305,19 @@ class CamBranchState:
     last_logged_step: dict = None
     top_pre_hook_handle: Optional[torch.utils.hooks.RemovableHandle] = None
     top_pre_hook_fn: Optional[Callable] = None
+    # FFS/Utonia compatibility: when token insertion happens inside the
+    # language_model pre-hook, the top-level cam_branch hook sees pre-insert
+    # sequence positions. In defer mode, it only records raw cam ids/counts;
+    # depth_token_inject calls refresh_from_per_token_cam_id after inserting
+    # the 64 prompt/depth rows, so image_positions match the real hidden states.
+    defer_position_cache_until_token_insert: bool = False
+    refresh_from_per_token_cam_id: Optional[Callable] = None
+    raw_image_token_counts: Optional[torch.Tensor] = None
+    # Fail-closed sentinel: set True when the top hook DEFERS caching (it expects
+    # depth_token_inject to call refresh after token insertion); cleared by refresh
+    # or clear(). If a cam_branch layer runs while still True, insertion never
+    # refreshed -> raise instead of silently degrading to base attention.
+    deferred_refresh_pending: bool = False
 
     def clear(self) -> None:
         self.image_positions = None
@@ -312,6 +325,8 @@ class CamBranchState:
         self.P_T_img = None
         self.P_inv_img = None
         self.per_token_cam_id = None
+        self.raw_image_token_counts = None
+        self.deferred_refresh_pending = False
 
 
 def _language_model_layers(hf_model) -> nn.ModuleList:
@@ -367,6 +382,13 @@ def _make_cam_branch_forward(
 ) -> Callable:
     def _forward(self, hidden_states: torch.Tensor, *args, **kwargs):
         output = orig_forward(hidden_states, *args, **kwargs)
+        if state.deferred_refresh_pending:
+            raise RuntimeError(
+                f"[cam_branch] layer {layer_idx} reached with deferred position cache still "
+                "PENDING: the token-insertion path (depth_token_inject) did not call "
+                "refresh_from_per_token_cam_id after inserting tokens, so a TRAINED branch "
+                "would silently degrade to base attention. Refusing (fail-closed)."
+            )
         if state.image_positions is None or state.P_img is None:
             return output
 
@@ -432,6 +454,7 @@ def install_cam_branch(
     right_first: bool = True,
     extra_image_cam_id: Optional[int] = None,
     logging_frequency: int = 20,
+    defer_position_cache_until_token_insert: bool = False,
 ) -> Tuple[CamBranchState, List[CamBranchAttention]]:
     """Install image-token-only cam_branch wrappers on selected softmax layers.
 
@@ -462,6 +485,7 @@ def install_cam_branch(
         right_first=right_first,
     )
     state = CamBranchState(logging_frequency=max(int(logging_frequency), 0))
+    state.defer_position_cache_until_token_insert = bool(defer_position_cache_until_token_insert)
     branches: List[CamBranchAttention] = []
 
     for layer_idx in target_layers:
@@ -489,6 +513,65 @@ def install_cam_branch(
             attn,
         )
         branches.append(branch)
+
+    def _cache_positions_from_per_token_cam_id(
+        per_token_cam_id: torch.Tensor,
+        raw_image_counts: Optional[torch.Tensor] = None,
+    ):
+        # Hot path: this adds only 2 host-device syncs per step. It works for both
+        # normal cam_branch (pre-insert sequence) and token-inserting FFS paths after
+        # depth_token_inject has expanded cam ids to the post-insert sequence.
+        # Any invocation satisfies the deferred-refresh obligation (fail-closed sentinel).
+        state.deferred_refresh_pending = False
+        image_mask = per_token_cam_id >= 0
+        bsz = int(per_token_cam_id.shape[0])
+        flat_idx = image_mask.nonzero(as_tuple=False)  # sync 1; row-major order
+        n_total = int(flat_idx.shape[0])
+        if n_total == 0:
+            state.clear()
+            state.per_token_cam_id = per_token_cam_id
+            state.raw_image_token_counts = raw_image_counts
+            return None
+        if n_total % bsz != 0:
+            raise RuntimeError(
+                f"[cam_branch] image token total {n_total} not divisible by batch {bsz} — "
+                "per-sample image-token counts differ; uniform counts are required."
+            )
+        n_img = n_total // bsz
+
+        assigned_counts = image_mask.sum(dim=1)
+        if raw_image_counts is None:
+            raw_image_counts = assigned_counts
+        bad = (raw_image_counts.to(assigned_counts.device) != assigned_counts).any() | (assigned_counts != n_img).any()
+        if bool(bad):
+            raise RuntimeError(
+                "[cam_branch] cam-id assignment incomplete or non-uniform: raw image tokens "
+                f"{raw_image_counts.tolist()} vs assigned {assigned_counts.tolist()} "
+                f"(expected uniform {n_img}/sample). Refusing."
+            )
+
+        positions = flat_idx[:, 1].view(bsz, n_img)
+        cam_ids = per_token_cam_id.gather(dim=1, index=positions)
+        if state.forward_step <= 3:
+            min_cam = int(cam_ids.min().item())
+            max_cam = int(cam_ids.max().item())
+            if min_cam < 0 or max_cam >= int(num_cameras):
+                raise RuntimeError(
+                    f"[cam_branch] invalid image cam ids: min={min_cam} max={max_cam}"
+                )
+
+        P = P_stack.to(device=per_token_cam_id.device, dtype=torch.float32)
+        P_T = P_T_stack.to(device=per_token_cam_id.device, dtype=torch.float32)
+        P_inv = P_inv_stack.to(device=per_token_cam_id.device, dtype=torch.float32)
+        state.per_token_cam_id = per_token_cam_id
+        state.raw_image_token_counts = raw_image_counts
+        state.image_positions = positions
+        state.P_img = P[cam_ids]
+        state.P_T_img = P_T[cam_ids]
+        state.P_inv_img = P_inv[cam_ids]
+        return None
+
+    state.refresh_from_per_token_cam_id = _cache_positions_from_per_token_cam_id
 
     def _pre_forward_hook(module, args, kwargs):
         input_ids = kwargs.get("input_ids", None)
@@ -519,64 +602,19 @@ def install_cam_branch(
             spatial_merge_size=int(spatial_merge_size),
             extra_image_cam_id=extra_image_cam_id,
         )
-        # Hot path: the code BELOW adds only 2 host-device syncs per step (the old
-        # per-sample nonzero loop + per-check .item() readbacks cost ~B+6). NOTE:
-        # compute_per_token_cam_id above retains its own pre-existing host readbacks
-        # (cam_rope_hook.py tolist/nonzero) — that cost is shared with every live
-        # depth-token/FFS arm and is part of their measured healthy baseline; it
-        # moves to a vectorized neutral module at cam_rope soft-retirement.
-        image_mask = per_token_cam_id >= 0
-        bsz = int(input_ids.shape[0])
-        flat_idx = image_mask.nonzero(as_tuple=False)  # sync 1; row-major order
-        n_total = int(flat_idx.shape[0])
-        if n_total == 0:
+        raw_image_counts = (input_ids == image_token_id).sum(dim=1)
+        if state.defer_position_cache_until_token_insert:
+            # Token-inserting FFS paths (e.g. Utonia prompt tokens) will shift the
+            # image rows inside the language_model pre-hook. Do NOT cache positions
+            # here; depth_token_inject refreshes them after insertion using post-insert
+            # cam ids, while retaining raw_image_counts for fail-closed validation.
             state.clear()
             state.per_token_cam_id = per_token_cam_id
+            state.raw_image_token_counts = raw_image_counts
+            state.deferred_refresh_pending = True  # depth_token_inject MUST refresh post-insert
             return None
-        if n_total % bsz != 0:
-            raise RuntimeError(
-                f"[cam_branch] image token total {n_total} not divisible by batch {bsz} — "
-                "per-sample image-token counts differ; uniform counts are required."
-            )
-        n_img = n_total // bsz
 
-        # Fused fail-closed validation, single boolean readback (sync 2):
-        # (a) completeness — compute_per_token_cam_id silently leaves mismatched image
-        #     runs at -1; partial coverage must refuse, not shrink the branch.
-        # (b) uniformity — the .view(bsz, n_img) reshape below would silently MISALIGN
-        #     positions if counts were e.g. [96,160] (sum still divisible by bsz).
-        raw_image_counts = (input_ids == image_token_id).sum(dim=1)
-        assigned_counts = image_mask.sum(dim=1)
-        bad = (raw_image_counts != assigned_counts).any() | (assigned_counts != n_img).any()
-        if bool(bad):
-            raise RuntimeError(
-                "[cam_branch] cam-id assignment incomplete or non-uniform: raw image tokens "
-                f"{raw_image_counts.tolist()} vs assigned {assigned_counts.tolist()} "
-                f"(expected uniform {n_img}/sample). Refusing."
-            )
-
-        positions = flat_idx[:, 1].view(bsz, n_img)
-        cam_ids = per_token_cam_id.gather(dim=1, index=positions)
-        # cam-id range validation only while warming up: violations can only come from
-        # compute_per_token_cam_id logic (layout-independent), so the first forwards
-        # prove it; skipping the .item() readbacks afterwards keeps the path async.
-        if state.forward_step <= 3:
-            min_cam = int(cam_ids.min().item())
-            max_cam = int(cam_ids.max().item())
-            if min_cam < 0 or max_cam >= int(num_cameras):
-                raise RuntimeError(
-                    f"[cam_branch] invalid image cam ids: min={min_cam} max={max_cam}"
-                )
-
-        P = P_stack.to(device=input_ids.device, dtype=torch.float32)
-        P_T = P_T_stack.to(device=input_ids.device, dtype=torch.float32)
-        P_inv = P_inv_stack.to(device=input_ids.device, dtype=torch.float32)
-        state.per_token_cam_id = per_token_cam_id
-        state.image_positions = positions
-        state.P_img = P[cam_ids]
-        state.P_T_img = P_T[cam_ids]
-        state.P_inv_img = P_inv[cam_ids]
-        return None
+        return state.refresh_from_per_token_cam_id(per_token_cam_id, raw_image_counts)
 
     state.top_pre_hook_fn = _pre_forward_hook
     state.top_pre_hook_handle = hf_model.register_forward_pre_hook(_pre_forward_hook, with_kwargs=True)
