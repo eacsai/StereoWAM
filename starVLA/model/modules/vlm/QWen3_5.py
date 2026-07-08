@@ -3,6 +3,7 @@
 # Implemented by [Shijie LIAN/ Huazhong University of Science & Technology] in [2026].
 # Design and Merged by [Jinhui YE / HKUST University] in [2026].
 
+import os
 from typing import Optional
 
 import torch
@@ -146,15 +147,23 @@ class _QWen3_5_VL_Interface(nn.Module):
         messages = []
         assert len(images) == len(instructions), "Images and instructions must have the same length"
         for imgs, instruction in zip(images, instructions):
-            content = [{"type": "image", "image": img} for img in imgs]
-
-            if "CoT_prompt" in self.config.datasets.vla_data:  # If using a grounding prompt to task
+            env_prompt = os.environ.get("ORTHO_PROMPT_TEXT")
+            if env_prompt:
+                prompt = env_prompt.replace("{instruction}", instruction)
+            elif "CoT_prompt" in self.config.datasets.vla_data:  # If using a grounding prompt to task
                 CoT_prompt = self.config.datasets.vla_data.get("CoT_prompt", "")
+                if not isinstance(CoT_prompt, str):
+                    CoT_prompt = str(CoT_prompt)
                 prompt = CoT_prompt.replace("{instruction}", instruction)
             else:
                 prompt = instruction
 
-            content.append({"type": "text", "text": prompt})
+            image_content = [{"type": "image", "image": img} for img in imgs]
+            text_content = {"type": "text", "text": prompt}
+            if bool(self.config.datasets.vla_data.get("prompt_before_images", False)):
+                content = [text_content, *image_content]
+            else:
+                content = [*image_content, text_content]
             msg = [{"role": "user", "content": content}]
 
             if solutions is not None:
@@ -167,6 +176,23 @@ class _QWen3_5_VL_Interface(nn.Module):
         batch_inputs = self.processor.apply_chat_template(
             messages, tokenize=True, padding=True, add_generation_prompt=True, return_dict=True, return_tensors="pt"
         )
+        if os.environ.get("ORTHO_DEBUG_SHAPES") and getattr(self, "_ortho_debug_n", 0) < 4:
+            self._ortho_debug_n = getattr(self, "_ortho_debug_n", 0) + 1
+            input_ids = batch_inputs.get("input_ids")
+            image_counts = []
+            if input_ids is not None:
+                image_counts = (input_ids == IMAGE_TOKEN_INDEX).sum(dim=1).tolist()
+            pixel_values = batch_inputs.get("pixel_values")
+            image_grid_thw = batch_inputs.get("image_grid_thw")
+            print(
+                "[qwen35-input] "
+                f"n_images={[len(imgs) for imgs in images]} "
+                f"image_token_counts={image_counts} "
+                f"input_ids={tuple(input_ids.shape) if input_ids is not None else None} "
+                f"pixel_values={tuple(pixel_values.shape) if pixel_values is not None else None} "
+                f"image_grid_thw={tuple(image_grid_thw.shape) if image_grid_thw is not None else None}",
+                flush=True,
+            )
 
         # if solutions, mask out the solution tokens in labels
         if solutions is not None:  #  here only for fast_tokenizer now.

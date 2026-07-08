@@ -19,6 +19,7 @@ from typing import Optional, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
+from PIL import Image
 
 from deployment.model_server.tools.websocket_policy_client import WebsocketClientPolicy
 from examples.SimplerEnv.eval_files.adaptive_ensemble import AdaptiveEnsembler
@@ -37,6 +38,9 @@ class ModelClient:
         adaptive_ensemble_alpha: float = 0.1,
         host: str = "0.0.0.0",
         port: int = 10095,
+        image_size: Sequence[int] = (224, 224),
+        ortho_eval: bool = False,
+        suite_name: Optional[str] = None,
     ) -> None:
         # Connect & receive handshake metadata (action_chunk_size, etc.)
         self.client = WebsocketClientPolicy(host, port)
@@ -44,6 +48,11 @@ class ModelClient:
         self.action_chunk_size = int(meta["action_chunk_size"])
         self._server_metadata = meta
 
+        self.image_size: tuple = tuple(image_size)
+        self.ortho_eval = bool(ortho_eval)
+        self.suite_name = suite_name
+        if self.ortho_eval and not self.suite_name:
+            raise ValueError("ModelClient(ortho_eval=True) requires suite_name (fail-closed)")
         self.policy_setup = policy_setup
         self.unnorm_key = unnorm_key
         print(
@@ -94,6 +103,7 @@ class ModelClient:
         self.sticky_gripper_action = 0.0
         self.previous_gripper_action = None
         self.raw_actions = None
+        self._episode_id = getattr(self, "_episode_id", -1) + 1  # per-episode -> server FIFO reset
 
     def step(self, example: dict, step: int = 0, **kwargs) -> dict:
         """One env step.
@@ -109,6 +119,37 @@ class ModelClient:
         if task_description != self.task_description:
             self.reset(task_description)
 
+        # ORTHOGRID eval: capture the raw (un-resized) 256px stereo pair BEFORE the
+        # 224 resize below, so the server renders the orthogonal grid at the SAME
+        # 256px scale the training cache used (FFS + intrinsics are 256px).
+        raw_stereo_256 = None
+        if self.ortho_eval:
+            imgs = example.get("image") or []
+            if len(imgs) != 2:
+                raise ValueError(
+                    f"ortho_eval expects exactly 2 camera images [primary,left_view], "
+                    f"got {len(imgs)} (multi-frame orthogrid unsupported; fail-closed)."
+                )
+            raw_stereo_256 = [
+                np.ascontiguousarray(np.asarray(imgs[0], dtype=np.uint8)),
+                np.ascontiguousarray(np.asarray(imgs[1], dtype=np.uint8)),
+            ]
+
+        # Resize images to self.image_size if needed.
+        if self.image_size and example.get("image"):
+            resized = []
+            target_hw = self.image_size  # (H, W)
+            for img in example["image"]:
+                arr = np.asarray(img)
+                if arr.shape[:2] != target_hw:
+                    arr = np.asarray(
+                        Image.fromarray(arr).resize(
+                            (target_hw[1], target_hw[0])
+                        )
+                    )
+                resized.append(arr)
+            example = {**example, "image": resized}
+
         # Refresh chunk if needed.
         if step % self.action_chunk_size == 0 or self.raw_actions is None:
             vla_input = {
@@ -117,7 +158,13 @@ class ModelClient:
                 "do_sample": False,
                 "use_ddim": self.use_ddim,
                 "num_ddim_steps": self.num_ddim_steps,
+                "episode_id": getattr(self, "_episode_id", 0),  # server resets past-flow FIFO on change
             }
+            if self.ortho_eval:
+                if raw_stereo_256 is None:
+                    raise ValueError("ortho_eval set but raw_stereo_256 missing (fail-closed)")
+                vla_input["raw_stereo_256"] = raw_stereo_256
+                vla_input["suite_name"] = self.suite_name
             response = self.client.predict_action(vla_input)
             try:
                 actions_batch = response["data"]["actions"]  # (B, T, D), unnormalized server-side

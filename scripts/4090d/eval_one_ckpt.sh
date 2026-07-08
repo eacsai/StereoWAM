@@ -88,6 +88,29 @@ if [ -z "$VIDEO_KEYS" ]; then
   echo "  [preflight] auto-derived video_keys='$VIDEO_KEYS' from data_mix='$DM'"
 fi
 
+# ---- ORTHOGRID eval detection: render the third orthogonal-grid view live in the server ----
+# Detected from the ckpt config (ortho_cache.enabled + view: grid), never from run_id.
+# For orthogrid ckpts the server (server_policy.py) loads FFS + renders the grid from the
+# raw 256px stereo pair the client sends, then injects it at the config-declared slot.
+ORTHO_EVAL_ARGS=()
+_OC_BLOCK="$(grep -A8 -E '^[[:space:]]*ortho_cache:' "$RUN_DIR/config.yaml" 2>/dev/null || true)"
+if echo "$_OC_BLOCK" | grep -qE 'enabled:[[:space:]]*true' && echo "$_OC_BLOCK" | grep -qE 'view:[[:space:]]*grid'; then
+  ORTHO_POSITION="$(echo "$_OC_BLOCK" | grep -E 'position:' | head -1 | sed -E 's/.*position:[[:space:]]*//; s/#.*//; s/[[:space:]].*//; s/[^a-z]//g' || true)"
+  ORTHO_POSITION="${ORTHO_POSITION:-last}"
+  case "$ORTHO_POSITION" in last|first) ;; *) echo "  [FATAL] ortho_cache.position must be last|first, got '$ORTHO_POSITION'"; exit 7 ;; esac
+  # byte-exact prompt: prefer the per-run persisted copy, else the shared source.
+  ORTHO_PROMPT_FILE="$RUN_DIR/ortho_prompt.txt"
+  if [ ! -f "$ORTHO_PROMPT_FILE" ]; then
+    ORTHO_PROMPT_FILE="$STARVLA_DIR/scripts/_shared/ortho_prompt_${ORTHO_POSITION}.txt"
+  fi
+  [ -f "$ORTHO_PROMPT_FILE" ] || { echo "  [FATAL] orthogrid ckpt but no prompt file ($RUN_DIR/ortho_prompt.txt or scripts/_shared/ortho_prompt_${ORTHO_POSITION}.txt)"; exit 7; }
+  export ORTHO_PROMPT_TEXT="$(cat "$ORTHO_PROMPT_FILE")"
+  [ -n "$ORTHO_PROMPT_TEXT" ] || { echo "  [FATAL] ORTHO_PROMPT_TEXT empty from $ORTHO_PROMPT_FILE"; exit 7; }
+  ORTHO_EVAL_ARGS=(--args.ortho-eval)
+  echo "  [ortho] orthogrid ckpt: position=$ORTHO_POSITION prompt_file=$ORTHO_PROMPT_FILE prompt_len=${#ORTHO_PROMPT_TEXT} (server renders+injects grid live)"
+  echo "  [ortho] FFS_REPO_DIR=$FFS_REPO_DIR"
+fi
+
 echo "=== eval $CKPT  GPU=$GPU port=$PORT suite=$TASK_SUITE video_keys=$VIDEO_KEYS  $(date) ==="
 
 pkill -9 -f "server_policy.py.*--port $PORT" 2>/dev/null || true
@@ -122,10 +145,11 @@ export MUJOCO_EGL_DEVICE_ID="$GPU"
 set +e
 $LIBERO_VENV examples/LIBERO/eval_files/eval_libero.py \
   --args.pretrained-path "$CKPT" --args.host 127.0.0.1 --args.port "$PORT" \
-  --args.task-suite-name "$TASK_SUITE" --args.num-trials-per-task 10 --args.max-tasks -1 \
+  --args.task-suite-name "$TASK_SUITE" --args.num-trials-per-task "${EVAL_NUM_TRIALS:-10}" --args.max-tasks "${EVAL_MAX_TASKS:--1}" \
   --args.video-keys "$VIDEO_KEYS" \
   --args.num-obs-frames "$NUM_OBS_FRAMES" \
   --args.obs-indices "$OBS_INDICES" \
+  "${ORTHO_EVAL_ARGS[@]}" \
   --args.video-out-path "$EVAL_DIR/videos" \
   > "$EVAL_DIR/client.log" 2>&1
 CLIENT_RC=$?

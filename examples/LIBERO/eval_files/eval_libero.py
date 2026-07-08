@@ -142,6 +142,11 @@ class Args:
 
     job_name: str = "test"
 
+    # NEW (2026-07-04 orthogrid eval): when True the client sends the raw 256px
+    # stereo pair + suite name so the policy server renders the third "orthogonal
+    # grid" view live and injects it. Set by the eval launcher for orthogrid ckpts.
+    ortho_eval: bool = False
+
 
 _ALLOWED_VIDEO_KEYS = {"primary", "wrist", "right_view", "left_view"}
 _ALLOWED_GRIPPER_CONVENTIONS = {"openvla", "libero_raw"}
@@ -209,6 +214,30 @@ def eval_libero(args: Args) -> None:
     if use_stereo:
         logging.info(f"[stereo] eval with rendered rightview baseline={args.stereo_baseline}m")
 
+    # NEW (2026-07-04): orthogrid eval fail-closed preconditions. The live grid is
+    # rendered from the stereo pair -> requires stereo video_keys, single frame only (R7).
+    if args.ortho_eval:
+        if requested_video_keys != ["primary", "left_view"]:
+            raise ValueError(
+                "--args.ortho-eval requires EXACTLY video_keys=primary,left_view "
+                "(in that order: imgs[0]=primary, imgs[1]=left_view, renderer does "
+                f"ffs(left_view,primary)); got {requested_video_keys}"
+            )
+        if not use_stereo:
+            raise ValueError(
+                "--args.ortho-eval requires stereo video_keys (primary,left_view); "
+                f"got {requested_video_keys}"
+            )
+        if len(_obs_idx) != 1:
+            raise ValueError(
+                f"--args.ortho-eval supports single-frame only (num_obs_frames=1); "
+                f"got obs_indices={_obs_idx}"
+            )
+        logging.info(
+            f"[ortho] orthogrid eval ENABLED; server renders+injects the grid; "
+            f"suite={args.task_suite_name}"
+        )
+
     # Initialize LIBERO task suite
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite = benchmark_dict[args.task_suite_name]()
@@ -236,6 +265,8 @@ def eval_libero(args: Args) -> None:
         host=args.host,
         port=args.port,
         unnorm_key=args.unnorm_key,
+        ortho_eval=args.ortho_eval,
+        suite_name=args.task_suite_name if args.ortho_eval else None,
     )
 
     # Optional smoke-test cap (still useful for quick verification with -1 = full run).

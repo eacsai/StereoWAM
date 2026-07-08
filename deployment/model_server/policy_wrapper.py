@@ -21,7 +21,9 @@ Exposed API:
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -55,6 +57,44 @@ class PolicyServerWrapper:
         # Co-located metadata.
         model_cfg, _ = read_mode_config(self._ckpt_path)
         self._model_cfg = model_cfg
+
+        # --- orthogrid live-render detection (eval-time third view) ---
+        # Orthogrid checkpoints consume a third "orthogonal 2x2 grid" image that
+        # training read from a precomputed cache keyed by (traj_id, frame). At
+        # eval there is no such key, so the server renders the grid live and
+        # injects it here (deployment/model_server/ortho_render_live.py).
+        # Detected from config (ortho_cache.enabled + view==grid), never run_id.
+        self._ortho_enabled = False
+        self._ortho_position = "last"
+        self._live_ortho = None
+        self._ortho_debug_n = 0
+        _vla = (model_cfg.get("datasets", {}) or {}).get("vla_data", {}) or {}
+        _oc = _vla.get("ortho_cache", {}) or {}
+        if bool(_oc.get("enabled", False)) and str(_oc.get("view", "")) == "grid":
+            self._ortho_enabled = True
+            self._ortho_position = str(_oc.get("position", "last"))
+            if self._ortho_position not in ("last", "first"):
+                raise ValueError(
+                    f"PolicyServerWrapper: ortho_cache.position must be 'last' or "
+                    f"'first', got {self._ortho_position!r}"
+                )
+            from deployment.model_server.ortho_render_live import LiveOrthoRenderer
+            self._live_ortho = LiveOrthoRenderer()
+            # fail-closed: orthogrid ckpts were trained with a specific
+            # ORTHO_PROMPT_TEXT; QWen3_5 silently falls back to the bare
+            # instruction if the env var is unset (prompt contract broken).
+            # The eval launcher exports it before starting the server; refuse
+            # to run if a bypass/stale launcher left it unset.
+            if not (os.environ.get("ORTHO_PROMPT_TEXT") or "").strip():
+                raise ValueError(
+                    "orthogrid checkpoint but ORTHO_PROMPT_TEXT env is unset/empty; "
+                    "the eval launcher must export the byte-exact training prompt "
+                    "before starting server_policy.py (fail-closed)."
+                )
+            logging.info(
+                "PolicyServerWrapper: ORTHOGRID live-render ENABLED (position=%s)",
+                self._ortho_position,
+            )
 
         # action_chunk_size = future_action_window_size + 1 (matches old client).
         action_model_cfg = model_cfg["framework"]["action_model"]
@@ -123,10 +163,78 @@ class PolicyServerWrapper:
             base["state_keys"] = proc.state_keys
         return base
 
+    def _inject_ortho_grid(
+        self,
+        examples: List[dict],
+        suite_name: Optional[str],
+        raw_stereo_256: Optional[list],
+    ) -> List[dict]:
+        """Render the live orthogonal grid and inject it as the third image.
+
+        Fail-closed: an orthogrid checkpoint MUST receive ``suite_name`` (for
+        the per-suite camera pose) and ``raw_stereo_256`` (the un-resized 256px
+        stereo pair) from the client; missing either is a hard error rather
+        than a silent wrong-geometry render.
+        """
+        if suite_name is None or raw_stereo_256 is None:
+            raise ValueError(
+                "orthogrid checkpoint requires suite_name and raw_stereo_256 in "
+                "the request (client must send them); refusing to render with "
+                "missing geometry inputs (fail-closed)."
+            )
+        if len(examples) != 1:
+            raise ValueError(
+                f"orthogrid live-render is request-level (one raw_stereo_256 per "
+                f"request), but got a batch of {len(examples)} examples; refusing to "
+                f"apply one grid to a batch (fail-closed). Send B=1 requests."
+            )
+        if not (isinstance(raw_stereo_256, (list, tuple)) and len(raw_stereo_256) == 2):
+            raise ValueError(
+                f"raw_stereo_256 must be [primary_256, left_256]; got "
+                f"{type(raw_stereo_256).__name__}"
+            )
+        grid, info = self._live_ortho.render_grid(
+            raw_stereo_256[0], raw_stereo_256[1], suite_name
+        )
+        for ex in examples:
+            imgs = list(ex.get("image", []))
+            # single-frame only: [primary, left_view] (R7 multi-frame unsupported)
+            if len(imgs) != 2:
+                raise ValueError(
+                    f"orthogrid eval expects exactly 2 camera images "
+                    f"[primary,left_view] per example, got {len(imgs)} "
+                    f"(multi-frame orthogrid unsupported; fail-closed)."
+                )
+            if self._ortho_position == "first":
+                imgs.insert(0, grid)
+            else:
+                imgs.append(grid)
+            ex["image"] = imgs
+        if self._ortho_debug_n < 4:
+            self._ortho_debug_n += 1
+            _prompt = os.environ.get("ORTHO_PROMPT_TEXT") or ""
+            _phash = hashlib.md5(_prompt.encode()).hexdigest()[:8] if _prompt else "MISSING"
+            _sizes = [tuple(np.asarray(im).shape[:2]) for im in examples[0]["image"]]
+            logging.info(
+                "[ortho-eval-inject] suite=%s position=%s n_images=%d sizes=%s "
+                "num_points=%s prompt_md5=%s prompt_len=%d",
+                suite_name,
+                self._ortho_position,
+                len(examples[0]["image"]),
+                _sizes,
+                info.get("num_points"),
+                _phash,
+                len(_prompt),
+            )
+        return examples
+
     def predict_action(
         self,
         examples: List[dict],
         unnorm_key: Optional[str] = None,
+        suite_name: Optional[str] = None,
+        raw_stereo_256: Optional[list] = None,
+        episode_id: Optional[int] = None,
         **kwargs,
     ) -> Dict[str, np.ndarray]:
         """Run the framework, then un-normalize via training-time transforms.
@@ -151,6 +259,16 @@ class PolicyServerWrapper:
                     f"Pass one of {self._available_unnorm_keys}."
                 )
         proc = self._get_processor(effective_key)
+
+        if self._ortho_enabled:
+            examples = self._inject_ortho_grid(examples, suite_name, raw_stereo_256)
+
+        # Past-flow rollout FIFO: reset when the episode changes (server holds ONE persistent
+        # framework across all episodes/tasks/suites, else past flow leaks between episodes).
+        if episode_id is not None and episode_id != getattr(self, "_pf_last_episode_id", None):
+            if hasattr(self._framework, "reset_past_flow"):
+                self._framework.reset_past_flow()
+            self._pf_last_episode_id = episode_id
 
         out = self._framework.predict_action(examples=examples, **kwargs)
         normalized = np.asarray(out["normalized_actions"])  # (B, T, D)
