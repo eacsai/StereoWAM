@@ -1,0 +1,192 @@
+[cfg]  /data/wangqiwei/ICLR2026/starVLA/playground/Checkpoints/qwen0p8_groot_cascade_motion_cambranch_learn_scene_flow_fromscratch_leftprimary/config.full.yaml
+[ckpt] /data/wangqiwei/ICLR2026/starVLA/playground/Checkpoints/qwen0p8_groot_cascade_motion_cambranch_learn_scene_flow_fromscratch_leftprimary/checkpoints/steps_30000_pytorch_model.pt
+[out]  /data/wangqiwei/ICLR2026/starVLA/docs/experiments/stage1_flow_prediction_check
+[build] constructing QwenGR00T + scene_predictor (loads Qwen VLM)...
+[transformers] The fast path is not available because one of the required library is not installed. Falling back to torch implementation. To install follow https://github.com/fla-org/flash-linear-attention#installation and https://github.com/Dao-AILab/causal-conv1d
+Loading weights:   0%|          | 0/473 [00:00<?, ?it/s]Loading weights: 100%|██████████| 473/473 [00:00<00:00, 8047.52it/s]
+07/07 [07:08:54] INFO     | >>  installed 6 branches cam_branch_attention.py:622
+                          on                                                    
+                          language_model.layers[3,                              
+                          7, 11, 15, 19, 23]                                    
+                          (heads=4, head_dim=128,                               
+                          num_cameras=2,                                        
+                          baseline_m=0.0600,                                    
+                          right_first=True)                                     
+Total number of DiT parameters:  161775616
+Total number of DiT parameters:  137961216
+[load] missing=0 unexpected=0
+[load] scene_predictor missing=0  qwen_vl missing=0  cam_branch missing=0
+/data/wangqiwei/ICLR2026/starVLA/.venv/lib/python3.10/site-packages/albumentations/__init__.py:13: UserWarning: A new version of Albumentations is available: 2.0.8 (you have 1.4.18). Upgrade using: pip install -U albumentations. To disable automatic update checks, set the environment variable NO_ALBUMENTATIONS_UPDATE to 1.
+  check_for_updates()
+07/07 [07:09:09] INFO     | >>  Loaded mixtures from Behavior    registry.py:110
+                          (data_config): ['BEHAVIOR_challenge']                 
+                 INFO     | >>  Loaded data_config from DOMINO:  registry.py:104
+                          ['robotwin']                                          
+                 INFO     | >>  Loaded embodiment_tags from      registry.py:107
+                          DOMINO (data_config): []                              
+                 INFO     | >>  Loaded mixtures from DOMINO      registry.py:110
+                          (data_config): ['domino',                             
+                          'domino_clean', 'domino_random',                      
+                          'domino_cotrain']                                     
+                 INFO     | >>  Loaded data_config from Franka:  registry.py:104
+                          ['custom_robot_config',                               
+                          'demo_sim_franka_delta_joints',                       
+                          'SO101']                                              
+                 INFO     | >>  Loaded embodiment_tags from      registry.py:107
+                          Franka (data_config): []                              
+                 INFO     | >>  Loaded mixtures from Franka      registry.py:110
+                          (data_config): ['custom_dataset',                     
+                          'custom_dataset_2',                                   
+                          'demo_sim_pick_place', 'SO101_pick']                  
+                 INFO     | >>  Loaded data_config from LIBERO:  registry.py:104
+                          ['libero_franka']                                     
+                 INFO     | >>  Loaded embodiment_tags from      registry.py:107
+                          LIBERO (data_config): []                              
+                 INFO     | >>  Loaded mixtures from LIBERO      registry.py:110
+                          (data_config): ['libero_all',                         
+                          'libero_goal', 'multi_robot']                         
+                 INFO     | >>  Loaded data_config from          registry.py:104
+                          LIBERO_STEREO:                                        
+                          ['libero_franka_stereo',                              
+                          'libero_franka_mono_primary']                         
+                 INFO     | >>  Loaded embodiment_tags from      registry.py:107
+                          LIBERO_STEREO (data_config):                          
+                          ['libero_franka_stereo',                              
+                          'libero_franka_mono_primary']                         
+                 INFO     | >>  Loaded mixtures from             registry.py:110
+                          LIBERO_STEREO (data_config):                          
+                          ['libero_spatial_stereo',                             
+                          'libero_object_stereo',                               
+                          'libero_goal_stereo',                                 
+                          'libero_10_stereo',                                   
+                          'libero_all_stereo',                                  
+                          'libero_spatial_mono_replay',                         
+                          'libero_object_mono_replay',                          
+                          'libero_goal_mono_replay',                            
+                          'libero_goal_mono_official',                          
+                          'libero_10_mono_replay',                              
+                          'libero_all_mono_selfrender',                         
+                          'libero_all_mono_replay']                             
+                 INFO     | >>  Loaded data_config from          registry.py:104
+                          RoboChallenge_table30v2:                              
+                          ['ur5_robochallenge',                                 
+                          'arx5_robochallenge',                                 
+                          'dosw1_robochallenge']                                
+                 INFO     | >>  Loaded embodiment_tags from      registry.py:107
+                          RoboChallenge_table30v2 (data_config):                
+                          ['ur5_robochallenge',                                 
+                          'arx5_robochallenge',                                 
+                          'dosw1_robochallenge']                                
+                 INFO     | >>  Loaded mixtures from             registry.py:110
+                          RoboChallenge_table30v2 (data_config):                
+                          ['robochallenge_table30v2_shred_paper'                
+                          , 'robochallenge_table30v2_ur5_all',                  
+                          'robochallenge_table30v2_arx5_all',                   
+                          'robochallenge_table30v2_dosw1_all']                  
+                 INFO     | >>  Loaded data_config from          registry.py:104
+                          Robocasa_365:                                         
+                          ['panda_omron_robocasa365']                           
+                 INFO     | >>  Loaded embodiment_tags from      registry.py:107
+                          Robocasa_365 (data_config): []                        
+                 INFO     | >>  Loaded mixtures from             registry.py:110
+                          Robocasa_365 (data_config):                           
+                          ['robocasa365_open_drawer_target_human                
+                          ',                                                    
+                          'robocasa365_atomic_target_human_all',                
+                          'robocasa365_composite_target_human_al                
+                          l', 'robocasa365_target_human_all']                   
+                 INFO     | >>  Loaded data_config from          registry.py:104
+                          Robocasa_tabletop:                                    
+                          ['fourier_gr1_arms_waist']                            
+                 INFO     | >>  Loaded embodiment_tags from      registry.py:107
+                          Robocasa_tabletop (data_config): []                   
+                 INFO     | >>  Loaded mixtures from             registry.py:110
+                          Robocasa_tabletop (data_config):                      
+                          ['fourier_gr1_unified_1000']                          
+                 INFO     | >>  Loaded data_config from          registry.py:104
+                          Robotwin: ['robotwin', 'robotwin50',                  
+                          'arx_x5']                                             
+                 INFO     | >>  Loaded embodiment_tags from      registry.py:107
+                          Robotwin (data_config): []                            
+                 INFO     | >>  Loaded mixtures from Robotwin    registry.py:110
+                          (data_config): ['robotwin_all',                       
+                          'robotwin_all_50', 'robotwin',                        
+                          'robotwin_task1', 'robotwin_task2',                   
+                          'arx_x5']                                             
+                 INFO     | >>  Loaded data_config from          registry.py:104
+                          SimplerEnv: ['oxe_droid',                             
+                          'oxe_bridge', 'oxe_rt1']                              
+                 INFO     | >>  Loaded embodiment_tags from      registry.py:107
+                          SimplerEnv (data_config): []                          
+                 INFO     | >>  Loaded mixtures from SimplerEnv  registry.py:110
+                          (data_config): ['bridge',                             
+                          'bridge_rt_1']                                        
+                 INFO     | >>  Loaded data_config from          registry.py:104
+                          VLA-Arena: ['vla_arena_franka']                       
+                 INFO     | >>  Loaded embodiment_tags from      registry.py:107
+                          VLA-Arena (data_config): []                           
+                 INFO     | >>  Loaded mixtures from VLA-Arena   registry.py:110
+                          (data_config): ['vla_arena_L0_S',                     
+                          'vla_arena_L0_M', 'vla_arena_L0_L']                   
+[data] building dataset mix=libero_all_sfstereo_leftprimary (gt_only_sampler)...
+[scene-flow] libero_object_no_noops_1.0.0_lerobot: indexed 451 GT episodes from playground/Datasets/LEROBOT_LIBERO_OURRENDER_PW/libero_object_no_noops_1.0.0_lerobot/meta/episode_to_sceneflow_sidecar.json (sidecar_to_training_flip=rot180)
+Initialized dataset libero_object_no_noops_1.0.0_lerobot with EmbodimentTag.FRANKA
+[scene-flow] libero_goal_no_noops_1.0.0_lerobot: indexed 427 GT episodes from playground/Datasets/LEROBOT_LIBERO_OURRENDER_PW/libero_goal_no_noops_1.0.0_lerobot/meta/episode_to_sceneflow_sidecar.json (sidecar_to_training_flip=rot180)
+Initialized dataset libero_goal_no_noops_1.0.0_lerobot with EmbodimentTag.FRANKA
+[scene-flow] libero_spatial_no_noops_1.0.0_lerobot: indexed 434 GT episodes from playground/Datasets/LEROBOT_LIBERO_OURRENDER_PW/libero_spatial_no_noops_1.0.0_lerobot/meta/episode_to_sceneflow_sidecar.json (sidecar_to_training_flip=rot180)
+Initialized dataset libero_spatial_no_noops_1.0.0_lerobot with EmbodimentTag.FRANKA
+[scene-flow] libero_10_no_noops_1.0.0_lerobot: indexed 383 GT episodes from playground/Datasets/LEROBOT_LIBERO_OURRENDER_PW/libero_10_no_noops_1.0.0_lerobot/meta/episode_to_sceneflow_sidecar.json (sidecar_to_training_flip=rot180)
+Initialized dataset libero_10_no_noops_1.0.0_lerobot with EmbodimentTag.FRANKA
+Dataset lengths: [ 66022  51335  52705 102251]
+[head] grid=16 field_dim=3 num_tokens=256 num_timestep_buckets=1000 dynamic_fallback_to_valid=False
+[transformers] Kwargs passed to `processor.__call__` have to be in `processor_kwargs` dict, not in `**kwargs`
+  collected 16 samples | sup_cells so far=187
+[transformers] Kwargs passed to `processor.__call__` have to be in `processor_kwargs` dict, not in `**kwargs`
+  collected 32 samples | sup_cells so far=292
+[transformers] Kwargs passed to `processor.__call__` have to be in `processor_kwargs` dict, not in `**kwargs`
+  collected 48 samples | sup_cells so far=413
+[transformers] Kwargs passed to `processor.__call__` have to be in `processor_kwargs` dict, not in `**kwargs`
+  collected 64 samples | sup_cells so far=527
+[transformers] Kwargs passed to `processor.__call__` have to be in `processor_kwargs` dict, not in `**kwargs`
+  collected 80 samples | sup_cells so far=683
+[transformers] Kwargs passed to `processor.__call__` have to be in `processor_kwargs` dict, not in `**kwargs`
+  collected 96 samples | sup_cells so far=811
+
+==============================================================================
+SCENE-FLOW PREDICTION DEGENERACY CHECK
+==============================================================================
+run_id            : qwen0p8_groot_cascade_motion_cambranch_learn_scene_flow_fromscratch_leftprimary
+ckpt_step         : 30000
+n_samples         : 96   (imgs/sample=2, euler_steps=10)
+
+--- DYNAMIC ∩ VALID cells (the supervised set; the decisive test) ---
+  Model EPE           : 0.0074 m
+  Zero-flow EPE (base): 0.0093 m   <-- degeneracy baseline
+  Mean-flow EPE (base): 0.0085 m
+  RELATIVE EPE        : 0.8019      (Model/Zero; <<1 good, ~1 degenerate)
+  Cosine(pred,gt)     : 0.7008          (dynamic cells)
+  n_cells             : 811
+
+--- ALL-VALID cells (mostly static; sanity) ---
+  Model EPE           : 0.0116 m
+  Zero-flow EPE (base): 0.0005 m
+  Mean-flow EPE (base): 0.0007 m
+  RELATIVE EPE        : 22.6532
+  Cosine(pred,gt)     : 0.0418
+  n_cells             : 19654
+
+--- coverage / diagnostics ---
+  frac dyn∩valid of ALL cells   : 0.0330
+  frac dyn∩valid of VALID cells : 0.0413
+  frac valid of ALL cells       : 0.7997
+  samples w/ 0 dynamic cells    : 25 / 96
+  dynamic_fallback_to_valid     : False
+  ||GT|| dynamic cells (m)      : mean=0.0093 median=0.0093
+  ||GT|| static cells  (m)      : mean=0.0001 median=0.0000
+
+VERDICT: PARTIAL / IN-BETWEEN: see numbers.
+         RelativeEPE(dyn)=0.802, cosine(dyn)=0.701
+==============================================================================
+[saved] /data/wangqiwei/ICLR2026/starVLA/docs/experiments/stage1_flow_prediction_check/flow_pred_metrics.json
+[saved] /data/wangqiwei/ICLR2026/starVLA/docs/experiments/stage1_flow_prediction_check/flow_pred_vs_gt.png
+CODEX_EVAL_EXIT=0

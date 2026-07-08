@@ -1,0 +1,47 @@
+{
+  "run_id": "qwen0p8_groot_cascade_motion_cambranch_learn_scene_flow_fromscratch_leftprimary",
+  "ckpt_step": 30000,
+  "n_samples": 96,
+  "n_euler_steps": 10,
+  "n_imgs_per_sample": 2,
+  "dynamic_and_valid": {
+    "model_epe": 0.007425068411976099,
+    "zero_baseline_epe": 0.009259158745408058,
+    "mean_baseline_epe": 0.008509652689099312,
+    "relative_epe": 0.8019160936903097,
+    "cosine": 0.7008190751075745,
+    "n_cells": 811
+  },
+  "all_valid": {
+    "model_epe": 0.011579160578548908,
+    "zero_baseline_epe": 0.0005111496429890394,
+    "mean_baseline_epe": 0.0006617465405724943,
+    "relative_epe": 22.653171605163774,
+    "cosine": 0.04181336238980293,
+    "n_cells": 19654
+  },
+  "coverage": {
+    "frac_dynvalid_of_all_cells": 0.032999674479166664,
+    "frac_dynvalid_of_valid_cells": 0.041263864862114585,
+    "frac_valid_of_all_cells": 0.7997233072916666,
+    "n_total_cells": 24576,
+    "n_valid_cells": 19654,
+    "n_sup_cells": 811,
+    "n_samples_zero_dynamic": 25,
+    "dynamic_fallback_to_valid": false
+  },
+  "gt_flow_magnitude_m": {
+    "dynamic_cells": {
+      "mean": 0.009259158745408058,
+      "median": 0.009289952926337719,
+      "n": 811
+    },
+    "static_cells": {
+      "mean": 0.0001346365752397105,
+      "median": 0.0,
+      "n": 18843
+    }
+  },
+  "verdict": "PARTIAL / IN-BETWEEN: see numbers.",
+  "verdict_reason": "RelativeEPE(dyn)=0.802, cosine(dyn)=0.701"
+}
