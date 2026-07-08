@@ -17,7 +17,7 @@ export OMP_NUM_THREADS=$NPROC_PER_WORKER MKL_NUM_THREADS=$NPROC_PER_WORKER \
        OPENBLAS_NUM_THREADS=$NPROC_PER_WORKER NUMEXPR_NUM_THREADS=$NPROC_PER_WORKER \
        VECLIB_MAXIMUM_THREADS=$NPROC_PER_WORKER
 echo "[precompute ${SUITE}] start $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-/home/wangqiwei/ICLR2026/starVLA/.venv/bin/python scripts/a800/precompute_utonia_cache.py \
+/home/wangqiwei/ICLR2026/starVLA/.venv/bin/python scripts/tools/precompute_utonia_cache.py \
   --cache-dir playground/Datasets/utonia_cache_perpatch \
   --suites "${SUITE}" \
   --data-root playground/Datasets/LEROBOT_LIBERO_OURRENDER_PW \

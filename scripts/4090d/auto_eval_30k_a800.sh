@@ -20,10 +20,10 @@ cd /data/wangqiwei/ICLR2026/starVLA
 
 RID="${1:?need RUN_ID}"; SRC_IP="${2:?need a800 ip}"; SRC_PORT="${3:?need a800 ssh port}"
 STEP="${STEP:-30000}"
-VK="primary,left_view"                                   # leftprimary convention (asserted vs config-derived)
+VK="${VK:-primary,left_view}"
 EVAL=scripts/4090d/eval_qwen2p5vl_4suite.sh
 RESULTS="playground/Checkpoints/${RID}_eval_results.txt"
-REGISTRY="docs/experiments/leftprimary_30k_autoeval.md"
+REGISTRY="${REGISTRY:-docs/experiments/leftprimary_30k_autoeval.md}"
 LOG="playground/Checkpoints/auto_eval_${RID}.log"
 LOCK="playground/Checkpoints/.eval_4090d.lock"           # SHARED by all eval daemons
 A800="ssh -i /data/wangqiwei/.ssh/id_a800_push -p ${SRC_PORT} -o StrictHostKeyChecking=no -o ConnectTimeout=30 -o ServerAliveInterval=15 wangqiwei@${SRC_IP}"
@@ -65,6 +65,11 @@ if [ "$LOCAL_SZ" != "$sz" ]; then
   $A800 "cat ${A800_RUN}/config.full.yaml" > "${LOCAL_RUN}/config.full.yaml"
   $A800 "cat ${A800_RUN}/dataset_statistics.json" > "${LOCAL_RUN}/dataset_statistics.json"
   cp "${LOCAL_RUN}/config.full.yaml" "${LOCAL_RUN}/config.yaml"
+  # orthogrid: pull the per-run byte-exact prompt if present (eval_one_ckpt.sh
+  # falls back to scripts/_shared/ortho_prompt_<position>.txt when absent).
+  if $A800 "test -f ${A800_RUN}/ortho_prompt.txt" 2>/dev/null; then
+    $A800 "cat ${A800_RUN}/ortho_prompt.txt" > "${LOCAL_RUN}/ortho_prompt.txt" && log "pulled ortho_prompt.txt"
+  fi
   NEW_SZ=$(stat -c %s "$CKPT")
   [ "$NEW_SZ" = "$sz" ] || { log "[FATAL] pulled ckpt size mismatch local=$NEW_SZ remote=$sz"; rm -f "$CKPT"; exit 2; }
   log "pull OK"

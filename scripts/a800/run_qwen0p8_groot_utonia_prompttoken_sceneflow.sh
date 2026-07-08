@@ -1,5 +1,7 @@
 #!/bin/bash
-# Qwen3.5-0.8B + GR00T + Utonia prompt-token injection.
+# Qwen3.5-0.8B + GR00T + Utonia prompt-token + scene_flow aux head (= ③ Utonia + ④ scene_flow).
+# Based on run_qwen0p8_groot_utonia_prompttoken.sh + scene_flow args (online_grad_norm=false, flow_lambda=130 per spec §9).
+# full ft (FREEZE_MODULES='') aligns ③; primary contrast = ③ (single-var = scene_flow on Utonia).
 #
 # Version B for the Version A comparison: same cached Utonia grid/source as
 # run_qwen0p8_groot_utonia_perpatch.sh, but inserts 64 prompt rows before the
@@ -39,16 +41,16 @@ else
 fi
 
 run_root_dir=./playground/Checkpoints
-run_id=${RUN_ID:-qwen3p5_0p8b_utonia_prompttoken_cached_30k}
+run_id=${RUN_ID:-qwen3p5_0p8b_utonia_prompttoken_sceneflow_lambda130_leftprimary_fromscratch_fullft_eff128_maskfix_30k}
 
-BS=${BS:-32}
+BS=${BS:-16}
 MAX_STEPS=${MAX_STEPS:-30000}
 SAVE_INTERVAL=${SAVE_INTERVAL:-10000}
 WARMUP_STEPS=${WARMUP_STEPS:-5000}
 GPUS=${GPUS:-0}
 NUM_PROCESSES=${NUM_PROCESSES:-1}
 PORT=${PORT:-29764}
-DS_CONFIG=${DS_CONFIG:-starVLA/config/deepseeds/deepspeed_zero2_ga4.yaml}
+DS_CONFIG=${DS_CONFIG:-starVLA/config/deepseeds/deepspeed_zero2_ga8.yaml}
 FREEZE_MODULES=${FREEZE_MODULES-}
 TRAIN_ONLY=${TRAIN_ONLY-}
 CAM_ROPE=${CAM_ROPE:-0}
@@ -367,6 +369,27 @@ CUDA_VISIBLE_DEVICES=${GPUS} ${CONDA_VENV}/accelerate launch \
   --framework.utonia_pointcloud.point_prompt "Left image point-cloud features:" \
   --framework.utonia_pointcloud.gate_init zero \
   --framework.utonia_pointcloud.utonia_cache_dir "${UTONIA_CACHE_DIR}" \
+  --framework.action_model.scene_flow.enabled true \
+  --framework.action_model.scene_flow.flow_lambda 130 \
+  --framework.action_model.scene_flow.online_grad_norm_enabled false \
+  --framework.action_model.scene_flow.target_grad_ratio 0.05 \
+  --framework.action_model.scene_flow.lambda_min 0.001 \
+  --framework.action_model.scene_flow.lambda_max 10000 \
+  --framework.action_model.scene_flow.lambda_ema_decay 0.97 \
+  --framework.action_model.scene_flow.online_grad_norm_every_n_steps 10 \
+  --framework.action_model.scene_flow.probe_samples 4 \
+  --framework.action_model.scene_flow.lambda_jump_cap 2.0 \
+  --framework.action_model.scene_flow.lambda_warmup_steps 100 \
+  --framework.action_model.scene_flow.min_supervised_pixels 128 \
+  --framework.action_model.scene_flow.grid_size 16 \
+  --framework.action_model.scene_flow.hidden_layer -1 \
+  --framework.action_model.scene_flow.mask_mode dynamic \
+  --framework.action_model.scene_flow.step0_flow_warmup_steps 1 \
+  --framework.action_model.scene_flow.step0_action_loss_audit true \
+  --framework.action_model.scene_flow.grad_ratio_steps 20 \
+  --datasets.vla_data.scene_flow.enabled true \
+  --datasets.vla_data.scene_flow.gt_only_sampler true \
+  --datasets.vla_data.scene_flow.expected_sidecar_to_training_flip rot180 \
   --datasets.vla_data.data_root_dir ${DATA_ROOT} \
   --datasets.vla_data.data_mix ${DATA_MIX} \
   --datasets.vla_data.per_device_batch_size $BS \

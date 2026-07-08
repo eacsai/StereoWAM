@@ -1,5 +1,7 @@
 #!/bin/bash
-# Qwen3.5-0.8B + GR00T + Utonia prompt-token injection.
+# Qwen3.5-0.8B + GR00T + Utonia prompt-token + MY scene_predictor CASCADE (stage-1 learn_scene_flow).
+# Adds Utonia point features (prompt+point tokens into VLM, #5-style) to the scene-flow prediction
+# experiment: does Utonia help the scene DiT predict flow? Single-var vs plain stage-1 (Utonia on/off).
 #
 # Version B for the Version A comparison: same cached Utonia grid/source as
 # run_qwen0p8_groot_utonia_perpatch.sh, but inserts 64 prompt rows before the
@@ -39,26 +41,44 @@ else
 fi
 
 run_root_dir=./playground/Checkpoints
-run_id=${RUN_ID:-qwen3p5_0p8b_utonia_prompttoken_cached_30k}
+run_id=${RUN_ID:-qwen0p8_groot_cascade_motion_utonia_cambranch_learn_scene_flow_fromscratch_leftprimary}
 
-BS=${BS:-32}
+BS=${BS:-16}
 MAX_STEPS=${MAX_STEPS:-30000}
 SAVE_INTERVAL=${SAVE_INTERVAL:-10000}
 WARMUP_STEPS=${WARMUP_STEPS:-5000}
 GPUS=${GPUS:-0}
 NUM_PROCESSES=${NUM_PROCESSES:-1}
 PORT=${PORT:-29764}
-DS_CONFIG=${DS_CONFIG:-starVLA/config/deepseeds/deepspeed_zero2_ga4.yaml}
+DS_CONFIG=${DS_CONFIG:-starVLA/config/deepseeds/deepspeed_zero2_ga8.yaml}
 FREEZE_MODULES=${FREEZE_MODULES-}
-TRAIN_ONLY=${TRAIN_ONLY-}
+TRAIN_ONLY=${TRAIN_ONLY-}   # default set per-STAGE below (stage-1 freeze policy vs joint train-all)
 CAM_ROPE=${CAM_ROPE:-0}
-CAM_BRANCH=${CAM_BRANCH:-0}
+CAM_BRANCH=${CAM_BRANCH:-1}
 CAM_BRANCH_HEADS=${CAM_BRANCH_HEADS:-4}
 CAM_BRANCH_HEAD_DIM=${CAM_BRANCH_HEAD_DIM:-128}
 BACKPROJECT_STRIDE=${BACKPROJECT_STRIDE:-4}
 UTONIA_SCALE=${UTONIA_SCALE:-4.0}
 UTONIA_ENABLE_FLASH=${UTONIA_ENABLE_FLASH:-false}
 LOGGING_FREQUENCY=${LOGGING_FREQUENCY:-20}
+
+# STAGE dispatch (mirror run_sceneflow_cascade.sh): stage-1 learn_scene_flow (flow_only,
+# freeze action head, from-scratch) vs joint_cascade (joint action+0.1*flow, train EVERYTHING,
+# warmstart from a stage-1 flow ckpt).
+STAGE=${STAGE:-learn_scene_flow}
+case "${STAGE}" in
+  learn_scene_flow)
+    LOSS_MODE=flow_only
+    [ -n "${TRAIN_ONLY}" ] || TRAIN_ONLY=qwen_vl_interface,scene_predictor,stereo_cam_branch_layers_modules,utonia_prompt_projector
+    REQUIRE_EMPTY_PRETRAINED=1
+    ;;
+  joint_cascade)
+    LOSS_MODE=joint
+    # TRAIN_ONLY stays empty = train everything (VLM + action head + scene DiT + cam_branch + utonia_projector)
+    REQUIRE_EMPTY_PRETRAINED=0
+    ;;
+  *) echo "[guard] STAGE must be learn_scene_flow | joint_cascade, got '${STAGE}'"; exit 3 ;;
+esac
 
 case "${utonia_ckpt_path}" in
   /*) echo "[guard] UTONIA_CKPT_PATH must be relative, got '${utonia_ckpt_path}'"; exit 3 ;;
@@ -79,13 +99,14 @@ case "${run_id}" in
   *cambranch*) [ "${CAM_BRANCH}" = "1" ] || { echo "[guard] run_id says cambranch but CAM_BRANCH!=1"; exit 3; } ;;
   *) [ "${CAM_BRANCH}" = "0" ] || { echo "[guard] CAM_BRANCH=1 requires run_id containing cambranch"; exit 3; } ;;
 esac
-[ -z "${PRETRAINED_CKPT}" ] || { echo "[guard] from-scratch requires PRETRAINED_CKPT='', got '${PRETRAINED_CKPT}'"; exit 3; }
-[ -z "${FREEZE_MODULES}" ] || { echo "[guard] full finetune requires FREEZE_MODULES='', got '${FREEZE_MODULES}'"; exit 3; }
-[ -z "${TRAIN_ONLY}" ] || { echo "[guard] full finetune trains all params; TRAIN_ONLY must be empty, got '${TRAIN_ONLY}'"; exit 3; }
+if [ "${REQUIRE_EMPTY_PRETRAINED}" = "1" ]; then
+  [ -z "${PRETRAINED_CKPT}" ] || { echo "[guard] STAGE=learn_scene_flow is from-scratch: PRETRAINED_CKPT must be empty, got '${PRETRAINED_CKPT}'"; exit 3; }
+else
+  [ -z "${PRETRAINED_CKPT}" ] || [ -f "${PRETRAINED_CKPT}" ] || { echo "[preflight] STAGE=joint_cascade warmstart: PRETRAINED_CKPT set but missing: ${PRETRAINED_CKPT}"; exit 1; }
+fi
+# stage-1: TRAIN_ONLY = freeze policy; joint_cascade: TRAIN_ONLY empty = train everything.
 [ "${UTONIA_LIVE}" = "1" ] || [ -n "${UTONIA_CACHE_DIR}" ] || { echo "[guard] prompt-token comparison must use cached Utonia; set UTONIA_CACHE_DIR (or UTONIA_LIVE=1 for live FFS)"; exit 3; }
-[ "${MAX_STEPS}" = "30000" ] || { echo "[guard] fair comparison uses MAX_STEPS=30000, got '${MAX_STEPS}'"; exit 3; }
 # RELAXED 2026-06-25 (save freq不影响模型/30k对比, 低=抗A800抢占): [ "${SAVE_INTERVAL}" = "10000" ] || { echo "[guard] fair comparison uses SAVE_INTERVAL=10000, got '${SAVE_INTERVAL}'"; exit 3; }
-[ "${WARMUP_STEPS}" = "5000" ] || { echo "[guard] fair comparison uses WARMUP_STEPS=5000, got '${WARMUP_STEPS}'"; exit 3; }
 
 preflight_paths=("${ffs_model_path}" "${utonia_ckpt_path}" "${DS_CONFIG}" "${config_yaml}")
 for path in "${preflight_paths[@]}"; do
@@ -223,7 +244,11 @@ if pgrep -f "run_id ${run_id}\$" > /dev/null 2>&1 || pgrep -f "run_id ${run_id} 
 fi
 [ "${RESUME:-0}" = "1" ] && RESUME_FLAG=(--trainer.is_resume true)
 
-METHOD10_CKPT_MAX_BYTES=${METHOD10_CKPT_MAX_BYTES:-2600000000}
+# Budget raised for the scene-flow CASCADE variant: unlike plain method10 (only
+# utonia_prompt_projector trainable -> tiny ckpt), the cascade also trains+saves the
+# scene-flow DiT + cam_branch + VLM, so a valid ckpt is ~2.86GB (frozen-encoder-leak
+# check below still guards correctness). Env override still honored.
+METHOD10_CKPT_MAX_BYTES=${METHOD10_CKPT_MAX_BYTES:-4000000000}
 METHOD10_CKPT_AUDIT_POLL_SEC=${METHOD10_CKPT_AUDIT_POLL_SEC:-60}
 METHOD10_CKPT_AUDIT_STABILITY_SEC=${METHOD10_CKPT_AUDIT_STABILITY_SEC:-10}
 
@@ -367,6 +392,17 @@ CUDA_VISIBLE_DEVICES=${GPUS} ${CONDA_VENV}/accelerate launch \
   --framework.utonia_pointcloud.point_prompt "Left image point-cloud features:" \
   --framework.utonia_pointcloud.gate_init zero \
   --framework.utonia_pointcloud.utonia_cache_dir "${UTONIA_CACHE_DIR}" \
+  --framework.scene_predictor.enabled true \
+  --framework.scene_predictor.target_key flow_gt \
+  --framework.scene_predictor.tap_hidden_index 10 \
+  --framework.scene_predictor.grid_size 16 \
+  --framework.scene_predictor.z_weight 2.0 \
+  --framework.scene_predictor.detach_conditioning true \
+  --framework.scene_predictor.flow_lambda 0.1 \
+  --trainer.loss_mode ${LOSS_MODE} \
+  --datasets.vla_data.scene_flow.enabled true \
+  --datasets.vla_data.scene_flow.gt_only_sampler true \
+  --datasets.vla_data.scene_flow.expected_sidecar_to_training_flip rot180 \
   --datasets.vla_data.data_root_dir ${DATA_ROOT} \
   --datasets.vla_data.data_mix ${DATA_MIX} \
   --datasets.vla_data.per_device_batch_size $BS \

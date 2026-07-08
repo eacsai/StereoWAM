@@ -3,7 +3,7 @@
 # STATIC lambda=130 (codex-calibrated: flow grad ~1% of action grad into the shared trunk).
 # 4-suite scene-flow GT read per-suite from each dataset's meta/episode_to_sceneflow_sidecar.json
 # (wired 2026-06-16), so FLOW_INDEX is left EMPTY (single path can't serve 4 suites).
-# Authored on 4090d, transferred to /mnt/data (shared h100a/h100b). Run on h100a GPU0.
+# Authored on 4090d (canonical code source); run on an A800 GPU (GPUS overridable).
 # MAX_STEPS / RUN_ID / GPUS overridable via env (for the GPU smoke).
 set -euo pipefail
 cd "$(dirname "$0")/../.."   # repo root

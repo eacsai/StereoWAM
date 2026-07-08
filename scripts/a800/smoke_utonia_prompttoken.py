@@ -93,7 +93,7 @@ def _lazy_import_runtime() -> None:
         _utonia_geometry_meta as _cache_utonia_geometry_meta,
     )
     from starVLA.training.trainer_utils.trainer_tools import TrainerUtils as _TrainerUtils
-    from scripts.h100b.smoke_groot_ffs import (
+    from scripts.tools.smoke_groot_ffs import (
         build_framework_model as _build_framework_model,
         clone_cfg as _clone_cfg,
         grad_sum as _grad_sum,
@@ -274,7 +274,9 @@ def build_prompt_cfg(args: argparse.Namespace, ckpt_cfg, cache_dir: Path):
     update_cfg(cfg, "framework.qwenvl.stereo_cam_rope_init_mode", "zero")
     update_cfg(cfg, "framework.qwenvl.stereo_cam_rope_right_first", True)
     update_cfg(cfg, "framework.qwenvl.stereo_epipolar_mask_enabled", False)
-    update_cfg(cfg, "framework.qwenvl.stereo_cam_branch_enabled", False)
+    update_cfg(cfg, "framework.qwenvl.stereo_cam_branch_enabled", bool(args.cam_branch))
+    update_cfg(cfg, "framework.qwenvl.stereo_cam_branch_heads", int(args.cam_branch_heads))
+    update_cfg(cfg, "framework.qwenvl.stereo_cam_branch_head_dim", int(args.cam_branch_head_dim))
     update_cfg(cfg, "framework.action_model.diffusion_model_cfg.interleave_self_attention", True)
     update_cfg(cfg, "framework.utonia_pointcloud", utonia_prompt_cfg(args, cache_dir))
     update_cfg(cfg, "datasets.vla_data.data_root_dir", args.data_root)
@@ -418,6 +420,42 @@ def trainable_params(module: nn.Module) -> list[torch.nn.Parameter]:
     return [param for param in module.parameters() if param.requires_grad]
 
 
+def check_cam_branch_post_insert(model: nn.Module, args: argparse.Namespace) -> str:
+    if not args.cam_branch:
+        return "cam_branch=off"
+    cam_state = getattr(model, "_stereo_cam_branch_state", None)
+    if cam_state is None:
+        raise AssertionError("cam_branch state missing")
+    depth_state = model.get_utonia_prompt_insert_state()
+    if getattr(depth_state, "per_token_cam_id", None) is None:
+        raise AssertionError("depth token state has no post-insert per_token_cam_id")
+    if cam_state.image_positions is None:
+        raise AssertionError("cam_branch image_positions missing after post-insert refresh")
+    cam = depth_state.per_token_cam_id
+    image_mask = cam >= 0
+    flat = image_mask.nonzero(as_tuple=False)
+    bsz = int(cam.shape[0])
+    if flat.shape[0] % bsz != 0:
+        raise AssertionError(f"post-insert image token count {flat.shape[0]} not divisible by batch {bsz}")
+    expected_positions = flat[:, 1].view(bsz, flat.shape[0] // bsz).to(cam_state.image_positions.device)
+    if tuple(cam_state.image_positions.shape) != tuple(expected_positions.shape):
+        raise AssertionError(
+            f"cam_branch image_positions shape {tuple(cam_state.image_positions.shape)} "
+            f"!= expected {tuple(expected_positions.shape)}"
+        )
+    if not torch.equal(cam_state.image_positions, expected_positions):
+        raise AssertionError("cam_branch image_positions do not exactly match post-insert image-token positions")
+    insert_idx = getattr(depth_state, "insert_idx", None)
+    if insert_idx is not None:
+        for b in range(bsz):
+            lo = int(insert_idx[b].item())
+            hi = lo + int(model.num_point_tokens)
+            inside = ((cam_state.image_positions[b] >= lo) & (cam_state.image_positions[b] < hi)).any()
+            if bool(inside):
+                raise AssertionError(f"sample {b}: cam_branch position falls inside inserted token span [{lo},{hi})")
+    return f"post_insert_positions={tuple(cam_state.image_positions.shape)}"
+
+
 def run_train_steps(model: nn.Module, examples: list[dict], args: argparse.Namespace) -> str:
     model.train()
     optimizer = torch.optim.AdamW(trainable_params(model), lr=args.train_lr)
@@ -474,6 +512,7 @@ def run_fromscratch(args: argparse.Namespace, ckpt_cfg, device: torch.device) ->
     ok = True
     ok = run_check(FRAMEWORK, "singleton_projector_shape_b1", lambda: check_singleton_projector_shape(model, examples)) and ok
     ok = run_check(FRAMEWORK, "sequence_prompttoken_position_cache", lambda: check_sequence_contract(model, examples, args)) and ok
+    ok = run_check(FRAMEWORK, "cam_branch_post_insert_positions", lambda: check_cam_branch_post_insert(model, args)) and ok
     ok = run_check(FRAMEWORK, "fromscratch_finite_steps", lambda: run_train_steps(model, examples, args)) and ok
     min_hits = 1 + args.batch_size * (args.train_steps + 1)
     ok = run_check(FRAMEWORK, "cache_hit_sample_ids_path", lambda: check_cache_hit_path(model, min_hits=min_hits)) and ok
@@ -502,6 +541,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--loss-seed", type=int, default=123)
     parser.add_argument("--zero-atol", type=float, default=1e-7)
     parser.add_argument("--cam-rope", action="store_true")
+    parser.add_argument("--cam-branch", action="store_true")
+    parser.add_argument("--cam-branch-heads", type=int, default=4)
+    parser.add_argument("--cam-branch-head-dim", type=int, default=128)
     return parser.parse_args()
 
 

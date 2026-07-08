@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Full Utonia Version-A offline-cache precompute (4 LIBERO stereo suites -> ~49GB fp16).
-# Runs on h100b GPU1 (freed from the stopped random perpatch). FRESH cache dir (no resume
+# Runs on an A800 GPU (CUDA_VISIBLE_DEVICES overridable). FRESH cache dir (no resume
 # across config changes — avoids the H1 stale-resume footgun). Launched in a detached tmux.
 set -uo pipefail
 cd /home/wangqiwei/ICLR2026/starVLA
@@ -13,7 +13,7 @@ echo "[precompute] start $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "[precompute] df before:"
 df -h playground/Datasets | tail -2
 
-/home/wangqiwei/ICLR2026/starVLA/.venv/bin/python scripts/a800/precompute_utonia_cache.py \
+/home/wangqiwei/ICLR2026/starVLA/.venv/bin/python scripts/tools/precompute_utonia_cache.py \
   --cache-dir playground/Datasets/utonia_cache_perpatch \
   --suites all \
   --data-root playground/Datasets/LEROBOT_LIBERO_OURRENDER_PW \
