@@ -279,3 +279,8 @@ SSF/libero_sim_env/
 
 # backup snapshots (never commit)
 *.bak*
+
+# Codex continuation entry points must remain visible in fresh clones.
+# They intentionally override the broad Markdown ignores above.
+!AGENTS.md
+!docs/CODEX_PROJECT_RECOVERY.md
