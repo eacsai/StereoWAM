@@ -27,7 +27,14 @@ export NCCL_ASYNC_ERROR_HANDLING=1
 export WANDB_MODE=disabled
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-cd "${REPO_DIR:-/home/wangqiwei/ICLR2026/starVLA}"        # a800 default; REPO_DIR=/data/wangqiwei/ICLR2026/starVLA on 4090d
+if [ -z "${REPO_DIR:-}" ]; then
+  if [ -f "./starVLA/training/train_starvla.py" ]; then
+    REPO_DIR=$(pwd)                                      # safe when launched from the authoritative repo
+  else
+    REPO_DIR=/home/wangqiwei/ICLR2026/starVLA            # a800 default fallback
+  fi
+fi
+cd "${REPO_DIR}"
 export PYTHONPATH=$(pwd):${PYTHONPATH:-}
 
 CONDA_VENV=${CONDA_VENV:-$(pwd)/.venv/bin}
@@ -97,15 +104,85 @@ PORT=${PORT:-29775}
 DS_CONFIG=${DS_CONFIG:-starVLA/config/deepseeds/deepspeed_zero2_ga8.yaml}
 LOGGING_FREQUENCY=${LOGGING_FREQUENCY:-20}
 
+_bool01() {
+  case "${1:-0}" in
+    1|true|TRUE|yes|YES|y|Y|on|ON) echo 1 ;;
+    0|false|FALSE|no|NO|n|N|off|OFF|"") echo 0 ;;
+    *) echo "[guard] $2 must be boolean-like, got '$1'" >&2; exit 3 ;;
+  esac
+}
+PAST_FLOW=$(_bool01 "${PAST_FLOW:-0}" PAST_FLOW)
+PAST_FLOW_FULL_INJECT=$(_bool01 "${PAST_FLOW_FULL_INJECT:-0}" PAST_FLOW_FULL_INJECT)
+PAST_FLOW_K=${PAST_FLOW_K:-2}
+PAST_FLOW_DELTA=${PAST_FLOW_DELTA:-1}
+PAST_FLOW_DROPOUT=${PAST_FLOW_DROPOUT:-0.3}
+PAST_FLOW_NOISE=${PAST_FLOW_NOISE:-0.0}
+
+# ---- dynamic-token focus knobs (default no-op) ----
+DYNAMIC_LOSS_WEIGHT=${DYNAMIC_LOSS_WEIGHT:-1.0}
+STATIC_ZERO_LOSS_WEIGHT=${STATIC_ZERO_LOSS_WEIGHT:-0.0}
+DYNAMIC_DIRECTION_LOSS_WEIGHT=${DYNAMIC_DIRECTION_LOSS_WEIGHT:-0.0}
+DYNAMIC_MAGNITUDE_LOSS_WEIGHT=${DYNAMIC_MAGNITUDE_LOSS_WEIGHT:-0.0}
+DIRECTION_LOSS_EPS=${DIRECTION_LOSS_EPS:-1e-6}
+CONDITIONING_PAST_MOTION_GATE=$(_bool01 "${CONDITIONING_PAST_MOTION_GATE:-0}" CONDITIONING_PAST_MOTION_GATE)
+CONDITIONING_STATIC_SCALE=${CONDITIONING_STATIC_SCALE:-1.0}
+CONDITIONING_MOTION_THRESHOLD=${CONDITIONING_MOTION_THRESHOLD:-1e-5}
+
 # ---- fail-closed guards ----
 [ "${FRAMEWORK}" = "QwenGR00T" ] || { echo "[guard] cascade requires FRAMEWORK=QwenGR00T"; exit 3; }
 case "${TARGET_KEY}" in flow_gt|pointmap_gt) ;; *) echo "[guard] TARGET_KEY must be flow_gt | pointmap_gt, got '${TARGET_KEY}'"; exit 3 ;; esac
 case "${LOSS_MODE}" in flow_only|joint) ;; *) echo "[guard] LOSS_MODE derivation bug: '${LOSS_MODE}'"; exit 3 ;; esac
+if [ "${CONDITIONING_PAST_MOTION_GATE}" = "1" ] && [ "${PAST_FLOW}" != "1" ]; then
+  echo "[guard] CONDITIONING_PAST_MOTION_GATE=1 requires PAST_FLOW=1 (gate is based on historical past flow)"; exit 3
+fi
+"${CONDA_VENV}/python" - <<PY
+import math
+try:
+    dyn = float("${DYNAMIC_LOSS_WEIGHT}")
+    stat = float("${STATIC_ZERO_LOSS_WEIGHT}")
+    direction = float("${DYNAMIC_DIRECTION_LOSS_WEIGHT}")
+    magnitude = float("${DYNAMIC_MAGNITUDE_LOSS_WEIGHT}")
+    direction_eps = float("${DIRECTION_LOSS_EPS}")
+    scale = float("${CONDITIONING_STATIC_SCALE}")
+    thresh = float("${CONDITIONING_MOTION_THRESHOLD}")
+except ValueError as exc:
+    raise SystemExit(f"[guard] dynamic-focus knob must be numeric: {exc}")
+for name, value in (
+    ("DYNAMIC_LOSS_WEIGHT", dyn),
+    ("STATIC_ZERO_LOSS_WEIGHT", stat),
+    ("DYNAMIC_DIRECTION_LOSS_WEIGHT", direction),
+    ("DYNAMIC_MAGNITUDE_LOSS_WEIGHT", magnitude),
+    ("DIRECTION_LOSS_EPS", direction_eps),
+    ("CONDITIONING_STATIC_SCALE", scale),
+    ("CONDITIONING_MOTION_THRESHOLD", thresh),
+):
+    if not math.isfinite(value):
+        raise SystemExit(f"[guard] {name} must be finite")
+if dyn < 0 or stat < 0 or direction < 0 or magnitude < 0 or direction_eps < 0:
+    raise SystemExit("[guard] scene-flow loss weights and DIRECTION_LOSS_EPS must be non-negative")
+if dyn == 0 and stat == 0 and direction == 0 and magnitude == 0:
+    raise SystemExit("[guard] at least one scene-flow loss weight must be > 0")
+if not (0.0 <= scale <= 1.0):
+    raise SystemExit("[guard] CONDITIONING_STATIC_SCALE must be in [0, 1]")
+if thresh < 0:
+    raise SystemExit("[guard] CONDITIONING_MOTION_THRESHOLD must be non-negative")
+if "${TARGET_KEY}" != "flow_gt" and (stat > 0 or direction > 0 or magnitude > 0 or "${CONDITIONING_PAST_MOTION_GATE}" == "1"):
+    raise SystemExit("[guard] dynamic-token focus/static-zero/aux losses/past-motion gate are only supported for TARGET_KEY=flow_gt")
+PY
 if [ "${REQUIRE_WARMSTART}" = "1" ]; then
   [ -n "${PRETRAINED_CKPT}" ] || { echo "[guard] STAGE=flow_predictor_only FREEZES the VLM -> requires PRETRAINED_CKPT (a pretrained/plain stage-0 ckpt). From-scratch is meaningless here (frozen random VLM). Use STAGE=joint_cascade for from-scratch."; exit 3; }
 fi
 [ -z "${PRETRAINED_CKPT}" ] || [ -f "${PRETRAINED_CKPT}" ] || { echo "[preflight] PRETRAINED_CKPT set but missing: ${PRETRAINED_CKPT}"; exit 1; }
 case "${run_id}" in *cambranch*) [ "${CAM_BRANCH}" = "1" ] || { echo "[guard] run_id says cambranch but CAM_BRANCH!=1"; exit 3; } ;; esac
+if [ "${PAST_FLOW_FULL_INJECT}" = "1" ]; then
+  [ "${PAST_FLOW}" = "1" ] || { echo "[guard] PAST_FLOW_FULL_INJECT=1 requires PAST_FLOW=1"; exit 3; }
+  case "${STAGE}" in learn_scene_flow|joint_cascade) ;; *) echo "[guard] PAST_FLOW_FULL_INJECT=1 is allowed only for STAGE=learn_scene_flow or joint_cascade"; exit 3 ;; esac
+  case "${run_id}" in *fullinject*) ;; *) echo "[guard] PAST_FLOW_FULL_INJECT=1 requires run_id to contain fullinject"; exit 3 ;; esac
+fi
+case "${run_id}" in *fullinject*)
+  [ "${PAST_FLOW}" = "1" ] && [ "${PAST_FLOW_FULL_INJECT}" = "1" ] || { echo "[guard] run_id says fullinject but PAST_FLOW/PAST_FLOW_FULL_INJECT are not both enabled"; exit 3; }
+  ;;
+esac
 # staticgeom twin needs the current-pointmap sidecars; refuse until they exist (GAP #2)
 if [ "${TARGET_KEY}" = "pointmap_gt" ] && [ "${ALLOW_MISSING_POINTMAP_GT:-0}" != "1" ]; then
   echo "[guard] TARGET_KEY=pointmap_gt needs current-pointmap GT sidecars (not yet generated). Set ALLOW_MISSING_POINTMAP_GT=1 to override once they exist."; exit 3
@@ -143,11 +220,6 @@ if pgrep -f "run_id ${run_id}\$" >/dev/null 2>&1 || pgrep -f "run_id ${run_id} "
 # config into BOTH the model (framework.scene_predictor) and dataloader (datasets.vla_data.
 # scene_flow) namespaces. K=n_past_steps, DELTA=one-step-flow spacing, DROPOUT/NOISE = the
 # train/infer-gap defenses (past-flow dropout + noise-aug). ---
-PAST_FLOW=${PAST_FLOW:-0}
-PAST_FLOW_K=${PAST_FLOW_K:-2}
-PAST_FLOW_DELTA=${PAST_FLOW_DELTA:-1}
-PAST_FLOW_DROPOUT=${PAST_FLOW_DROPOUT:-0.3}
-PAST_FLOW_NOISE=${PAST_FLOW_NOISE:-0.0}
 PAST_FLOW_ARGS=()
 if [ "${PAST_FLOW}" = "1" ]; then
   PAST_FLOW_ARGS=(
@@ -156,6 +228,7 @@ if [ "${PAST_FLOW}" = "1" ]; then
     --framework.scene_predictor.past_flow_controlnet.spacing_delta ${PAST_FLOW_DELTA}
     --framework.scene_predictor.past_flow_controlnet.dropout_p ${PAST_FLOW_DROPOUT}
     --framework.scene_predictor.past_flow_controlnet.noise_aug_std ${PAST_FLOW_NOISE}
+    --framework.scene_predictor.past_flow_controlnet.full_injection $([ "${PAST_FLOW_FULL_INJECT}" = 1 ] && echo true || echo false)
     --datasets.vla_data.scene_flow.past_flow_controlnet.enabled true
     --datasets.vla_data.scene_flow.past_flow_controlnet.n_past_steps ${PAST_FLOW_K}
     --datasets.vla_data.scene_flow.past_flow_controlnet.spacing_delta ${PAST_FLOW_DELTA}
@@ -173,7 +246,8 @@ if [ "${MAX_STEPS}" -ge 1000 ] && [ "${EFFECTIVE_BATCH}" != "128" ]; then
   echo "[guard] real run wants effective batch 128, got ${EFFECTIVE_BATCH} (BS=$BS NUM_PROCESSES=$NUM_PROCESSES GA=$DS_GA). Set BATCH knobs or MAX_STEPS<1000 for a smoke."; exit 3
 fi
 
-echo "[launch] SCENE-FLOW CASCADE | STAGE=${STAGE} arm=${_arm}(${TARGET_KEY}) loss_mode=${LOSS_MODE} tap=${TAP_HIDDEN_INDEX} detach=${DETACH_CONDITIONING} lambda=${FLOW_LAMBDA}"
+echo "[launch] SCENE-FLOW CASCADE | STAGE=${STAGE} arm=${_arm}(${TARGET_KEY}) loss_mode=${LOSS_MODE} tap=${TAP_HIDDEN_INDEX} detach=${DETACH_CONDITIONING} lambda=${FLOW_LAMBDA} past_flow_full_inject=${PAST_FLOW_FULL_INJECT}"
+echo "[launch] dynamic_focus dyn_w=${DYNAMIC_LOSS_WEIGHT} static_zero_w=${STATIC_ZERO_LOSS_WEIGHT} dir_w=${DYNAMIC_DIRECTION_LOSS_WEIGHT} mag_w=${DYNAMIC_MAGNITUDE_LOSS_WEIGHT} dir_eps=${DIRECTION_LOSS_EPS} past_motion_gate=${CONDITIONING_PAST_MOTION_GATE} static_scale=${CONDITIONING_STATIC_SCALE} motion_thresh=${CONDITIONING_MOTION_THRESHOLD}"
 echo "[launch] warmstart='${PRETRAINED_CKPT:-<from-scratch>}' TRAIN_ONLY='${TRAIN_ONLY}' FREEZE_MODULES='${FREEZE_MODULES}' cam_branch=${CAM_BRANCH_BOOL}"
 echo "[launch] BS=$BS x $NUM_PROCESSES GPU x GA${DS_GA} = eff_${EFFECTIVE_BATCH} | MAX_STEPS=$MAX_STEPS save=$SAVE_INTERVAL warmup=$WARMUP_STEPS | run_id=$run_id"
 
@@ -203,6 +277,14 @@ CUDA_VISIBLE_DEVICES=${GPUS} ${CONDA_VENV}/accelerate launch \
   --framework.scene_predictor.tap_hidden_index ${TAP_HIDDEN_INDEX} \
   --framework.scene_predictor.grid_size ${GRID_SIZE} \
   --framework.scene_predictor.z_weight ${Z_WEIGHT} \
+  --framework.scene_predictor.dynamic_loss_weight ${DYNAMIC_LOSS_WEIGHT} \
+  --framework.scene_predictor.static_zero_loss_weight ${STATIC_ZERO_LOSS_WEIGHT} \
+  --framework.scene_predictor.dynamic_direction_loss_weight ${DYNAMIC_DIRECTION_LOSS_WEIGHT} \
+  --framework.scene_predictor.dynamic_magnitude_loss_weight ${DYNAMIC_MAGNITUDE_LOSS_WEIGHT} \
+  --framework.scene_predictor.direction_loss_eps ${DIRECTION_LOSS_EPS} \
+  --framework.scene_predictor.conditioning_past_motion_gate $([ "${CONDITIONING_PAST_MOTION_GATE}" = 1 ] && echo true || echo false) \
+  --framework.scene_predictor.conditioning_static_scale ${CONDITIONING_STATIC_SCALE} \
+  --framework.scene_predictor.conditioning_motion_threshold ${CONDITIONING_MOTION_THRESHOLD} \
   --framework.scene_predictor.detach_conditioning ${DETACH_CONDITIONING} \
   --framework.scene_predictor.flow_lambda ${FLOW_LAMBDA} \
   --datasets.vla_data.scene_flow.enabled true \

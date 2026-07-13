@@ -1071,22 +1071,26 @@ class VLATrainer(TrainerUtils):
                     total_loss = action_loss + flow_weight * flow_loss
                 elif self._scene_predictor_enabled():
                     # Scene-flow dual-DiT cascade (independent of the legacy aux path).
-                    sup_cells = output_dict.get("flow_supervised_cells", None)
+                    sup_cells = output_dict.get(
+                        "flow_effective_cells",
+                        output_dict.get("flow_weighted_cells", output_dict.get("flow_supervised_cells", None)),
+                    )
                     if self._loss_mode() == "flow_only":
                         if flow_loss is None:
                             raise RuntimeError(
                                 "loss_mode=flow_only but forward returned no flow_loss "
                                 "(scene_predictor stage-1 needs flow GT in the batch)."
                             )
-                        # Zero-supervision guard (review H2): an all-empty mask makes
-                        # flow_loss==0 -> silent no-op training. Refuse. NOTE flow_only
-                        # assumes the action head is FROZEN via freeze_modules (else its
-                        # params get no grad -> DeepSpeed/DDP unused-param hang; review M3).
+                        # Zero-effective-supervision guard (review H2): an all-empty mask makes
+                        # flow_loss==0 -> silent no-op training. For dynamic-focused stage1,
+                        # static-zero regularization is valid supervision, so prefer the weighted
+                        # cell count when the scene head provides it. NOTE flow_only assumes the
+                        # action head is FROZEN via freeze_modules (else unused-param hangs).
                         if sup_cells is not None and float(sup_cells) <= 0:
                             raise RuntimeError(
-                                "loss_mode=flow_only but the batch has ZERO supervised scene "
-                                "cells (empty masks / flow_has_gt all False). Check GT sidecars / "
-                                "gt_only_sampler; refusing a no-op step."
+                                "loss_mode=flow_only but the batch has ZERO effective scene "
+                                "supervision cells (empty masks / flow_has_gt all False / zero loss weights). "
+                                "Check GT sidecars, gt_only_sampler, and scene-flow loss weights; refusing a no-op step."
                             )
                         total_loss = flow_loss
                     elif flow_loss is not None:
@@ -1158,6 +1162,22 @@ class VLATrainer(TrainerUtils):
             _sc = output_dict.get("flow_supervised_cells", None)
             if torch.is_tensor(_sc):
                 metrics["scene_predictor/supervised_cells"] = _sc.item()
+            for key in (
+                "flow_dynamic_cells",
+                "flow_static_zero_cells",
+                "flow_weighted_cells",
+                "flow_effective_cells",
+                "flow_fm_loss",
+                "flow_dynamic_loss",
+                "flow_static_zero_loss",
+                "flow_direction_loss",
+                "flow_magnitude_loss",
+            ):
+                value = output_dict.get(key, None)
+                if torch.is_tensor(value):
+                    value = value.item()
+                if value is not None:
+                    metrics[f"scene_predictor/{key}"] = value
         if self._scene_flow_online_grad_norm_enabled():
             metrics.update(self._scene_flow_online_state_metrics())
             metrics.update(online_gradnorm_metrics)

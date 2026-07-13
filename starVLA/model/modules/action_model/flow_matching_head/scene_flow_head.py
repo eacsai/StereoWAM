@@ -19,6 +19,8 @@ so its extraction forward consumes no RNG (step-0 identity; belt-and-suspenders
 with the framework's torch.random.fork_rng around extraction).
 """
 
+import math
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -38,6 +40,21 @@ def _cfg_get(cfg, key, default):
     if isinstance(cfg, dict):
         return cfg.get(key, default)
     return getattr(cfg, key, default)
+
+
+def _cfg_bool(cfg, key, default=False):
+    value = _cfg_get(cfg, key, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in {"1", "true", "yes", "y", "on"}:
+            return True
+        if v in {"0", "false", "no", "n", "off", ""}:
+            return False
+    raise ValueError(f"{key} must be boolean-like, got {value!r}")
 
 
 class FieldEncoder(nn.Module):
@@ -101,11 +118,12 @@ class SceneFieldMatchingHead(nn.Module):
         # Reuse the DiT's built-in zero-init MotionCoupler by giving THIS scene DiT a
         # motion_coupler_dim and feeding the encoded last-K past flow fields as motion_hidden.
         pf_cfg = _cfg_get(cfg, "past_flow_controlnet", {}) or {}
-        self.past_flow_enabled = bool(_cfg_get(pf_cfg, "enabled", False))
+        self.past_flow_enabled = _cfg_bool(pf_cfg, "enabled", False)
         self.n_past_steps = int(_cfg_get(pf_cfg, "n_past_steps", 2))
         self.past_flow_spacing = int(_cfg_get(pf_cfg, "spacing_delta", 1))
         self.past_flow_dropout_p = float(_cfg_get(pf_cfg, "dropout_p", 0.0))
         self.past_flow_noise_std = float(_cfg_get(pf_cfg, "noise_aug_std", 0.0))
+        self.past_flow_full_injection = _cfg_bool(pf_cfg, "full_injection", False)
         self.past_flow_key = str(_cfg_get(pf_cfg, "past_key", "past_flow_gt"))
         self.past_valid_key = str(_cfg_get(pf_cfg, "past_valid_key", "past_flow_valid"))
         self.has_past_key = str(_cfg_get(pf_cfg, "has_past_key", "has_past_flow"))
@@ -126,6 +144,7 @@ class SceneFieldMatchingHead(nn.Module):
         # = input_embedding_dim, matching PastFlowEncoder output). No-op when past_flow disabled.
         if self.past_flow_enabled:
             diffusion_model_cfg["motion_coupler_dim"] = self.input_embedding_dim
+            diffusion_model_cfg["motion_coupler_zero_init"] = not self.past_flow_full_injection
         self.model = DiT(**diffusion_model_cfg)
 
         self.grid_size = int(_cfg_get(cfg, "grid_size", 16))
@@ -168,6 +187,44 @@ class SceneFieldMatchingHead(nn.Module):
         self.valid_key = str(_cfg_get(cfg, "valid_key", "flow_valid"))
         self.dynamic_key = str(_cfg_get(cfg, "dynamic_key", "flow_dynamic"))
         self.dynamic_fallback_to_valid = bool(_cfg_get(cfg, "dynamic_fallback_to_valid", True))
+        self.dynamic_loss_weight = float(_cfg_get(cfg, "dynamic_loss_weight", 1.0))
+        self.static_zero_loss_weight = float(_cfg_get(cfg, "static_zero_loss_weight", 0.0))
+        # Optional dynamic-only target-space auxiliaries. The base flow-matching loss
+        # supervises velocity (target - noise); these estimate x1 from the current
+        # noised field and predicted velocity, then compare direction/magnitude to
+        # the true scene-flow target on dynamic cells only.
+        self.dynamic_direction_loss_weight = float(_cfg_get(cfg, "dynamic_direction_loss_weight", 0.0))
+        self.dynamic_magnitude_loss_weight = float(_cfg_get(cfg, "dynamic_magnitude_loss_weight", 0.0))
+        self.direction_loss_eps = float(_cfg_get(cfg, "direction_loss_eps", 1e-6))
+        for _name, _value in (
+            ("dynamic_loss_weight", self.dynamic_loss_weight),
+            ("static_zero_loss_weight", self.static_zero_loss_weight),
+            ("dynamic_direction_loss_weight", self.dynamic_direction_loss_weight),
+            ("dynamic_magnitude_loss_weight", self.dynamic_magnitude_loss_weight),
+            ("direction_loss_eps", self.direction_loss_eps),
+        ):
+            if not math.isfinite(_value) or _value < 0:
+                raise ValueError(f"{_name} must be finite and non-negative")
+        if (
+            self.dynamic_loss_weight == 0
+            and self.static_zero_loss_weight == 0
+            and self.dynamic_direction_loss_weight == 0
+            and self.dynamic_magnitude_loss_weight == 0
+        ):
+            raise ValueError(
+                "at least one scene-flow loss weight must be > 0 "
+                "(dynamic/static_zero/direction/magnitude)"
+            )
+
+        # Optional non-leaky action-conditioning gate: use historical past-flow motion only,
+        # never current/future flow_dynamic from the supervision target.
+        self.conditioning_past_motion_gate = _cfg_bool(cfg, "conditioning_past_motion_gate", False)
+        self.conditioning_static_scale = float(_cfg_get(cfg, "conditioning_static_scale", 1.0))
+        self.conditioning_motion_threshold = float(_cfg_get(cfg, "conditioning_motion_threshold", 1e-5))
+        if not math.isfinite(self.conditioning_static_scale) or not (0.0 <= self.conditioning_static_scale <= 1.0):
+            raise ValueError("conditioning_static_scale must be finite and in [0, 1]")
+        if not math.isfinite(self.conditioning_motion_threshold) or self.conditioning_motion_threshold < 0:
+            raise ValueError("conditioning_motion_threshold must be finite and non-negative")
 
         # deterministic extraction policy (must match train + eval + predict_action)
         self.tap_hidden_index = int(_cfg_get(cfg, "tap_hidden_index", 10))
@@ -218,6 +275,51 @@ class SceneFieldMatchingHead(nn.Module):
             no_dyn = sup.flatten(1).any(dim=1).logical_not()  # (B,)
             sup = torch.where(no_dyn.view(-1, 1, 1, 1), valid, sup)
         return sup
+
+    def _past_motion_token_gate(self, batch, device, batch_size):
+        """Return (B,N,1) token gate from historical past-flow motion, or None when disabled.
+
+        This gate is used only for action conditioning. It intentionally reads only
+        past-flow keys, never the current/future `flow_dynamic` supervision mask.
+        """
+        if not self.conditioning_past_motion_gate:
+            return None
+        base = torch.full(
+            (batch_size, self.num_tokens),
+            float(self.conditioning_static_scale),
+            device=device,
+            dtype=torch.float32,
+        )
+        if batch is None or self.past_flow_key not in batch:
+            return base.unsqueeze(-1)
+
+        past = batch[self.past_flow_key].to(device).float()  # (B,K,3,H,W) or (B,K,3,g,g)
+        if past.shape[0] != batch_size:
+            raise ValueError(f"past-flow batch size {past.shape[0]} != vl batch size {batch_size}")
+        valid = batch.get(self.past_valid_key, None)
+        moving = torch.zeros(batch_size, self.num_tokens, device=device, dtype=torch.bool)
+        for k in range(past.shape[1]):
+            fk = past[:, k]
+            if valid is not None:
+                vk = valid[:, k].to(device).float()
+                if vk.dim() == 3:
+                    vk = vk.unsqueeze(1)
+                pk, mk = self._pool_target(fk, vk)
+            else:
+                pk = F.adaptive_avg_pool2d(
+                    torch.nan_to_num(fk, nan=0.0, posinf=0.0, neginf=0.0),
+                    (self.grid_size, self.grid_size),
+                )
+                mk = torch.ones(batch_size, 1, self.grid_size, self.grid_size, device=device, dtype=torch.bool)
+            pk_flat = pk.flatten(2).permute(0, 2, 1).contiguous()
+            mk_flat = mk.reshape(batch_size, -1).bool()
+            moving = moving | (mk_flat & (pk_flat.norm(dim=-1) > self.conditioning_motion_threshold))
+
+        if self.has_past_key in batch:
+            has_past = batch[self.has_past_key].to(device).bool().view(batch_size, 1)
+            moving = moving & has_past
+        gate = torch.where(moving, torch.ones_like(base), base)
+        return gate.unsqueeze(-1)
 
     def _encode_past_flow(self, batch, device, training_aug=True):
         """Encode the last-K past flow fields -> (motion_hidden (B,K*N,D), gate (B,1,1)).
@@ -287,13 +389,43 @@ class SceneFieldMatchingHead(nn.Module):
 
         target_grid, valid_grid = self._pool_target(field_gt.to(device), valid.to(device))
         dyn_grid = None
+        dyn_any_grid = None
         if dynamic is not None:
-            dyn_grid = F.adaptive_avg_pool2d(dynamic.float().to(device), (self.grid_size, self.grid_size)) > 0.5
+            dyn_ratio = F.adaptive_avg_pool2d(dynamic.float().to(device), (self.grid_size, self.grid_size))
+            dyn_grid = dyn_ratio > 0.5
+            # Static-zero regularization must not touch mixed/boundary dynamic cells.
+            dyn_any_grid = dyn_ratio > 0.0
+        elif (
+            self.static_zero_loss_weight > 0
+            or self.dynamic_direction_loss_weight > 0
+            or self.dynamic_magnitude_loss_weight > 0
+        ):
+            raise RuntimeError(
+                "dynamic-focused scene-flow losses require the batch key "
+                f"'{self.dynamic_key}' (needed to distinguish dynamic vs static cells)."
+            )
         sup = self._supervision_mask(valid_grid, dyn_grid)  # (B,1,g,g)
+        raw_dynamic_sup = torch.zeros_like(valid_grid, dtype=torch.bool) if dyn_grid is None else (dyn_grid & valid_grid)
+        flow_has_gt_grid = None
         if "flow_has_gt" in batch:  # dummy no-GT samples carry zero flow_gt -> don't supervise (review H2)
-            sup = sup & batch["flow_has_gt"].to(sup.device).view(-1, 1, 1, 1)
+            flow_has_gt_grid = batch["flow_has_gt"].to(sup.device).view(-1, 1, 1, 1)
+            sup = sup & flow_has_gt_grid
+            raw_dynamic_sup = raw_dynamic_sup & flow_has_gt_grid
 
-        target = target_grid.flatten(2).permute(0, 2, 1).contiguous()  # (B,N,3)
+        static_zero = None
+        target_for_fm = target_grid
+        if self.static_zero_loss_weight > 0 and dyn_any_grid is not None:
+            static_zero = valid_grid & (~dyn_any_grid)
+            if flow_has_gt_grid is not None:
+                static_zero = static_zero & flow_has_gt_grid
+            if static_zero.any():
+                target_for_fm = torch.where(
+                    static_zero.expand(-1, self.field_dim, -1, -1),
+                    torch.zeros_like(target_grid),
+                    target_grid,
+                )
+
+        target = target_for_fm.flatten(2).permute(0, 2, 1).contiguous()  # (B,N,3)
         noise = torch.randn_like(target)
         t = self.sample_time(target.shape[0], target.device, target.dtype)[:, None, None]
         noised = (1 - t) * noise + t * target
@@ -320,14 +452,75 @@ class SceneFieldMatchingHead(nn.Module):
             ch_w = torch.ones(self.field_dim, device=pv.device, dtype=pv.dtype)
             ch_w[-1] = self.z_weight  # z = last channel (camera-frame XYZ)
             diff = diff * ch_w.view(1, 1, -1)
-            m = sup.reshape(sup.shape[0], -1, 1).float()  # (B,N,1)
-            supervised_cells = sup.sum()  # for the trainer's flow_only zero-supervision guard (H2)
-            denom = (m.sum() * float(self.field_dim)).clamp(min=1.0)
-            loss = (diff * m).sum() / denom
+
+            dyn_m = sup.reshape(sup.shape[0], -1, 1).float()  # (B,N,1), may fallback to valid by config
+            aux_dyn_m = raw_dynamic_sup.reshape(raw_dynamic_sup.shape[0], -1, 1).float()  # true dynamic only
+            static_m = torch.zeros_like(dyn_m)
+            if static_zero is not None:
+                static_m = static_zero.reshape(static_zero.shape[0], -1, 1).float()
+            weights = dyn_m * float(self.dynamic_loss_weight) + static_m * float(self.static_zero_loss_weight)
+            supervised_cells = sup.sum()  # dynamic-only guard for flow_only no-op protection
+            weighted_cells = weights.sum()
+            aux_enabled = (self.dynamic_direction_loss_weight > 0) or (self.dynamic_magnitude_loss_weight > 0)
+            aux_cells = aux_dyn_m.sum() if aux_enabled else weighted_cells.detach() * 0.0
+            effective_cells = weighted_cells + aux_cells
+            if supervised_cells.item() > 0 and effective_cells.item() <= 0:
+                raise RuntimeError(
+                    "scene-flow loss has dynamic supervised cells but zero effective loss weight; "
+                    "check dynamic/static_zero/direction/magnitude loss weights"
+                )
+            zero = diff.sum() * 0.0
+
+            def _masked_mean(mask):
+                denom_i = (mask.sum() * float(self.field_dim)).clamp(min=1.0)
+                return (diff * mask).sum() / denom_i
+
+            dyn_loss = _masked_mean(dyn_m) if dyn_m.sum().item() > 0 else zero
+            static_loss = _masked_mean(static_m) if static_m.sum().item() > 0 else zero
+            fm_loss = float(self.dynamic_loss_weight) * dyn_loss + float(self.static_zero_loss_weight) * static_loss
+
+            direction_loss = zero
+            magnitude_loss = zero
+            if aux_enabled and aux_dyn_m.sum().item() > 0:
+                pred_target = noised.float() + (1.0 - t.float()) * pv
+                target_f = target.float()
+                dyn_bool = aux_dyn_m.squeeze(-1).bool()
+                target_norm = target_f.norm(dim=-1)
+                pred_norm = pred_target.norm(dim=-1)
+                motion_bool = dyn_bool & (target_norm > self.direction_loss_eps)
+                if self.dynamic_direction_loss_weight > 0 and motion_bool.any().item():
+                    cos = F.cosine_similarity(
+                        pred_target[motion_bool],
+                        target_f[motion_bool],
+                        dim=-1,
+                        eps=self.direction_loss_eps,
+                    )
+                    direction_loss = (1.0 - cos).mean()
+                if self.dynamic_magnitude_loss_weight > 0 and dyn_bool.any().item():
+                    magnitude_loss = F.smooth_l1_loss(
+                        pred_norm[dyn_bool],
+                        target_norm[dyn_bool],
+                        reduction="mean",
+                        beta=self.smooth_l1_beta,
+                    )
+            loss = (
+                fm_loss
+                + float(self.dynamic_direction_loss_weight) * direction_loss
+                + float(self.dynamic_magnitude_loss_weight) * magnitude_loss
+            )
         return {
             "flow_loss": loss,
             "field_pred_velocity": pred_v.detach(),
             "flow_supervised_cells": supervised_cells.detach(),
+            "flow_dynamic_cells": raw_dynamic_sup.sum().detach(),
+            "flow_static_zero_cells": static_m.sum().detach(),
+            "flow_weighted_cells": weighted_cells.detach(),
+            "flow_effective_cells": effective_cells.detach(),
+            "flow_fm_loss": fm_loss.detach(),
+            "flow_dynamic_loss": dyn_loss.detach(),
+            "flow_static_zero_loss": static_loss.detach(),
+            "flow_direction_loss": direction_loss.detach(),
+            "flow_magnitude_loss": magnitude_loss.detach(),
         }
 
     # -------------------------------------------------- conditioning extraction
@@ -359,6 +552,9 @@ class SceneFieldMatchingHead(nn.Module):
                 motion_gate=_pf_gate,
             )
         hidden = all_hidden[self.tap_hidden_index]  # (B, N, D)
+        token_gate = self._past_motion_token_gate(past_flow_batch, vl_embs.device, B)
+        if token_gate is not None:
+            hidden = hidden * token_gate.to(device=hidden.device, dtype=hidden.dtype)
         return hidden.detach() if self.detach_conditioning else hidden
 
     @torch.no_grad()

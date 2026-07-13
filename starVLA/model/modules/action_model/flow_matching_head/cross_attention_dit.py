@@ -28,6 +28,20 @@ from diffusers.models.embeddings import (
 from torch import nn
 
 
+def _as_bool(value, name):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in {"1", "true", "yes", "y", "on"}:
+            return True
+        if v in {"0", "false", "no", "n", "off", ""}:
+            return False
+    raise ValueError(f"{name} must be boolean-like, got {value!r}")
+
+
 class TimestepEncoder(nn.Module):
     def __init__(self, embedding_dim, compute_dtype=torch.float32):
         super().__init__()
@@ -186,18 +200,19 @@ class BasicTransformerBlock(nn.Module):
 
 
 class MotionCoupler(nn.Module):
-    """Zero-init gated cross-attention that injects a DETACHED external "motion"
-    hidden (from a separate scene-flow DiT) into the action DiT, as a residual.
+    """Gated cross-attention that injects an external "motion" hidden as a residual.
 
-    Design (spec §4, round-2 N1/N4):
+    Default design (spec section 4, round-2 N1/N4):
     - dropout forced to 0.0 so the branch consumes NO RNG (train-mode step-0 identity).
     - a zero-initialized final Linear (`zero_proj`) is the LAST op before the residual
       add, so at init this path outputs exactly 0 -> enabling the coupler is
       byte-identical to baseline at step 0.
-    - keep it a clean side module (not an attn1 wrapper), so trunk keys are untouched.
+    - for explicit ablations, `zero_init=False` bypasses the zero projection and injects
+      the attention output directly. This is intentionally unsafe for baseline identity and
+      should only be used for controlled experiments such as past-flow full injection.
     """
 
-    def __init__(self, dim, motion_dim, num_attention_heads, attention_head_dim, norm_eps=1e-5):
+    def __init__(self, dim, motion_dim, num_attention_heads, attention_head_dim, norm_eps=1e-5, zero_init=True):
         super().__init__()
         self.norm = nn.LayerNorm(dim, eps=norm_eps, elementwise_affine=True)
         self.attn = Attention(
@@ -209,9 +224,13 @@ class MotionCoupler(nn.Module):
             bias=False,
             out_bias=True,
         )
-        self.zero_proj = nn.Linear(dim, dim)
-        nn.init.zeros_(self.zero_proj.weight)
-        nn.init.zeros_(self.zero_proj.bias)
+        self.zero_init = _as_bool(zero_init, "zero_init")
+        if self.zero_init:
+            self.zero_proj = nn.Linear(dim, dim)
+            nn.init.zeros_(self.zero_proj.weight)
+            nn.init.zeros_(self.zero_proj.bias)
+        else:
+            self.zero_proj = nn.Identity()
 
     def forward(self, hidden_states, motion_hidden, motion_attention_mask=None):
         out = self.attn(
@@ -248,6 +267,7 @@ class DiT(ModelMixin, ConfigMixin):
         interleave_self_attention=False,
         cross_attention_dim: Optional[int] = None,
         motion_coupler_dim: Optional[int] = None,
+        motion_coupler_zero_init: bool = True,
         **kwargs,
     ):
         super().__init__()
@@ -305,6 +325,7 @@ class DiT(ModelMixin, ConfigMixin):
                         self.config.num_attention_heads,
                         self.config.attention_head_dim,
                         norm_eps=self.config.norm_eps,
+                        zero_init=self.config.motion_coupler_zero_init,
                     )
             self.motion_coupler = nn.ModuleDict(couplers)
 
@@ -355,8 +376,8 @@ class DiT(ModelMixin, ConfigMixin):
                     encoder_attention_mask=encoder_attention_mask,
                     temb=temb,
                 )
-                # Zero-init motion coupler on cross-attn (even) blocks. No-op at
-                # init (zero_proj) and when motion_hidden is None (baseline).
+                # Motion coupler on cross-attn (even) blocks. Default is zero-init
+                # no-op; explicit ablations may use direct full injection.
                 if (
                     motion_hidden is not None
                     and self.motion_coupler is not None

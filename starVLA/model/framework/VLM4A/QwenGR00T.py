@@ -195,6 +195,14 @@ class QwenGR00TDefaultConfig:
             "flow_lambda": 0.1,                  # stage-2 joint weight
             "smooth_l1_beta": 0.01,
             "z_weight": 2.0,
+            "dynamic_loss_weight": 1.0,
+            "static_zero_loss_weight": 0.0,
+            "dynamic_direction_loss_weight": 0.0,
+            "dynamic_magnitude_loss_weight": 0.0,
+            "direction_loss_eps": 1e-6,
+            "conditioning_past_motion_gate": False,
+            "conditioning_static_scale": 1.0,
+            "conditioning_motion_threshold": 1e-5,
             "diffusion_model_cfg": {
                 "cross_attention_dim": 2048,     # aligned to VLM hidden at runtime
                 "num_layers": 16,
@@ -416,6 +424,23 @@ class Qwen_GR00T(baseframework):
                 )  # (B,)
         return batch
 
+    def _scene_past_only_batch(self, scene_batch):
+        """Keep only historical past-flow keys for action-conditioning extraction.
+
+        The full scene batch also contains current/future supervision (`flow_gt`,
+        `flow_dynamic`). Passing a past-only dict makes future-mask leakage impossible
+        by construction when optional token gating is enabled.
+        """
+        if self.scene_predictor is None or scene_batch is None:
+            return None
+        keys = (
+            getattr(self.scene_predictor, "past_flow_key", "past_flow_gt"),
+            getattr(self.scene_predictor, "past_valid_key", "past_flow_valid"),
+            getattr(self.scene_predictor, "has_past_key", "has_past_flow"),
+        )
+        out = {k: scene_batch[k] for k in keys if k in scene_batch}
+        return out or None
+
     def load_state_dict(self, state_dict, strict=True, assign=False, init_from_baseline: bool = False):
         """Fail-closed load with warm-start exceptions for inert legacy stereo keys."""
         own_keys = set(self.state_dict().keys())
@@ -560,12 +585,13 @@ class Qwen_GR00T(baseframework):
                 self._collect_scene_targets(examples, last_hidden.device)
                 if self.scene_predictor_enabled else None
             )
+            _scene_past_batch = self._scene_past_only_batch(_scene_batch) if self.scene_predictor_enabled else None
             if self.scene_predictor_enabled:
                 with torch.random.fork_rng(
                     devices=[last_hidden.device.index] if last_hidden.is_cuda else []
                 ):
                     motion_hidden = self.scene_predictor.extract_conditioning_hidden(
-                        last_hidden, encoder_attention_mask=_enc_mask, past_flow_batch=_scene_batch
+                        last_hidden, encoder_attention_mask=_enc_mask, past_flow_batch=_scene_past_batch
                     )
                 motion_hidden_repeated = motion_hidden.repeat(repeated_diffusion_steps, 1, 1)
 
@@ -592,8 +618,20 @@ class Qwen_GR00T(baseframework):
                         last_hidden, flow_batch, encoder_attention_mask=_enc_mask
                     )
                     losses["flow_loss"] = scene_out["flow_loss"]
-                    if "flow_supervised_cells" in scene_out:
-                        losses["flow_supervised_cells"] = scene_out["flow_supervised_cells"]
+                    for key in (
+                        "flow_supervised_cells",
+                        "flow_dynamic_cells",
+                        "flow_static_zero_cells",
+                        "flow_weighted_cells",
+                        "flow_effective_cells",
+                        "flow_fm_loss",
+                        "flow_dynamic_loss",
+                        "flow_static_zero_loss",
+                        "flow_direction_loss",
+                        "flow_magnitude_loss",
+                    ):
+                        if key in scene_out:
+                            losses[key] = scene_out[key]
 
         return losses
 
