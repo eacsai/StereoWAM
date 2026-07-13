@@ -73,7 +73,13 @@ def encode_vl(model, examples, device):
 
 
 def grid_gt(head, flow_batch, device):
-    """Replicate head.forward's gridding: pooled target (B,256,3) + sup / valid masks (B,256)."""
+    """Replicate head.forward's gridding.
+
+    Returns pooled target plus three masks flattened to (B, 256):
+    - sup: the actual training supervision mask (may fallback to valid, depending on config)
+    - valid: pooled valid mask
+    - dynvalid: raw dynamic intersect valid cells, used for honest motion visualization/metrics
+    """
     field_gt = flow_batch[head.target_key].to(device)  # (B,3,Hgt,Wgt) fp32
     valid = flow_batch.get(head.valid_key, None)
     dynamic = flow_batch.get(head.dynamic_key, None)
@@ -98,16 +104,63 @@ def grid_gt(head, flow_batch, device):
     target = target_grid.flatten(2).permute(0, 2, 1).contiguous()  # (B,256,3)
     sup_flat = sup.reshape(sup.shape[0], -1)  # (B,256) bool
     valid_flat = valid_grid.reshape(valid_grid.shape[0], -1)  # (B,256) bool
-    return target, sup_flat, valid_flat
+    if dyn_grid is not None:
+        dynvalid_flat = (dyn_grid & valid_grid).reshape(valid_grid.shape[0], -1)
+    else:
+        # Fail closed for raw-dynamic visualization: missing dynamic data is not motion.
+        # If callers explicitly allow fallback-valid cells, metric_b can still fall back to sup later.
+        dynvalid_flat = torch.zeros_like(valid_flat)
+    return target, sup_flat, valid_flat, dynvalid_flat
+
+
+def grid_past_flow_for_viz(head, flow_batch, device):
+    """Pool the actual past_flow_gt inputs into the same 16x16 token grid used by the head.
+
+    Returns:
+      past_grid:  (B,K,256,3) or None
+      past_valid: (B,K,256) bool or None
+    """
+    if not getattr(head, "past_flow_enabled", False):
+        return None, None
+    if flow_batch is None or head.past_flow_key not in flow_batch:
+        return None, None
+
+    past = flow_batch[head.past_flow_key].to(device).float()  # (B,K,3,H,W)
+    valid = flow_batch.get(head.past_valid_key, None)
+    pooled_fields = []
+    pooled_valids = []
+    for k in range(past.shape[1]):
+        fk = past[:, k]  # (B,3,H,W)
+        if valid is not None:
+            vk = valid[:, k].to(device).float()
+            if vk.dim() == 3:
+                vk = vk.unsqueeze(1)
+            pk, mk = head._pool_target(fk, vk)
+        else:
+            pk = F.adaptive_avg_pool2d(
+                torch.nan_to_num(fk, nan=0.0, posinf=0.0, neginf=0.0),
+                (head.grid_size, head.grid_size),
+            )
+            mk = pk.norm(dim=1, keepdim=True) > 1e-7
+        pooled_fields.append(pk.flatten(2).permute(0, 2, 1).contiguous())
+        pooled_valids.append(mk.reshape(mk.shape[0], -1).bool())
+
+    return torch.stack(pooled_fields, dim=1), torch.stack(pooled_valids, dim=1)
 
 
 @torch.no_grad()
-def sample_flow(head, vl_embs, enc_mask, n_steps):
-    """Euler-integrate dx/dt = pred_v(x,t), x0=noise(t=0) -> x1(t=1). Returns (B,256,3) fp32."""
+def sample_flow(head, vl_embs, enc_mask, n_steps, past_flow_batch=None):
+    """Euler-integrate dx/dt = pred_v(x,t), x0=noise(t=0) -> x1(t=1).
+
+    For past-flow checkpoints, `past_flow_batch` must carry past_flow_gt/valid/has_past_flow
+    so this evaluates the conditioned branch rather than the cold no-past path.
+    Returns (B,256,3) fp32.
+    """
     B = vl_embs.shape[0]
     device = vl_embs.device
     x = torch.randn(B, head.num_tokens, head.field_dim, device=device, dtype=torch.float32)
     dt = 1.0 / n_steps
+    pf_hidden, pf_gate = head._encode_past_flow(past_flow_batch, device, training_aug=False)
     with torch.autocast("cuda", dtype=torch.float32):
         for i in range(n_steps):
             t_val = i * dt
@@ -119,6 +172,8 @@ def sample_flow(head, vl_embs, enc_mask, n_steps):
                 encoder_hidden_states=vl_embs,
                 encoder_attention_mask=enc_mask,
                 timestep=t_disc,
+                motion_hidden=pf_hidden,
+                motion_gate=pf_gate,
             )
             pred_v = head.field_decoder(out).float()
             x = x + dt * pred_v
@@ -127,12 +182,17 @@ def sample_flow(head, vl_embs, enc_mask, n_steps):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--run-id", default="qwen0p8_groot_cascade_motion_cambranch_learn_scene_flow_fromscratch_leftprimary")
+    ap.add_argument("--run-id", default="qwen0p8_groot_cascade_motion_cambranch_pastflow_learn_scene_flow_fromscratch_leftprimary")
     ap.add_argument("--ckpt-step", type=int, default=30000)
     ap.add_argument("--n-samples", type=int, default=96)
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--n-euler-steps", type=int, default=10)
     ap.add_argument("--out-dir", default="docs/experiments/stage1_flow_prediction_check")
+    ap.add_argument("--viz-top-k", type=int, default=6, help="number of motion samples to draw in the PNG")
+    ap.add_argument("--require-past-flow", action="store_true", help="fail unless the model/dataloader emit past-flow and only score has_past_flow=True samples")
+    ap.add_argument("--allow-cold-start-past-flow", action="store_true", help="for past-flow models, allow has_past_flow=False cold-start samples instead of auto-requiring history")
+    ap.add_argument("--require-raw-dynamic", action="store_true", help="only score/draw samples with raw dynamic-valid cells, not fallback-valid cells")
+    ap.add_argument("--allow-fallback-valid", action="store_true", help="allow fallback-valid/static cells when no raw dynamic cells are present")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -187,6 +247,27 @@ def main():
         print(f"[WARN] {len(cam_missing)} cam_branch keys missing e.g. {cam_missing[:4]}", flush=True)
     model.eval()
 
+    pf_enabled = bool(getattr(sp, "past_flow_enabled", False))
+    if pf_enabled and not args.allow_cold_start_past_flow:
+        args.require_past_flow = True
+    if not args.allow_fallback_valid:
+        args.require_raw_dynamic = True
+    has_past_key = getattr(sp, "has_past_key", "has_past_flow")
+    if args.require_past_flow:
+        if not pf_enabled:
+            print("[FATAL] --require-past-flow set but scene_predictor.past_flow_enabled is false", flush=True)
+            sys.exit(1)
+        ds_pf = bool(OmegaConf.select(cfg, "datasets.vla_data.scene_flow.past_flow_controlnet.enabled", default=False))
+        if not ds_pf:
+            print("[FATAL] --require-past-flow set but datasets.vla_data.scene_flow.past_flow_controlnet.enabled is false", flush=True)
+            sys.exit(1)
+    print(
+        f"[policy] pf_enabled={pf_enabled} require_past_flow={args.require_past_flow} "
+        f"past_key={has_past_key} require_raw_dynamic={args.require_raw_dynamic} "
+        f"allow_cold_start={args.allow_cold_start_past_flow} allow_fallback_valid={args.allow_fallback_valid}",
+        flush=True,
+    )
+
     # ---- build the real training dataset (gt_only_sampler -> only GT frames) ----
     from starVLA.dataloader.lerobot_datasets import collate_fn, get_vla_dataset
     from torch.utils.data import DataLoader
@@ -206,15 +287,21 @@ def main():
     n_valid_cells = 0
     n_sup_cells = 0
     n_samples = 0
-    n_fell_to_zero_sup = 0         # samples with zero dynamic-and-valid cells
+    n_fell_to_zero_sup = 0         # samples with zero raw dynamic-and-valid cells
+    n_skipped_no_past = 0
+    n_skipped_no_dynamic = 0
     n_imgs_per_sample = None
-    per_sample_viz = []            # (target16, pred16, supmask16, epe, cos, magmean)
+    per_sample_viz = []            # (target16, pred16, motionmask16, epe, cos, magmean)
 
     for examples in loader:
         if n_samples >= args.n_samples:
             break
         # drop samples with no GT (shouldn't happen under gt_only, but be safe for _collect_scene_targets all-or-none)
         examples = [e for e in examples if bool(e.get("flow_has_gt", False))]
+        if args.require_past_flow:
+            before = len(examples)
+            examples = [e for e in examples if bool(e.get(has_past_key, False))]
+            n_skipped_no_past += before - len(examples)
         if not examples:
             continue
         if n_imgs_per_sample is None:
@@ -225,53 +312,80 @@ def main():
         flow_batch = model._collect_scene_targets(examples, device)
         if flow_batch is None:
             continue
-        target, sup_flat, valid_flat = grid_gt(sp, flow_batch, device)  # (B,256,3),(B,256),(B,256)
-        pred = sample_flow(sp, vl_embs, enc_mask, args.n_euler_steps)   # (B,256,3)
+        target, sup_flat, valid_flat, dynvalid_flat = grid_gt(sp, flow_batch, device)  # (B,256,3),(B,256),(B,256),(B,256)
+        past_grid, past_valid_flat = grid_past_flow_for_viz(sp, flow_batch, device)  # (B,K,256,3),(B,K,256) or None
+        pred = sample_flow(sp, vl_embs, enc_mask, args.n_euler_steps, past_flow_batch=flow_batch)   # (B,256,3)
 
         target = target.float()
         pred = pred.float()
+        if past_grid is not None:
+            past_grid = past_grid.float()
 
         for b in range(B):
+            if n_samples >= args.n_samples:
+                break
             g = target[b]           # (256,3)
             p = pred[b]             # (256,3)
-            sup_b = sup_flat[b]     # (256,)
-            val_b = valid_flat[b]   # (256,)
-            gmag = g.norm(dim=-1)   # (256,)
+            sup_b = sup_flat[b]       # (256,) actual training supervision mask
+            val_b = valid_flat[b]     # (256,) pooled valid mask
+            dyn_b = dynvalid_flat[b]  # (256,) raw dynamic intersect valid mask
+            gmag = g.norm(dim=-1)     # (256,)
 
+            ndyn = int(dyn_b.sum().item())
+            if args.require_raw_dynamic and ndyn == 0:
+                n_skipped_no_dynamic += 1
+                continue
+
+            metric_b = dyn_b if ndyn > 0 else sup_b
+            ns = int(metric_b.sum().item())
             n_total_cells += 256
             n_valid_cells += int(val_b.sum().item())
-            ns = int(sup_b.sum().item())
             n_sup_cells += ns
             if ns == 0:
                 n_fell_to_zero_sup += 1
 
-            # magnitude distributions
-            static_sel = val_b & (~sup_b)
+            # magnitude distributions: static = valid but not raw dynamic.
+            static_sel = val_b & (~dyn_b)
             if static_sel.any():
                 static_mag.append(gmag[static_sel].detach().cpu())
-            if sup_b.any():
-                dynamic_mag.append(gmag[sup_b].detach().cpu())
+            if metric_b.any():
+                dynamic_mag.append(gmag[metric_b].detach().cpu())
 
-            # metrics accumulators
-            if sup_b.any():
-                P_sup.append(p[sup_b].detach().cpu())
-                G_sup.append(g[sup_b].detach().cpu())
+            # metrics accumulators use raw dynamic-valid cells when present, avoiding fallback-valid inflation.
+            if metric_b.any():
+                P_sup.append(p[metric_b].detach().cpu())
+                G_sup.append(g[metric_b].detach().cpu())
             if val_b.any():
                 P_val.append(p[val_b].detach().cpu())
                 G_val.append(g[val_b].detach().cpu())
 
-            # per-sample record for visualization (only samples with motion)
+            # per-sample record for visualization (only samples with raw dynamic motion when required).
             if ns > 0:
-                epe = (p[sup_b] - g[sup_b]).norm(dim=-1).mean().item()
-                pc = p[sup_b]
-                gc = g[sup_b]
+                epe = (p[metric_b] - g[metric_b]).norm(dim=-1).mean().item()
+                pc = p[metric_b]
+                gc = g[metric_b]
                 cos = F.cosine_similarity(pc, gc, dim=-1).mean().item()
+                past16 = []
+                pastmask16 = []
+                pastmoving16 = []
+                if past_grid is not None and past_valid_flat is not None:
+                    for k in range(past_grid.shape[1]):
+                        pk = past_grid[b, k]
+                        pv = past_valid_flat[b, k].bool()
+                        moving = pv & (pk.norm(dim=-1) > 1e-5)
+                        past16.append(pk.reshape(16, 16, 3).detach().cpu().numpy())
+                        # Valid cells are the actual pooled input support; moving cells only control visible arrows.
+                        pastmask16.append(pv.reshape(16, 16).detach().cpu().numpy())
+                        pastmoving16.append(moving.reshape(16, 16).detach().cpu().numpy())
                 per_sample_viz.append({
                     "target16": g.reshape(16, 16, 3).detach().cpu().numpy(),
                     "pred16": p.reshape(16, 16, 3).detach().cpu().numpy(),
-                    "sup16": sup_b.reshape(16, 16).detach().cpu().numpy(),
+                    "sup16": metric_b.reshape(16, 16).detach().cpu().numpy(),
+                    "past16": past16,
+                    "pastmask16": pastmask16,
+                    "pastmoving16": pastmoving16,
                     "epe": epe, "cos": cos, "ncells": ns,
-                    "magmean": gmag[sup_b].mean().item(),
+                    "magmean": gmag[metric_b].mean().item(),
                 })
             n_samples += 1
 
@@ -332,6 +446,7 @@ def main():
             "model_epe": model_epe_val, "zero_baseline_epe": zero_epe_val,
             "mean_baseline_epe": mean_epe_val, "relative_epe": rel_epe_val,
             "cosine": cos_val, "n_cells": int(G_val_t.shape[0]),
+            "sample_scope": "accepted_samples_after_filters",
         },
         "coverage": {
             "frac_dynvalid_of_all_cells": frac_dyn_of_all,
@@ -339,6 +454,12 @@ def main():
             "frac_valid_of_all_cells": frac_valid_of_all,
             "n_total_cells": n_total_cells, "n_valid_cells": n_valid_cells, "n_sup_cells": n_sup_cells,
             "n_samples_zero_dynamic": n_fell_to_zero_sup,
+            "n_skipped_no_past_flow": n_skipped_no_past,
+            "n_skipped_no_raw_dynamic": n_skipped_no_dynamic,
+            "require_past_flow": bool(args.require_past_flow),
+            "allow_cold_start_past_flow": bool(args.allow_cold_start_past_flow),
+            "require_raw_dynamic": bool(args.require_raw_dynamic),
+            "allow_fallback_valid": bool(args.allow_fallback_valid),
             "dynamic_fallback_to_valid": bool(sp.dynamic_fallback_to_valid),
         },
         "gt_flow_magnitude_m": {
@@ -382,7 +503,7 @@ def main():
     print(f"  Cosine(pred,gt)     : {f(cos_sup)}          (dynamic cells)", flush=True)
     print(f"  n_cells             : {G_sup_t.shape[0]}", flush=True)
     print("", flush=True)
-    print("--- ALL-VALID cells (mostly static; sanity) ---", flush=True)
+    print("--- ALL-VALID cells (accepted samples after filters; mostly static; sanity) ---", flush=True)
     print(f"  Model EPE           : {f(model_epe_val)} m", flush=True)
     print(f"  Zero-flow EPE (base): {f(zero_epe_val)} m", flush=True)
     print(f"  Mean-flow EPE (base): {f(mean_epe_val)} m", flush=True)
@@ -395,6 +516,10 @@ def main():
     print(f"  frac dyn∩valid of VALID cells : {f(frac_dyn_of_valid)}", flush=True)
     print(f"  frac valid of ALL cells       : {f(frac_valid_of_all)}", flush=True)
     print(f"  samples w/ 0 dynamic cells    : {n_fell_to_zero_sup} / {n_samples}", flush=True)
+    print(f"  skipped no past-flow history  : {n_skipped_no_past}", flush=True)
+    print(f"  skipped no raw dynamic cells  : {n_skipped_no_dynamic}", flush=True)
+    print(f"  require_past_flow             : {args.require_past_flow}", flush=True)
+    print(f"  require_raw_dynamic           : {args.require_raw_dynamic}", flush=True)
     print(f"  dynamic_fallback_to_valid     : {sp.dynamic_fallback_to_valid}", flush=True)
     print(f"  ||GT|| dynamic cells (m)      : mean={f(results['gt_flow_magnitude_m']['dynamic_cells']['mean'])} "
           f"median={f(results['gt_flow_magnitude_m']['dynamic_cells']['median'])}", flush=True)
@@ -417,7 +542,7 @@ def main():
     import matplotlib.pyplot as plt
 
     per_sample_viz.sort(key=lambda d: d["ncells"], reverse=True)
-    picks = per_sample_viz[:6]
+    picks = per_sample_viz[:max(0, int(args.viz_top_k))]
     if picks:
         ncol = 2
         nrow = len(picks)
@@ -448,8 +573,77 @@ def main():
         png_path = out_dir / "flow_pred_vs_gt.png"
         fig.savefig(png_path, dpi=130)
         print(f"[saved] {png_path}", flush=True)
+        plt.close(fig)
+
+        max_past_cols = max((len(rec.get("past16", [])) for rec in picks), default=0)
+        if args.require_past_flow and max_past_cols == 0:
+            print("[FATAL] require_past_flow=True but no past-flow panels were recorded", flush=True)
+            sys.exit(1)
+        ncol2 = max_past_cols + 2
+        fig2, axes2 = plt.subplots(nrow, ncol2, figsize=(4.2 * ncol2, 4.2 * nrow), squeeze=False)
+        for r_i, rec in enumerate(picks):
+            g16 = rec["target16"]
+            p16 = rec["pred16"]
+            m16 = rec["sup16"].astype(bool)
+            row_cols = []
+            past_fields = rec.get("past16", [])
+            past_masks = rec.get("pastmask16", [])
+            past_moving = rec.get("pastmoving16", [])
+            for idx in reversed(range(len(past_fields))):
+                lag = idx + 1
+                pm = past_masks[idx].astype(bool) if idx < len(past_masks) else np.zeros((gs, gs), dtype=bool)
+                qm = past_moving[idx].astype(bool) if idx < len(past_moving) else pm
+                dst = "t" if lag == 1 else f"t-{lag - 1}"
+                row_cols.append((past_fields[idx], pm, qm, f"PAST t-{lag}->{dst}", "tab:green"))
+            row_cols.extend([
+                (g16, m16, m16, "POST GT t->t+1", "tab:blue"),
+                (p16, m16, m16, "POST PRED t->t+1", "tab:red"),
+            ])
+
+            zvals = [np.abs(fld[..., 2][mask]) for fld, mask, _, _, _ in row_cols if mask.any()]
+            zmax2 = max(1e-6, max(float(v.max()) for v in zvals)) if zvals else 1e-6
+            for c_i in range(ncol2):
+                ax = axes2[r_i][c_i]
+                if c_i >= len(row_cols):
+                    ax.axis("off")
+                    continue
+                fld, mask, arrow_mask, ttl, arrow_c = row_cols[c_i]
+                bg = np.where(mask, fld[..., 2], np.nan)
+                ax.imshow(bg, origin="upper", cmap="coolwarm", vmin=-zmax2, vmax=zmax2, alpha=0.65,
+                          extent=[-0.5, gs - 0.5, gs - 0.5, -0.5])
+                U = np.where(arrow_mask, fld[..., 0], np.nan)
+                V = np.where(arrow_mask, fld[..., 1], np.nan)
+                ax.quiver(xs, ys, U, -V, color=arrow_c, angles="xy", scale_units="xy",
+                          scale=None, width=0.006)
+                if ttl.startswith("PAST"):
+                    extra = f"valid={int(mask.sum())}, moving={int(arrow_mask.sum())}"
+                else:
+                    extra = f"cells={int(mask.sum())}, EPE={rec['epe']:.3f}m, cos={rec['cos']:.2f}"
+                ax.set_title(f"{ttl}  ({extra})", fontsize=9)
+                ax.set_xlim(-0.5, gs - 0.5)
+                ax.set_ylim(gs - 0.5, -0.5)
+                ax.set_xticks([])
+                ax.set_yticks([])
+        title_prefix = (
+            "Past-flow inputs + post-flow target/prediction"
+            if max_past_cols > 0 else
+            "Post-flow target/prediction (no past-flow inputs available)"
+        )
+        fig2.suptitle(
+            f"{title_prefix} (XY quiver, Z=bg color)\n"
+            f"post-flow dyn-valid RelEPE={f(rel_epe_sup)} cos={f(cos_sup)}  |  {verdict.split(':')[0]}",
+            fontsize=11)
+        fig2.tight_layout(rect=[0, 0, 1, 0.95])
+        temporal_png_path = out_dir / "flow_temporal_context_vs_pred.png"
+        fig2.savefig(temporal_png_path, dpi=130)
+        print(f"[saved] {temporal_png_path}", flush=True)
+        plt.close(fig2)
     else:
-        print("[WARN] no samples with dynamic cells -> no quiver figure", flush=True)
+        msg = "no samples with dynamic cells -> no quiver figure"
+        if args.require_past_flow or args.require_raw_dynamic:
+            print(f"[FATAL] {msg}", flush=True)
+            sys.exit(1)
+        print(f"[WARN] {msg}", flush=True)
 
 
 if __name__ == "__main__":
