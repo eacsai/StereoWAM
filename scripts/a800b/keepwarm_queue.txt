@@ -1,0 +1,2 @@
+# launcher | gpu | run_id | ckpt_dir | smoke_status
+scripts/a800b/launch_dynamic_focus_stage1_regular.sh | 0 | qwen0p8_groot_cascade_motion_cambranch_pastflow_dynamic_focus_stage1_fromscratch_leftprimary | playground/Checkpoints/qwen0p8_groot_cascade_motion_cambranch_pastflow_dynamic_focus_stage1_fromscratch_leftprimary/checkpoints | PASS
