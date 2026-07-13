@@ -1,0 +1,54 @@
+{
+  "run_id": "qwen0p8_groot_cascade_motion_cambranch_pastflow_learn_scene_flow_fromscratch_leftprimary",
+  "ckpt_step": 30000,
+  "n_samples": 4,
+  "n_euler_steps": 10,
+  "n_imgs_per_sample": 2,
+  "dynamic_and_valid": {
+    "model_epe": 0.007297560106962919,
+    "zero_baseline_epe": 0.01080601941794157,
+    "mean_baseline_epe": 0.007046274375170469,
+    "relative_epe": 0.6753236159141592,
+    "cosine": 0.7573422193527222,
+    "n_cells": 81
+  },
+  "all_valid": {
+    "model_epe": 0.012708100490272045,
+    "zero_baseline_epe": 0.0010658976389095187,
+    "mean_baseline_epe": 0.0016510279383510351,
+    "relative_epe": 11.922439853861805,
+    "cosine": 0.08694473654031754,
+    "n_cells": 873,
+    "sample_scope": "accepted_samples_after_filters"
+  },
+  "coverage": {
+    "frac_dynvalid_of_all_cells": 0.0791015625,
+    "frac_dynvalid_of_valid_cells": 0.09278350515463918,
+    "frac_valid_of_all_cells": 0.8525390625,
+    "n_total_cells": 1024,
+    "n_valid_cells": 873,
+    "n_sup_cells": 81,
+    "n_samples_zero_dynamic": 0,
+    "n_skipped_no_past_flow": 0,
+    "n_skipped_no_raw_dynamic": 4,
+    "require_past_flow": true,
+    "allow_cold_start_past_flow": false,
+    "require_raw_dynamic": true,
+    "allow_fallback_valid": false,
+    "dynamic_fallback_to_valid": false
+  },
+  "gt_flow_magnitude_m": {
+    "dynamic_cells": {
+      "mean": 0.01080601941794157,
+      "median": 0.010523614473640919,
+      "n": 81
+    },
+    "static_cells": {
+      "mean": 6.974874850129709e-05,
+      "median": 0.0,
+      "n": 792
+    }
+  },
+  "verdict": "PARTIAL / IN-BETWEEN: see numbers.",
+  "verdict_reason": "RelativeEPE(dyn)=0.675, cosine(dyn)=0.757"
+}
