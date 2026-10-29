@@ -8,17 +8,19 @@ readonly DEFAULT_ARCHIVE_DIR="$(dirname -- "${REPO_ROOT}")/starvla-project-archi
 readonly ARCHIVE_DIR="${STARVLA_ARCHIVE_DIR:-${DEFAULT_ARCHIVE_DIR}}"
 
 READ_ONLY=0
-if [[ "${1:-}" == "--read-only" ]]; then
-  READ_ONLY=1
-  shift
-fi
+WITH_ARCHIVE=0
+for arg in "$@"; do
+  case "$arg" in
+    --read-only) READ_ONLY=1 ;;
+    --with-archive) WITH_ARCHIVE=1 ;;
+    *)
+      printf 'Usage: %s [--read-only] [--with-archive]\n' "$0" >&2
+      exit 2
+      ;;
+  esac
+done
 
-if [[ "$#" -ne 0 ]]; then
-  printf 'Usage: %s [--read-only]\n' "$0" >&2
-  exit 2
-fi
-
-readonly READ_ONLY
+readonly READ_ONLY WITH_ARCHIVE
 
 fail() {
   printf 'ERROR: %s\n' "$*" >&2
@@ -95,6 +97,41 @@ update_archive() {
     printf 'WARNING: archive main diverged; using the existing local copy.\n' >&2
   fi
 }
+
+# The portable core is always available in the research branch. Optional private
+# history must never block a teammate who has only this public checkout.
+core_files=(
+  "docs/TAKEOVER.md"
+  "docs/experiments/20261029_stereo_wrist_utonia_plan.md"
+  "docs/experiments/20261029_l40_results.md"
+  "docs/ASSET_MANIFEST.md"
+  "docs/handoff/environment.json"
+  "docs/handoff/experiment_results.json"
+  "docs/CODEX_PROJECT_RECOVERY.md"
+)
+for path in "${core_files[@]}"; do
+  [[ -f "${REPO_ROOT}/${path}" ]] || fail "missing local handoff file: ${path}"
+done
+command -v python3 >/dev/null 2>&1 || fail "python3 is required for the source-only handoff check"
+python3 "${REPO_ROOT}/scripts/verify_handoff.py" --source-only
+
+printf '\nLocal research handoff ready\n'
+printf '  code root:   %s\n' "${REPO_ROOT}"
+printf '  code branch: %s\n' "$(git -C "${REPO_ROOT}" branch --show-current)"
+printf '  code commit: %s\n' "$(git -C "${REPO_ROOT}" rev-parse HEAD)"
+printf '\nRead these repository-local files in order:\n'
+for path in "${core_files[@]}"; do
+  printf '  %s\n' "${REPO_ROOT}/${path}"
+done
+printf '\nNew three-camera geometry/Utonia design is proposed, not implemented.\n'
+if [[ "${WITH_ARCHIVE}" -eq 0 ]]; then
+  printf 'Private historical archive is optional; use --with-archive only when requested.\n'
+  exit 0
+fi
+if [[ "${READ_ONLY}" -eq 1 && ! -d "${ARCHIVE_DIR}" ]]; then
+  printf 'OPTIONAL ARCHIVE MISSING: %s (core handoff is still ready)\n' "${ARCHIVE_DIR}"
+  exit 0
+fi
 
 if [[ ! -d "${ARCHIVE_DIR}" ]]; then
   clone_archive

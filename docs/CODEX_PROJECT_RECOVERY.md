@@ -1,102 +1,86 @@
-# Codex project recovery map
+# Codex recovery map — local handoff first
 
-This document is the public, repository-local fallback for restoring project
-context. The complete memory is stored in the private
-`eacsai/starvla-project-archive` repository.
+The research source is eacsai/StereoWAM, branch ffs_controlnet_dev.
+The current teammate entry point is [TAKEOVER.md](TAKEOVER.md).
+It is self-contained for code/context recovery; the private historical archive
+is optional and is not required to read, design, or verify this checkout.
 
-## Automatic recovery
+## First commands in any checkout
 
-From the StereoWAM repository root, run:
-
-```bash
-bash scripts/codex_restore_context.sh
-```
-
-The script clones or safely fast-forwards the private archive in a sibling
-directory when online, validates the core files, and prints an ordered reading
-list. If an update fails but an existing archive is valid, it continues in
-offline mode. It does not download datasets, weights, checkpoints, or feature
-caches.
-
-For an explicitly read-only task, use an already cloned archive without any
-filesystem or network mutation:
-
-```bash
+~~~bash
 bash scripts/codex_restore_context.sh --read-only
-```
+python3 scripts/verify_handoff.py --source-only
+git status -sb
+git log -10 --oneline
+~~~
 
-Set `STARVLA_ARCHIVE_DIR` when the archive is stored elsewhere:
+The default and --read-only modes print the local reading list and run only
+source/metadata checks. They do not clone an archive, install dependencies,
+download data, edit configuration, or launch training/evaluation.
 
-```bash
-STARVLA_ARCHIVE_DIR=/path/to/starvla-project-archive \
-  bash scripts/codex_restore_context.sh
-```
+Read in this order:
 
-## Memory hierarchy
+1. [Current scope and takeover](TAKEOVER.md).
+2. [Primary stereo + Wrist + Utonia + camera geometry plan](experiments/20261029_stereo_wrist_utonia_plan.md).
+3. [Verified L40 experiment results and step semantics](experiments/20261029_l40_results.md).
+4. [External assets and environment](ASSET_MANIFEST.md).
+5. [Structured results](handoff/experiment_results.json) and
+   [observed environment](handoff/environment.json).
 
-Read these archive files first:
+## Three recovery levels
 
-1. `CONTINUATION.md`: current research objective, architecture, results, and
-   recommended next work.
-2. `project_memory/codex_handoffs/handoff-2026-07-13T03-17-48Z.md`: final
-   departure state and exact GitHub sources.
-3. `reproduction/DATASETS_AND_WEIGHTS.md`: how excluded datasets and weights
-   were obtained or should be rebuilt.
-4. `manifests/code_repositories.tsv`: exact revisions of code dependencies.
-5. `results/starvla_experiments/README.md`: durable experiment registry.
+| Level | Pass criterion | What a pass does not mean |
+|---|---|---|
+| Source/context | Required text/source/JSON present, links and result arithmetic valid | Datasets or weights restored |
+| Existing-host asset entry points | Core files and dataset metadata exist using --asset-root | Tensor integrity, full data completeness, or new camera K/T verified |
+| Runnable experiment | Validated environment, real tri-view K/T/token/rollout checks, approved GPU smoke | The new method improves policy success |
 
-Then search the archive by task:
+~~~bash
+python3 scripts/verify_handoff.py --asset-root "$PROJECT_ROOT/playground"
+~~~
 
-- architecture and paper analysis: `research/notes/`;
-- new ideas and future plans: `research/proposals/` and `research/specs/`;
-- papers: `research/papers/` plus `manifests/papers_sha256.tsv`;
-- plots, metrics, and checkpoint metadata: `results/`;
-- prior Codex/Claude decisions: `project_memory/`;
-- excluded assets and reconstruction: `reproduction/` and `manifests/`.
+Heavy asset restoration requires the appropriate access, license, storage and
+current task authority. Missing resources remain explicitly missing.
 
-Useful search examples:
+## Optional private historical archive
 
-```bash
-rg -n "past.flow|scene.flow|dynamic|rigid" ../starvla-project-archive
-rg -n "action conditioning|noise floor|stage.1" ../starvla-project-archive
-find ../starvla-project-archive/research/papers -type f -name '*.pdf' | sort
-```
+The old eacsai/starvla-project-archive may contain additional papers, notes and
+pre-migration results. It was absent from the existing L40 project on 2026-10-29,
+and the available GitHub account could not resolve it. This observation does not
+prove deletion, nor imply a teammate has access.
 
-## Migration boundary
+Only when explicitly requested:
 
-Before 2026-07-13, `/data/wangqiwei/ICLR2026/starVLA` on 4090d was the only
-authoritative working tree. The user is leaving that infrastructure. After the
-migration, the GitHub repositories are the durable sources of truth and a new
-computer's clean clone is the working tree.
+~~~bash
+# Reuse a local archive without cloning/updating:
+bash scripts/codex_restore_context.sh --read-only --with-archive
+# With authentication and permission already arranged:
+bash scripts/codex_restore_context.sh --with-archive
+~~~
 
-Historical handoffs may still say to wait for 4090d or modify code only there.
-Apply that instruction only if the user explicitly confirms that the legacy
-server is still available and authoritative. Otherwise do not wait for, probe,
-or depend on the old 4090d, A800, or H100 hosts.
+STARVLA_ARCHIVE_DIR may select an existing archive. The optional mode validates
+its origin and preserves dirty/diverged checkouts. Authentication and license
+acceptance remain actions for the account owner, not fabricated recovery success.
 
-## Preserved technical state
+If available, read CONTINUATION.md, the final July departure handoff,
+reproduction/DATASETS_AND_WEIGHTS.md, manifests/code_repositories.tsv and the
+archive's result registry. Treat old machine-only authority instructions as
+historical, subordinate to the user's current destination and this checkout.
 
-The active work adds a 16x16x3 scene-flow flow-matching DiT beside the action
-DiT. It can encode the previous two predicted flow fields into 512 history
-tokens and inject them through cross-attention. Regular injection uses a
-zero-initialized projection; full injection uses an identity projection.
+## Scientific continuation boundary
 
-The controlled one-sample stage-1 measurements were approximately:
+The current user direction uses Primary stereo rig as world frame W, with the
+original primary optical camera as rig reference. The stereo-derived point cloud
+must be transformed from left_view into W, and Wrist extrinsics must be per-frame.
+Current code is still a two-camera implementation. Do not present the proposal as
+already implemented or validated.
 
-| Variant | Dynamic EPE | Zero-flow EPE | Relative EPE | Cosine |
-|---|---:|---:|---:|---:|
-| regular | 0.0066 m | 0.0119 m | 0.5542 | 0.8628 |
-| full injection | 0.0066 m | 0.0119 m | 0.5510 | 0.8493 |
+Earlier Scene Flow/past-flow experiments remain in repository history; they are
+not the default next task. Pre-July documentation's approximately 6 percentage
+point noise reminder is empirical, not a newly measured confidence interval.
+The last causal/image-bidir runs were stopped with 14k model checkpoints and no
+final evaluation. Do not relaunch them from an old queue command.
 
-This sample is diagnostic evidence, not a robust comparison. Static regions
-still have large false motion. The next defensible step is a fixed multi-sample
-evaluation with confidence intervals and separate dynamic, static, angular,
-magnitude, and coverage metrics.
-
-## Missing large assets
-
-Datasets, checkpoint tensors, pretrained model weights, feature caches,
-environments, and third-party working copies were deliberately excluded from
-GitHub. Do not assume that their old absolute paths exist. Reconstruct them
-from the private archive's provenance documents and manifests, and record any
-new storage locations locally without committing machine-specific secrets.
+Preserve existing source changes and assets. No credentials, private keys,
+datasets, model tensors, optimizer tensors, environments or feature-cache payloads
+are included in the portable handoff.

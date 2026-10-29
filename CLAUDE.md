@@ -1,3 +1,7 @@
+> **历史记录说明（2026-10-29）**：本文件保留 2026-05/06 的研究导航和当时结论。
+> 当前研究分支、接手目标和资产状态以 AGENTS.md 与 docs/TAKEOVER.md 为准。
+> 不执行下文旧服务器路径、历史正在运行任务或自动后台审查指令。
+
 # CLAUDE.md — starVLA on 4090d (StereoVLA / Phase 1)
 
 > 本文件是 **agentic 协作时的导航**，不是 user-facing docs。任何动手前必读。

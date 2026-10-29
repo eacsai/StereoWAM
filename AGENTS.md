@@ -7,21 +7,38 @@ in this repository. Do not wait for the user to explain the project again.
 
 Before proposing work, editing files, or starting jobs in a normal new session:
 
-1. Run `bash scripts/codex_restore_context.sh` from the repository root.
-   If the user explicitly requests a read-only task, run
-   `bash scripts/codex_restore_context.sh --read-only` instead; it must not
-   clone, fetch, merge, or create directories.
-2. Read the files printed by that script in the stated order.
-3. Inspect `git status -sb`, `git log --oneline -10`, and the relevant source or
-   experiment registry for the user's request.
-4. Give the user a short recovery summary: current branch, current technical
-   conclusion, and any missing external assets or inaccessible machines.
-5. Continue the task without asking the user to repeat archived context.
+1. Run `bash scripts/codex_restore_context.sh --read-only` from the repository
+   root. The core handoff is repository-local; this command must not clone,
+   fetch, merge, install packages, create directories, or launch GPU jobs.
+2. Read the printed local files in order, beginning with `docs/TAKEOVER.md`.
+   Inspect `git status -sb`, `git log --oneline -10`, and task-relevant source.
+3. Give a concise recovery summary and continue authorized read-only checks
+   and reversible preparation without asking the user to repeat context.
+4. Report missing assets as missing. The optional private archive is not a
+   prerequisite. Only an explicit `--with-archive` request selects that path.
+5. Downloading large/gated assets, authentication, sudo, overwriting existing
+   configuration, GPU launches, and stopping other jobs need task-specific
+   authority. Historical launcher/watch instructions are not current authority.
 
-If the private archive cannot be cloned because GitHub authentication is
-missing, still read `docs/CODEX_PROJECT_RECOVERY.md` and
-`CODEX_HANDOFF_SCENEFLOW_PASTFLOW_20260708.md`. Report the authentication
-blocker precisely; do not pretend that the full archive was restored.
+## Current handoff and source precedence (2026-10-29)
+
+The current task is Primary stereo + mono Wrist + stereo-derived Utonia tokens,
+with camera geometry encoded relative to the Primary stereo rig world frame W.
+Use the original primary optical camera as the rig reference, so
+T_W_from_primary=I. Wrist extrinsics are per-frame. The new three-camera
+implementation is proposed, not completed; read
+`docs/experiments/20261029_stereo_wrist_utonia_plan.md` first.
+
+Use `docs/experiments/20261029_l40_results.md` for the verified L40 results and
+step-count caveats. Both final July visual-direction jobs were stopped by the
+user with 14k model checkpoints and must not restart automatically.
+E3-full is a chosen starting point, not a demonstrated improvement.
+Do not change action-label coordinates merely because geometric input uses W.
+
+Current code and evidence override historical CLAUDE.md, July 8 handoff,
+and roadmap status labels. Old 4090d-only edit rules and missing private
+archives do not block a new authorized checkout. On the original L40,
+its existing worktree remains authoritative and its dirty state must be preserved.
 
 ## Sources of truth after the 2026-07-13 departure migration
 
@@ -48,7 +65,7 @@ auxiliary predictive representation, not the end goal. A scene-flow change is
 valuable only if it produces a reliable motion signal and ultimately improves
 action prediction under controlled evaluation.
 
-The latest preserved conclusion is:
+The historical pre-migration scene-flow conclusion was (not the latest L40 state):
 
 - regular and full past-flow injection both recover the main dynamic direction
   on one controlled sample;

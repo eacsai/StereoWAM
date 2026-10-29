@@ -284,3 +284,16 @@ SSF/libero_sim_env/
 # They intentionally override the broad Markdown ignores above.
 !AGENTS.md
 !docs/CODEX_PROJECT_RECOVERY.md
+
+
+# Portable research handoff: preserve only curated text/JSON, not host assets.
+# playground/external may be symlinks to a data volume, so ignore the entries too.
+/playground
+/external
+/code_refs/
+!experiment/
+!experiment/*.md
+!docs/TAKEOVER.md
+!docs/ASSET_MANIFEST.md
+!docs/handoff/
+!docs/handoff/*.json

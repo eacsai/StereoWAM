@@ -1,0 +1,150 @@
+{
+  "schema": "stereowam-historical-results-v1",
+  "verified_at": "2026-10-29",
+  "metric": "unweighted mean of four LIBERO suite success rates",
+  "suite_order": [
+    "libero_spatial",
+    "libero_object",
+    "libero_goal",
+    "libero_10"
+  ],
+  "trials_per_task": 10,
+  "tasks_per_suite": 10,
+  "checkpoint_step_unit": "trainer_logged_completed_steps; not necessarily optimizer updates",
+  "source_pattern": "playground/Checkpoints/<run_id>/<eval_dir>/<suite>/client.log",
+  "records": [
+    {
+      "id": "primary_wrist",
+      "run_id": "qwen0p8_groot_baseline_primary_wrist_l40_4gpu_bs8ga4_eff128_queued_after_stereo_fromscratch_0717",
+      "eval_dir": "eval_step30000_primary_wrist_0719",
+      "checkpoint_logged_step": 30000,
+      "rates": [
+        0.99,
+        1,
+        1,
+        0.85
+      ],
+      "mean_rate": 0.96
+    },
+    {
+      "id": "plain_stereo",
+      "run_id": "qwen0p8_groot_stereo_plain_leftprimary_l40_4gpu_bs8ga4_eff128_recovery_retry_fromscratch_0717",
+      "eval_dir": "eval_step30000_primary_left_view_0719",
+      "checkpoint_logged_step": 30000,
+      "rates": [
+        0.96,
+        0.98,
+        0.89,
+        0.78
+      ],
+      "mean_rate": 0.9025
+    },
+    {
+      "id": "camera_branch",
+      "run_id": "qwen0p8_groot_stereo_cambranch_leftprimary_l40_4gpu_bs8ga4_eff128_fromscratch_0719",
+      "eval_dir": "eval_step30000_primary_left_view",
+      "checkpoint_logged_step": 30000,
+      "rates": [
+        0.91,
+        0.98,
+        0.93,
+        0.64
+      ],
+      "mean_rate": 0.865
+    },
+    {
+      "id": "E2",
+      "run_id": "qwen0p8_groot_stereo_cambranch_e2_bidirectional_leftprimary_l40_4gpu_bs8ga4_eff128_seed42_fromscratch_0720",
+      "eval_dir": "eval_step30000_primary_left_view_e2_20260721",
+      "checkpoint_logged_step": 30000,
+      "rates": [
+        0.9,
+        0.99,
+        0.85,
+        0.55
+      ],
+      "mean_rate": 0.8225
+    },
+    {
+      "id": "E3_small",
+      "run_id": "qwen0p8_groot_stereo_cambranch_e3_small_init_std1e-3_bidirectional_leftprimary_l40_4gpu_bs8ga4_eff128_seed42_fromscratch_0721",
+      "eval_dir": "eval_step30000_primary_left_view",
+      "checkpoint_logged_step": 30000,
+      "rates": [
+        0.95,
+        0.95,
+        0.89,
+        0.63
+      ],
+      "mean_rate": 0.855
+    },
+    {
+      "id": "E3_full",
+      "run_id": "qwen0p8_groot_stereo_cambranch_e3_full_init_std2e-2_bidirectional_leftprimary_l40_4gpu_bs8ga4_eff128_seed42_fromscratch_0721",
+      "eval_dir": "eval_step30000_primary_left_view",
+      "checkpoint_logged_step": 30000,
+      "rates": [
+        0.87,
+        0.99,
+        0.86,
+        0.69
+      ],
+      "mean_rate": 0.8525
+    },
+    {
+      "id": "E5_full_only",
+      "run_id": "qwen0p8_groot_stereo_e5_full_same_row_topk_init_std2e-2_gate1e-1_bidirectional_leftprimary_l40_4gpu_bs8ga4_eff128_seed42_fromscratch_0722_attempt05",
+      "eval_dir": "eval_step30000_primary_left_view",
+      "checkpoint_logged_step": 30000,
+      "rates": [
+        0.89,
+        0.97,
+        0.82,
+        0.63
+      ],
+      "mean_rate": 0.8275
+    },
+    {
+      "id": "utonia_clean_numpy126",
+      "run_id": "qwen0p8_groot_utonia_prompttoken_leftprimary_l40_4gpu_bs8ga4_eff128_fromscratch_0720_train",
+      "eval_dir": "eval_step30000_primary_left_view_clean_numpy126_20260720",
+      "checkpoint_logged_step": 30000,
+      "rates": [
+        0.88,
+        0.99,
+        0.91,
+        0.7
+      ],
+      "mean_rate": 0.87
+    },
+    {
+      "id": "utonia_eval_prompt_changed",
+      "run_id": "qwen0p8_groot_utonia_prompttoken_leftprimary_l40_4gpu_bs8ga4_eff128_fromscratch_0720_train",
+      "eval_dir": "eval_step30000_primary_left_view_promptfixed_numpy126_20260720",
+      "checkpoint_logged_step": 30000,
+      "rates": [
+        0.87,
+        0.97,
+        0.9,
+        0.63
+      ],
+      "mean_rate": 0.8425
+    }
+  ],
+  "stopped_runs": [
+    {
+      "run_id": "qwen0p8_groot_visual_causal_leftprimary_l40_4gpu_bs8ga4_eff128_seed42_fromscratch_legacyaccum_retry_20260723",
+      "status": "stopped_by_user_2026-07-23",
+      "latest_saved_logged_step": 14000,
+      "checkpoint_bytes": 2525184570,
+      "evaluation_completed": false
+    },
+    {
+      "run_id": "qwen0p8_groot_visual_image_bidir_leftprimary_l40_4gpu_bs8ga4_eff128_seed42_fromscratch_legacyaccum_retry_20260723",
+      "status": "stopped_by_user_2026-07-23",
+      "latest_saved_logged_step": 14000,
+      "checkpoint_bytes": 2525184570,
+      "evaluation_completed": false
+    }
+  ]
+}

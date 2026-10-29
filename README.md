@@ -1,3 +1,9 @@
+> **研究分支接手（2026-10-29）**：本分支为 eacsai/StereoWAM 的 ffs_controlnet_dev，
+> 当前任务是 Primary 双目 + Wrist + Utonia，以及以 Primary rig 为世界系的三相机几何编码。
+> 从 [docs/TAKEOVER.md](docs/TAKEOVER.md) 开始；运行
+> `bash scripts/codex_restore_context.sh --read-only` 可离线恢复本仓库内的上下文。
+> 新三视图模型尚未实现，历史实验与待做方案在入口中分别说明。
+
 <p align="center">
 <img src="assets/logo.svg" alt="StarVLA Logo" width="10%">
 </p>
