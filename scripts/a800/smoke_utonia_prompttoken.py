@@ -28,7 +28,7 @@ FRAMEWORK = "QwenGR00T_UtoniaPromptTokenFFS"
 SUITE = "smoke_suite"
 DEFAULT_PRETRAINED_CKPT = (
     "playground/Checkpoints/"
-    "qwen3p5_0p8b_4suite_stereo_camrope_rightprimary_ourrender_30k/"
+    "qwen0p8_groot_stereo_cambranch_leftprimary_l40_4gpu_bs8ga4_eff128_fromscratch_0719/"
     "checkpoints/steps_30000_pytorch_model.pt"
 )
 DEFAULT_BASE_VLM = "./playground/Pretrained_models/Qwen3.5-0.8B"

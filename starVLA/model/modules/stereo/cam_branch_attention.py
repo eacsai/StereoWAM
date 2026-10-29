@@ -45,6 +45,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .cam_rope_hook import _PATCHED_FORWARD_DISPATCH, compute_per_token_cam_id
+from .visual_attention import (
+    parse_exact_bool,
+    prepare_visual_attention_call,
+    resolve_visual_attention_profile,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -203,6 +208,202 @@ class _RMSNorm(nn.Module):
         return (x.float() * scale).to(dtype=x.dtype) * self.weight.to(dtype=x.dtype)
 
 
+def build_same_row_opposite_indices(
+    camera_ids: torch.Tensor,
+    row_ids: torch.Tensor,
+    *,
+    topk: int = 4,
+) -> Tuple[torch.Tensor, int, int]:
+    """Build sparse opposite-camera/same-row candidate indices.
+
+    ``camera_ids`` and ``row_ids`` are in the compressed image-token order used
+    by ``CamBranchAttention``. The function never constructs an N-by-N mask:
+    each query gets the contiguous row of the other camera directly. The
+    returned indices have shape ``[B, N, W]`` and ``effective_k=min(topk,W)``.
+    """
+    if camera_ids.ndim != 2 or row_ids.shape != camera_ids.shape:
+        raise ValueError(
+            f"camera_ids and row_ids must both be [B,N], got "
+            f"{tuple(camera_ids.shape)} and {tuple(row_ids.shape)}"
+        )
+    if int(topk) <= 0:
+        raise ValueError(f"topk must be positive, got {topk}")
+    batch, n_tokens = camera_ids.shape
+    if n_tokens == 0 or n_tokens % 2 != 0:
+        raise ValueError(f"expected two equal camera grids, got N={n_tokens}")
+    n_per_camera = n_tokens // 2
+    candidate_batches = []
+    widths = []
+    for b in range(batch):
+        cams = camera_ids[b]
+        rows = row_ids[b]
+        unique_cams = torch.unique(cams).tolist()
+        if sorted(int(x) for x in unique_cams) != [0, 1]:
+            raise ValueError(f"expected camera ids {{0,1}}, sample {b} has {unique_cams}")
+        if int((cams == 0).sum().item()) != n_per_camera or int((cams == 1).sum().item()) != n_per_camera:
+            raise ValueError(f"camera token counts are not equal in sample {b}")
+        row_counts = []
+        for cam in (0, 1):
+            cam_rows = rows[cams == cam]
+            values = torch.unique(cam_rows, sorted=True)
+            if values.numel() == 0 or int(values.min().item()) < 0:
+                raise ValueError(f"invalid row ids for sample {b}, camera {cam}")
+            counts = torch.stack([(cam_rows == row).sum() for row in values])
+            if not bool(torch.all(counts == counts[0])):
+                raise ValueError(f"non-uniform row width for sample {b}, camera {cam}")
+            row_counts.append(int(counts[0].item()))
+        if row_counts[0] != row_counts[1] or row_counts[0] <= 0:
+            raise ValueError(f"camera row widths disagree or are empty: {row_counts}")
+        width = row_counts[0]
+        widths.append(width)
+        col = torch.arange(width, device=camera_ids.device, dtype=torch.long)
+        other_base = torch.where(cams == 0, n_per_camera, 0).to(dtype=torch.long)
+        candidate_batches.append(other_base[:, None] + rows.to(dtype=torch.long)[:, None] * width + col[None, :])
+    if len(set(widths)) != 1:
+        raise ValueError(f"all samples must have the same merged row width, got {widths}")
+    width = widths[0]
+    return torch.stack(candidate_batches, dim=0), min(int(topk), width), width
+
+
+def _build_stereo_grid_metadata(
+    *,
+    per_token_cam_id: torch.Tensor,
+    image_positions: torch.Tensor,
+    image_grid_thw: torch.Tensor,
+    spatial_merge_size: int,
+    num_cameras: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return compressed camera, row and column ids with strict stereo guards."""
+    if int(num_cameras) != 2:
+        raise ValueError(f"E5 same-row routing currently requires 2 cameras, got {num_cameras}")
+    batch, n_img = image_positions.shape
+    if image_grid_thw is None or image_grid_thw.ndim != 2 or image_grid_thw.shape[0] != batch * 2:
+        raise ValueError(
+            f"E5 requires exactly 2 image_grid_thw rows per sample; got "
+            f"shape={None if image_grid_thw is None else tuple(image_grid_thw.shape)}, B={batch}"
+        )
+    s2 = max(int(spatial_merge_size), 1)
+    grid = image_grid_thw.detach().to(device="cpu", dtype=torch.long).tolist()
+    hw = []
+    for record_index, (t, h_raw, w_raw) in enumerate(grid):
+        if int(t) != 1 or int(h_raw) % s2 != 0 or int(w_raw) % s2 != 0:
+            raise ValueError(f"E5 requires t=1 and divisible grids, record_index={record_index}, grid={(t,h_raw,w_raw)}")
+        hw.append((int(h_raw) // s2, int(w_raw) // s2))
+    if len(set(hw)) != 1:
+        raise ValueError(f"E5 requires identical merged H/W across all cameras, got {hw}")
+    merged_h, merged_w = hw[0]
+    n_per_image = merged_h * merged_w
+    if n_img != 2 * n_per_image:
+        raise ValueError(f"E5 image token count {n_img} != 2*H*W={2*n_per_image}")
+
+    rows_one = torch.arange(merged_h, device=per_token_cam_id.device, dtype=torch.long).repeat_interleave(merged_w)
+    cols_one = torch.arange(merged_w, device=per_token_cam_id.device, dtype=torch.long).repeat(merged_h)
+    expected_rows = torch.cat((rows_one, rows_one), dim=0).expand(batch, -1)
+    expected_cols = torch.cat((cols_one, cols_one), dim=0).expand(batch, -1)
+    expected_cams = torch.cat(
+        (
+            torch.zeros(n_per_image, device=per_token_cam_id.device, dtype=torch.long),
+            torch.ones(n_per_image, device=per_token_cam_id.device, dtype=torch.long),
+        ),
+        dim=0,
+    ).expand(batch, -1)
+    actual_cams = per_token_cam_id.gather(dim=1, index=image_positions)
+    if not bool(torch.equal(actual_cams, expected_cams)):
+        raise ValueError(
+            "E5 camera binding mismatch: expected record_index=2*b+run_slot with "
+            "run_slot->camera_id [0,1]; refusing possible left/right swap or non-camera-major input"
+        )
+    return actual_cams, expected_rows, expected_cols
+
+
+class CrossViewCamBranchAttention(nn.Module):
+    """Sparse opposite-camera, same-row PRoPE attention used by E5."""
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        branch_heads: int,
+        branch_head_dim: int,
+        *,
+        out_proj_init_std: float,
+        init_seed: int,
+    ) -> None:
+        super().__init__()
+        self.hidden_dim = int(hidden_dim)
+        self.branch_heads = int(branch_heads)
+        self.branch_head_dim = int(branch_head_dim)
+        self.branch_dim = self.branch_heads * self.branch_head_dim
+        self.q_proj = nn.Linear(hidden_dim, self.branch_dim, bias=False)
+        self.k_proj = nn.Linear(hidden_dim, self.branch_dim, bias=False)
+        self.v_proj = nn.Linear(hidden_dim, self.branch_dim, bias=False)
+        self.norm_q = _RMSNorm(self.branch_head_dim)
+        self.norm_k = _RMSNorm(self.branch_head_dim)
+        self.out_proj = nn.Linear(self.branch_dim, hidden_dim, bias=True)
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(int(init_seed))
+            for proj in (self.q_proj, self.k_proj, self.v_proj):
+                nn.init.xavier_uniform_(proj.weight)
+            if float(out_proj_init_std) == 0.0:
+                nn.init.zeros_(self.out_proj.weight)
+            else:
+                nn.init.normal_(self.out_proj.weight, mean=0.0, std=float(out_proj_init_std))
+            nn.init.zeros_(self.out_proj.bias)
+
+    def _project_heads(self, proj: nn.Linear, hidden_img: torch.Tensor, norm: nn.Module) -> torch.Tensor:
+        batch, n_img, _ = hidden_img.shape
+        x = proj(hidden_img).view(batch, n_img, self.branch_heads, self.branch_head_dim)
+        return norm(x).transpose(1, 2).contiguous()
+
+    @staticmethod
+    def _gather_candidates(values: torch.Tensor, candidate_indices: torch.Tensor) -> torch.Tensor:
+        # Per-batch advanced indexing avoids materialising a dense [Nq,Nimage]
+        # gather view. The only candidate axis is the merged row width W.
+        return torch.stack(
+            [values[b][:, candidate_indices[b], :] for b in range(values.shape[0])], dim=0
+        )
+
+    def forward(
+        self,
+        hidden_img: torch.Tensor,
+        P_img: torch.Tensor,
+        P_T_img: torch.Tensor,
+        P_inv_img: torch.Tensor,
+        candidate_indices: torch.Tensor,
+        effective_k: int,
+    ) -> torch.Tensor:
+        if candidate_indices.ndim != 3 or int(effective_k) <= 0:
+            raise ValueError("E5 candidate route is missing or empty")
+        q = self._project_heads(self.q_proj, hidden_img, self.norm_q)
+        k = self._project_heads(self.k_proj, hidden_img, self.norm_k)
+        v = self.v_proj(hidden_img).view(
+            hidden_img.shape[0], hidden_img.shape[1], self.branch_heads, self.branch_head_dim
+        ).transpose(1, 2).contiguous()
+        q = _apply_tiled_projmat(q, P_T_img)
+        k = _apply_tiled_projmat(k, P_inv_img)
+        v = _apply_tiled_projmat(v, P_inv_img)
+        k_candidates = self._gather_candidates(k, candidate_indices)
+        v_candidates = self._gather_candidates(v, candidate_indices)
+        scores = (q.unsqueeze(3) * k_candidates).sum(dim=-1) * (self.branch_head_dim ** -0.5)
+        # topk is materially faster than a full argsort. A tiny rank-dependent
+        # float32 tie-break preserves the documented ascending-candidate order
+        # for exact score ties without changing the gathered attention scores.
+        rank_bias = torch.arange(
+            scores.shape[-1], device=scores.device, dtype=torch.float32
+        ).mul_(1e-7)
+        select_scores = scores.float() - rank_bias.view(1, 1, 1, -1)
+        _, selected = torch.topk(select_scores, k=int(effective_k), dim=-1, largest=True, sorted=True)
+        selected_scores = torch.gather(scores, dim=-1, index=selected)
+        selected_values = torch.gather(
+            v_candidates,
+            dim=3,
+            index=selected.unsqueeze(-1).expand(-1, -1, -1, -1, self.branch_head_dim),
+        )
+        weights = torch.softmax(selected_scores.float(), dim=-1).to(dtype=selected_values.dtype)
+        out = (weights.unsqueeze(-1) * selected_values).sum(dim=3)
+        out = _apply_tiled_projmat(out, P_img)
+        return self.out_proj(out.transpose(1, 2).reshape(hidden_img.shape[0], hidden_img.shape[1], self.branch_dim))
+
+
 class CamBranchAttention(nn.Module):
     """Image-token-only parallel PRoPE self-attention branch."""
 
@@ -212,12 +413,26 @@ class CamBranchAttention(nn.Module):
         branch_heads: int = 4,
         branch_head_dim: int = 128,
         rms_norm_eps: float = 1e-6,
+        out_proj_init_std: float = 0.0,
+        e5_enabled: bool = False,
+        e5_topk: int = 4,
+        e5_gate_init: float = 0.1,
+        e5_out_proj_init_std: float = 0.02,
+        e5_init_seed: int = 42,
+        *,
+        is_causal: bool = False,
     ) -> None:
         super().__init__()
+        self.is_causal = parse_exact_bool(is_causal, name="stereo_cam_branch_is_causal")
         self.hidden_dim = int(hidden_dim)
         self.branch_heads = int(branch_heads)
         self.branch_head_dim = int(branch_head_dim)
         self.branch_dim = self.branch_heads * self.branch_head_dim
+        self.out_proj_init_std = float(out_proj_init_std)
+        if not math.isfinite(self.out_proj_init_std) or self.out_proj_init_std < 0.0:
+            raise ValueError(
+                f"out_proj_init_std must be finite and non-negative, got {out_proj_init_std}"
+            )
         if self.branch_heads <= 0:
             raise ValueError(f"branch_heads must be positive, got {branch_heads}")
         if self.branch_head_dim % 4 != 0:
@@ -234,8 +449,27 @@ class CamBranchAttention(nn.Module):
 
         for proj in (self.q_proj, self.k_proj, self.v_proj):
             nn.init.xavier_uniform_(proj.weight)
-        nn.init.zeros_(self.out_proj.weight)
+        if self.out_proj_init_std == 0.0:
+            nn.init.zeros_(self.out_proj.weight)
+        else:
+            # Keep the optional E3 draw out of the model-wide initialization stream.
+            with torch.random.fork_rng(devices=[]):
+                nn.init.normal_(self.out_proj.weight, mean=0.0, std=self.out_proj_init_std)
         nn.init.zeros_(self.out_proj.bias)
+        self.e5_branch: Optional[CrossViewCamBranchAttention] = None
+        self.e5_gate: Optional[nn.Parameter] = None
+        self.e5_topk = 0
+        if bool(e5_enabled):
+            self.e5_topk = int(e5_topk)
+            with torch.random.fork_rng(devices=[]):
+                self.e5_branch = CrossViewCamBranchAttention(
+                    hidden_dim=self.hidden_dim,
+                    branch_heads=self.branch_heads,
+                    branch_head_dim=self.branch_head_dim,
+                    out_proj_init_std=float(e5_out_proj_init_std),
+                    init_seed=int(e5_init_seed),
+                )
+                self.e5_gate = nn.Parameter(torch.tensor(float(e5_gate_init), dtype=torch.float32))
 
     def _project_heads(self, proj: nn.Linear, hidden_img: torch.Tensor, norm: nn.Module) -> torch.Tensor:
         batch, n_img, _ = hidden_img.shape
@@ -273,7 +507,9 @@ class CamBranchAttention(nn.Module):
         q = _apply_tiled_projmat(q, P_T_img)
         k = _apply_tiled_projmat(k, P_inv_img)
         v = _apply_tiled_projmat(v, P_inv_img)
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        # The matched causal arm uses the same SDPA primitive with an explicit
+        # main-backbone mask; the branch direction is controlled independently.
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=self.is_causal)
         out = _apply_tiled_projmat(out, P_img)
         return out.transpose(1, 2).reshape(hidden_img.shape[0], hidden_img.shape[1], self.branch_dim)
 
@@ -287,7 +523,30 @@ class CamBranchAttention(nn.Module):
         raw = self.forward_raw(hidden_img, P_img, P_T_img, P_inv_img)
         if self.capture_raw_output:
             self.last_raw_output = raw.detach()
+        if self.e5_branch is not None:
+            raise RuntimeError("E5 branch requires route metadata; call forward_composite")
         return self.out_proj(raw)
+
+    def forward_composite(
+        self,
+        hidden_img: torch.Tensor,
+        P_img: torch.Tensor,
+        P_T_img: torch.Tensor,
+        P_inv_img: torch.Tensor,
+        candidate_indices: Optional[torch.Tensor],
+        effective_k: Optional[int],
+    ) -> torch.Tensor:
+        raw = self.forward_raw(hidden_img, P_img, P_T_img, P_inv_img)
+        if self.capture_raw_output:
+            self.last_raw_output = raw.detach()
+        out = self.out_proj(raw)
+        if self.e5_branch is not None:
+            if candidate_indices is None or effective_k is None:
+                raise RuntimeError("E5 enabled but same-row candidate route is unavailable")
+            out = out + self.e5_gate.to(dtype=out.dtype) * self.e5_branch(
+                hidden_img, P_img, P_T_img, P_inv_img, candidate_indices, effective_k
+            )
+        return out
 
 
 @dataclass
@@ -297,6 +556,11 @@ class CamBranchState:
     P_T_img: Optional[torch.Tensor] = None
     P_inv_img: Optional[torch.Tensor] = None
     per_token_cam_id: Optional[torch.Tensor] = None
+    per_token_row_id: Optional[torch.Tensor] = None
+    per_token_col_id: Optional[torch.Tensor] = None
+    e5_candidate_indices: Optional[torch.Tensor] = None
+    e5_effective_k: Optional[int] = None
+    image_grid_thw: Optional[torch.Tensor] = None
     forward_step: int = 0
     logging_frequency: int = 20
     # Per-layer memo of the last logged forward_step: kills duplicate log lines (and
@@ -305,6 +569,8 @@ class CamBranchState:
     last_logged_step: dict = None
     top_pre_hook_handle: Optional[torch.utils.hooks.RemovableHandle] = None
     top_pre_hook_fn: Optional[Callable] = None
+    top_post_hook_handle: Optional[torch.utils.hooks.RemovableHandle] = None
+    backward_finalize_handle: Optional[torch.utils.hooks.RemovableHandle] = None
     # FFS/Utonia compatibility: when token insertion happens inside the
     # language_model pre-hook, the top-level cam_branch hook sees pre-insert
     # sequence positions. In defer mode, it only records raw cam ids/counts;
@@ -318,6 +584,10 @@ class CamBranchState:
     # or clear(). If a cam_branch layer runs while still True, insertion never
     # refreshed -> raise instead of silently degrading to base attention.
     deferred_refresh_pending: bool = False
+    # Gradient-checkpointed decoder recomputation re-enters the wrapped decoder
+    # layers without re-entering the top-level model hook. Keep the route alive
+    # until the next top-level pre-hook clears it and rebuilds the next route.
+    retain_for_checkpoint_recompute: bool = False
 
     def clear(self) -> None:
         self.image_positions = None
@@ -325,8 +595,14 @@ class CamBranchState:
         self.P_T_img = None
         self.P_inv_img = None
         self.per_token_cam_id = None
+        self.per_token_row_id = None
+        self.per_token_col_id = None
+        self.e5_candidate_indices = None
+        self.e5_effective_k = None
         self.raw_image_token_counts = None
+        self.image_grid_thw = None
         self.deferred_refresh_pending = False
+        self.retain_for_checkpoint_recompute = False
 
 
 def _language_model_layers(hf_model) -> nn.ModuleList:
@@ -379,9 +655,22 @@ def _make_cam_branch_forward(
     branch: CamBranchAttention,
     state: CamBranchState,
     layer_idx: int,
+    visual_attention_mode: str = "legacy_mixed",
 ) -> Callable:
     def _forward(self, hidden_states: torch.Tensor, *args, **kwargs):
-        output = orig_forward(hidden_states, *args, **kwargs)
+        if state.deferred_refresh_pending:
+            raise RuntimeError(
+                f"[cam_branch] layer {layer_idx} reached before deferred position refresh"
+            )
+        call_args, call_kwargs = prepare_visual_attention_call(
+            hidden_states,
+            args,
+            kwargs,
+            image_positions=state.image_positions,
+            mode=visual_attention_mode,
+            layer_idx=layer_idx,
+        )
+        output = orig_forward(hidden_states, *call_args, **call_kwargs)
         if state.deferred_refresh_pending:
             raise RuntimeError(
                 f"[cam_branch] layer {layer_idx} reached with deferred position cache still "
@@ -407,11 +696,13 @@ def _make_cam_branch_forward(
         gather_index = positions.unsqueeze(-1).expand(-1, -1, hidden_states.shape[-1])
         hidden_img = hidden_states.gather(dim=1, index=gather_index)
 
-        branch_out = branch(
+        branch_out = branch.forward_composite(
             hidden_img,
             state.P_img,
             state.P_T_img,
             state.P_inv_img,
+            state.e5_candidate_indices,
+            state.e5_effective_k,
         ).to(device=attn_output.device, dtype=attn_output.dtype)
 
         if (
@@ -439,11 +730,39 @@ def _make_cam_branch_forward(
     return _forward
 
 
+def _make_visual_attention_forward(
+    *,
+    orig_forward: Callable,
+    state: CamBranchState,
+    layer_idx: int,
+    visual_attention_mode: str,
+) -> Callable:
+    """Wrap a non-branch full-attention layer with the same visual mask path."""
+    def _forward(self, hidden_states: torch.Tensor, *args, **kwargs):
+        if state.deferred_refresh_pending:
+            raise RuntimeError(
+                f"[cam_branch] layer {layer_idx} reached before deferred position refresh"
+            )
+        call_args, call_kwargs = prepare_visual_attention_call(
+            hidden_states,
+            args,
+            kwargs,
+            image_positions=state.image_positions,
+            mode=visual_attention_mode,
+            layer_idx=layer_idx,
+        )
+        return orig_forward(hidden_states, *call_args, **call_kwargs)
+    return _forward
+
 def install_cam_branch(
     hf_model,
     *,
     branch_heads: int = 4,
     branch_head_dim: int = 128,
+    out_proj_init_std: float = 0.0,
+    visual_attention_mode: str = "legacy_mixed",
+    stereo_cam_branch_is_causal: bool = False,
+    attention_implementation: str = "flash_attention_2",
     layers: Optional[Sequence[int] | str] = None,
     num_cameras: int = 2,
     baseline_m: float = 0.06,
@@ -455,6 +774,12 @@ def install_cam_branch(
     extra_image_cam_id: Optional[int] = None,
     logging_frequency: int = 20,
     defer_position_cache_until_token_insert: bool = False,
+    e5_enabled: bool = False,
+    e5_layers: Optional[Sequence[int] | str] = None,
+    e5_topk: int = 4,
+    e5_gate_init: float = 0.1,
+    e5_out_proj_init_std: float = 0.02,
+    e5_init_seed: int = 42,
 ) -> Tuple[CamBranchState, List[CamBranchAttention]]:
     """Install image-token-only cam_branch wrappers on selected softmax layers.
 
@@ -466,6 +791,28 @@ def install_cam_branch(
     supported = _discover_supported_attention_layers(hf_model)
     supported_by_idx = {idx: attn for idx, attn in supported}
     target_layers = _parse_layers(layers)
+    if len(target_layers) != len(set(target_layers)):
+        raise ValueError(f"duplicate Camera Branch layer indices: {target_layers}")
+    visual_attention_mode, stereo_cam_branch_is_causal, attention_implementation = (
+        resolve_visual_attention_profile(
+            visual_attention_mode,
+            stereo_cam_branch_is_causal,
+            attention_implementation,
+            cam_branch_enabled=True,
+        )
+    )
+    visual_attention_enabled = visual_attention_mode != "legacy_mixed"
+    e5_target_layers = _parse_layers(e5_layers) if e5_layers is not None else [11, 15, 19, 23]
+    if len(e5_target_layers) != len(set(e5_target_layers)):
+        raise ValueError(f"duplicate E5 layer indices: {e5_target_layers}")
+    if bool(e5_enabled):
+        if not set(e5_target_layers).issubset(set(target_layers)):
+            raise ValueError(
+                f"E5 layers {e5_target_layers} must be a subset of E3 layers {target_layers}"
+            )
+        unsupported_e5 = [idx for idx in e5_target_layers if idx not in supported_by_idx]
+        if unsupported_e5:
+            raise RuntimeError(f"E5 requested non-full/unsupported layers: {unsupported_e5}")
     missing = [idx for idx in target_layers if idx not in supported_by_idx]
     if missing:
         raise RuntimeError(
@@ -473,6 +820,15 @@ def install_cam_branch(
             f"supported={sorted(supported_by_idx)}"
         )
 
+    target_set = set(target_layers)
+    for layer_idx, attn in supported:
+        if visual_attention_enabled:
+            if getattr(attn, "_stereo_cam_branch_installed", False):
+                raise RuntimeError(f"[cam_branch] layer {layer_idx} already has cam_branch installed")
+            if getattr(attn, "_stereo_visual_attention_installed", False):
+                raise RuntimeError(f"[cam_branch] layer {layer_idx} already has visual attention installed")
+        elif layer_idx in target_set and getattr(attn, "_stereo_cam_branch_installed", False):
+            raise RuntimeError(f"[cam_branch] layer {layer_idx} already has cam_branch installed")
     text_cfg = hf_model.config.text_config if hasattr(hf_model.config, "text_config") else hf_model.config
     hidden_dim = int(text_cfg.hidden_size)
     image_token_id = int(hf_model.config.image_token_id)
@@ -492,10 +848,19 @@ def install_cam_branch(
         attn = supported_by_idx[layer_idx]
         if getattr(attn, "_stereo_cam_branch_installed", False):
             raise RuntimeError(f"[cam_branch] layer {layer_idx} already has cam_branch installed")
+        if visual_attention_enabled and getattr(attn, "_stereo_visual_attention_installed", False):
+            raise RuntimeError(f"[cam_branch] layer {layer_idx} already has visual attention installed")
         branch = CamBranchAttention(
             hidden_dim=hidden_dim,
             branch_heads=branch_heads,
             branch_head_dim=branch_head_dim,
+            out_proj_init_std=out_proj_init_std,
+            is_causal=stereo_cam_branch_is_causal,
+            e5_enabled=bool(e5_enabled and layer_idx in e5_target_layers),
+            e5_topk=int(e5_topk),
+            e5_gate_init=float(e5_gate_init),
+            e5_out_proj_init_std=float(e5_out_proj_init_std),
+            e5_init_seed=int(e5_init_seed) + int(layer_idx),
         )
         base_dtype = attn.q_proj.weight.dtype if hasattr(attn, "q_proj") else next(attn.parameters()).dtype
         branch = branch.to(dtype=base_dtype)
@@ -503,16 +868,42 @@ def install_cam_branch(
         attn._stereo_cam_branch_installed = True
         attn._stereo_cam_branch_layer_idx = int(layer_idx)
         attn._stereo_cam_branch_orig_forward = orig_forward
+        if visual_attention_enabled:
+            attn._stereo_visual_attention_installed = True
         attn.forward = MethodType(
             _make_cam_branch_forward(
                 orig_forward=orig_forward,
                 branch=branch,
                 state=state,
                 layer_idx=int(layer_idx),
+                visual_attention_mode=visual_attention_mode,
             ),
             attn,
         )
         branches.append(branch)
+
+    if visual_attention_enabled:
+        target_set = set(target_layers)
+        for layer_idx, attn in supported:
+            if layer_idx in target_set:
+                continue
+            if getattr(attn, "_stereo_cam_branch_installed", False):
+                raise RuntimeError(f"[cam_branch] non-target layer {layer_idx} already has cam_branch installed")
+            if getattr(attn, "_stereo_visual_attention_installed", False):
+                raise RuntimeError(f"[cam_branch] layer {layer_idx} already has visual attention installed")
+            orig_forward = attn.forward
+            attn._stereo_visual_attention_installed = True
+            attn._stereo_visual_attention_layer_idx = int(layer_idx)
+            attn._stereo_visual_attention_orig_forward = orig_forward
+            attn.forward = MethodType(
+                _make_visual_attention_forward(
+                    orig_forward=orig_forward,
+                    state=state,
+                    layer_idx=int(layer_idx),
+                    visual_attention_mode=visual_attention_mode,
+                ),
+                attn,
+            )
 
     def _cache_positions_from_per_token_cam_id(
         per_token_cam_id: torch.Tensor,
@@ -569,17 +960,50 @@ def install_cam_branch(
         state.P_img = P[cam_ids]
         state.P_T_img = P_T[cam_ids]
         state.P_inv_img = P_inv[cam_ids]
+        if bool(e5_enabled):
+            if state.image_grid_thw is None:
+                raise RuntimeError("E5 enabled but image_grid_thw metadata is unavailable")
+            actual_cams, row_ids, col_ids = _build_stereo_grid_metadata(
+                per_token_cam_id=per_token_cam_id,
+                image_positions=positions,
+                image_grid_thw=state.image_grid_thw,
+                spatial_merge_size=int(spatial_merge_size),
+                num_cameras=int(num_cameras),
+            )
+            candidate_indices, effective_k, _ = build_same_row_opposite_indices(
+                actual_cams, row_ids, topk=int(e5_topk)
+            )
+            state.per_token_row_id = row_ids
+            state.per_token_col_id = col_ids
+            state.e5_candidate_indices = candidate_indices
+            state.e5_effective_k = int(effective_k)
         return None
 
     state.refresh_from_per_token_cam_id = _cache_positions_from_per_token_cam_id
 
     def _pre_forward_hook(module, args, kwargs):
+        if state.retain_for_checkpoint_recompute:
+            raise RuntimeError(
+                "[cam_branch] a checkpointed visual forward is still in flight; "
+                "refusing an overlapping top-level forward before backward completes"
+            )
+        state.clear()
+        # Clear stale state from the previous top-level forward. This is also
+        # the lifecycle boundary after a checkpointed forward retained context
+        # for backward recomputation.
         input_ids = kwargs.get("input_ids", None)
         if input_ids is None and args:
             input_ids = args[0]
         image_grid_thw = kwargs.get("image_grid_thw", None)
         state.forward_step += 1
+        state.image_grid_thw = image_grid_thw
         if input_ids is None:
+            if visual_attention_enabled:
+                state.clear()
+                raise RuntimeError(
+                    "[cam_branch] visual attention mode requires input_ids so image-token "
+                    "positions cannot be guessed from inputs_embeds alone"
+                )
             # Fail-open by design (matches the cam_rope hook convention), but warn
             # once: a future inputs_embeds-only call path would otherwise silently
             # disable a TRAINED branch — the exact silent-inert failure class this
@@ -609,6 +1033,7 @@ def install_cam_branch(
             # here; depth_token_inject refreshes them after insertion using post-insert
             # cam ids, while retaining raw_image_counts for fail-closed validation.
             state.clear()
+            state.image_grid_thw = image_grid_thw
             state.per_token_cam_id = per_token_cam_id
             state.raw_image_token_counts = raw_image_counts
             state.deferred_refresh_pending = True  # depth_token_inject MUST refresh post-insert
@@ -619,6 +1044,64 @@ def install_cam_branch(
     state.top_pre_hook_fn = _pre_forward_hook
     state.top_pre_hook_handle = hf_model.register_forward_pre_hook(_pre_forward_hook, with_kwargs=True)
 
+    def _gradient_checkpointing_active() -> bool:
+        candidates = [
+            hf_model,
+            getattr(hf_model, "model", None),
+            getattr(getattr(hf_model, "model", None), "language_model", None),
+        ]
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            for attr in ("is_gradient_checkpointing", "gradient_checkpointing"):
+                value = getattr(candidate, attr, False)
+                if callable(value):
+                    value = value()
+                if bool(value):
+                    return True
+        return False
+
+    def _post_forward_hook(module, args, kwargs, output):
+        # Decoder-layer checkpoint recomputation does not re-enter this top-level
+        # hook. Retain the latest image route until the next top-level pre-hook;
+        # that pre-hook clears it before building the next route.
+        if (
+            bool(getattr(module, "training", False))
+            and torch.is_grad_enabled()
+            and _gradient_checkpointing_active()
+            and (state.image_positions is not None or state.deferred_refresh_pending)
+        ):
+            state.retain_for_checkpoint_recompute = True
+            return None
+        state.clear()
+        return None
+
+    state.top_post_hook_handle = hf_model.register_forward_hook(
+        _post_forward_hook, with_kwargs=True, always_call=True
+    )
+
+    def _backward_finalize_hook(grad):
+        state.clear()
+        return grad
+    finalize_parameter = None
+    decoder_layers = getattr(hf_model, "layers", None)
+    if decoder_layers is not None and len(decoder_layers) > 0:
+        finalize_parameter = next(
+            (parameter for parameter in decoder_layers[0].parameters() if parameter.requires_grad),
+            None,
+        )
+    if finalize_parameter is None:
+        finalize_parameter = next(
+            (parameter for parameter in hf_model.parameters() if parameter.requires_grad),
+            None,
+        )
+    if finalize_parameter is not None:
+        if hasattr(finalize_parameter, "register_post_accumulate_grad_hook"):
+            state.backward_finalize_handle = finalize_parameter.register_post_accumulate_grad_hook(
+                lambda _parameter: state.clear()
+            )
+        else:
+            state.backward_finalize_handle = finalize_parameter.register_hook(_backward_finalize_hook)
     logger.info(
         "[cam_branch] installed %d branches on language_model.layers%s "
         "(heads=%d, head_dim=%d, num_cameras=%d, baseline_m=%.4f, right_first=%s)",

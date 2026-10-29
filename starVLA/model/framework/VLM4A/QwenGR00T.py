@@ -38,6 +38,7 @@ from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 from starVLA.training.trainer_utils.trainer_tools import resize_images
 from starVLA.model.modules.stereo import install_cam_branch
+from starVLA.model.modules.stereo.visual_attention import parse_exact_bool, resolve_visual_attention_profile
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -84,7 +85,17 @@ class QwenGR00TDefaultConfig:
             "stereo_cam_branch_enabled": False,
             "stereo_cam_branch_heads": 4,
             "stereo_cam_branch_head_dim": 128,
+            "stereo_visual_attention_mode": "legacy_mixed",
+            "stereo_cam_branch_is_causal": False,
             "stereo_cam_branch_layers": None,
+            "stereo_cam_branch_out_proj_init_std": 0.0,
+            # === E5 sparse full-attention cross-view branch (default off) ===
+            "stereo_cam_branch_e5_enabled": False,
+            "stereo_cam_branch_e5_layers": "11,15,19,23",
+            "stereo_cam_branch_e5_topk": 4,
+            "stereo_cam_branch_e5_gate_init": 0.1,
+            "stereo_cam_branch_e5_out_proj_init_std": 0.02,
+            "stereo_cam_branch_e5_init_seed": 42,
         }
     )
 
@@ -246,12 +257,34 @@ class Qwen_GR00T(baseframework):
         # Merge framework defaults with YAML config (YAML wins on conflicts)
         self.config = merge_framework_config(QwenGR00TDefaultConfig, config)
         self.qwen_vl_interface = get_vlm_model(config=self.config)
-
-        cam_branch_enabled = bool(self.config.framework.qwenvl.get("stereo_cam_branch_enabled", False))
+        cam_branch_enabled = parse_exact_bool(
+            self.config.framework.qwenvl.get("stereo_cam_branch_enabled", False),
+            name="stereo_cam_branch_enabled",
+        )
+        visual_attention_mode, cam_branch_is_causal, attention_implementation = (
+            resolve_visual_attention_profile(
+                self.config.framework.qwenvl.get("stereo_visual_attention_mode", "legacy_mixed"),
+                self.config.framework.qwenvl.get("stereo_cam_branch_is_causal", False),
+                self.config.framework.qwenvl.get("attn_implementation", "flash_attention_2"),
+                cam_branch_enabled=cam_branch_enabled,
+            )
+        )
+        e5_enabled = parse_exact_bool(
+            self.config.framework.qwenvl.get("stereo_cam_branch_e5_enabled", False),
+            name="stereo_cam_branch_e5_enabled",
+        )
+        if e5_enabled and not cam_branch_enabled:
+            raise ValueError(
+                "stereo_cam_branch_e5_enabled=True requires stereo_cam_branch_enabled=True; "
+                "E5-full-only is always E3-plus-E5"
+            )
         # cam_rope (StereoCamRoPELayer d_c branch) was removed — it was a
         # provably-inert double-zero no-op. Fail closed if a stale config still
         # asks for it instead of silently ignoring the flag.
-        if bool(self.config.framework.qwenvl.get("stereo_cam_rope_enabled", False)):
+        if parse_exact_bool(
+            self.config.framework.qwenvl.get("stereo_cam_rope_enabled", False),
+            name="stereo_cam_rope_enabled",
+        ):
             raise NotImplementedError(
                 "stereo_cam_rope_enabled=True but the cam_rope module was removed "
                 "(inert double-zero). Use stereo_cam_branch_enabled instead."
@@ -266,7 +299,6 @@ class Qwen_GR00T(baseframework):
         self.stereo_cam_branch_layers_modules = None
         if cam_branch_enabled:
             import torch.nn as _nn_for_stereo
-
             trainer_cfg = getattr(self.config, "trainer", {})
             logging_frequency = (
                 int(trainer_cfg.get("logging_frequency", 20))
@@ -277,6 +309,10 @@ class Qwen_GR00T(baseframework):
                 self.qwen_vl_interface.model,
                 branch_heads=int(self.config.framework.qwenvl.get("stereo_cam_branch_heads", 4)),
                 branch_head_dim=int(self.config.framework.qwenvl.get("stereo_cam_branch_head_dim", 128)),
+                out_proj_init_std=float(self.config.framework.qwenvl.get("stereo_cam_branch_out_proj_init_std", 0.0)),
+                visual_attention_mode=visual_attention_mode,
+                stereo_cam_branch_is_causal=cam_branch_is_causal,
+                attention_implementation=attention_implementation,
                 layers=self.config.framework.qwenvl.get("stereo_cam_branch_layers", None),
                 num_cameras=int(self.config.framework.qwenvl.get("stereo_cam_rope_num_cameras", 2)),
                 baseline_m=float(self.config.framework.qwenvl.get("stereo_cam_rope_baseline_m", 0.06)),
@@ -284,9 +320,17 @@ class Qwen_GR00T(baseframework):
                 image_width=int(self.config.framework.qwenvl.get("stereo_cam_rope_image_width", 256)),
                 image_height=int(self.config.framework.qwenvl.get("stereo_cam_rope_image_height", 256)),
                 spatial_merge_size=int(self.config.framework.qwenvl.get("stereo_cam_rope_spatial_merge", 2)),
-                right_first=bool(self.config.framework.qwenvl.get("stereo_cam_rope_right_first", True)),
+                right_first=parse_exact_bool(self.config.framework.qwenvl.get("stereo_cam_rope_right_first", True), name="stereo_cam_rope_right_first"),
                 extra_image_cam_id=self.config.framework.qwenvl.get("stereo_extra_image_cam_id", None),
                 logging_frequency=logging_frequency,
+                e5_enabled=e5_enabled,
+                e5_layers=self.config.framework.qwenvl.get("stereo_cam_branch_e5_layers", "11,15,19,23"),
+                e5_topk=int(self.config.framework.qwenvl.get("stereo_cam_branch_e5_topk", 4)),
+                e5_gate_init=float(self.config.framework.qwenvl.get("stereo_cam_branch_e5_gate_init", 0.1)),
+                e5_out_proj_init_std=float(
+                    self.config.framework.qwenvl.get("stereo_cam_branch_e5_out_proj_init_std", 0.02)
+                ),
+                e5_init_seed=int(self.config.framework.qwenvl.get("stereo_cam_branch_e5_init_seed", 42)),
             )
             if not branch_modules:
                 raise RuntimeError(
@@ -294,6 +338,22 @@ class Qwen_GR00T(baseframework):
                     "Did the model architecture change so no attention layers found?"
                 )
             self.stereo_cam_branch_layers_modules = _nn_for_stereo.ModuleList(branch_modules)
+            if e5_enabled:
+                e5_count = sum(1 for module in branch_modules if getattr(module, "e5_branch", None) is not None)
+                requested_e5_layers = self.config.framework.qwenvl.get(
+                    "stereo_cam_branch_e5_layers", "11,15,19,23"
+                )
+                if e5_count != len(str(requested_e5_layers).split(",")):
+                    raise RuntimeError(
+                        f"E5 installation census mismatch: requested={requested_e5_layers}, installed={e5_count}"
+                    )
+                logger.info(
+                    "[cam_branch] E5 enabled: layers=%s modules=%d topk=%s gate_init=%s",
+                    requested_e5_layers,
+                    e5_count,
+                    self.config.framework.qwenvl.get("stereo_cam_branch_e5_topk", 4),
+                    self.config.framework.qwenvl.get("stereo_cam_branch_e5_gate_init", 0.1),
+                )
 
         # align dims --> we should put them to config or no?
         _vlm_hidden = self.qwen_vl_interface.model.config.hidden_size
@@ -444,7 +504,7 @@ class Qwen_GR00T(baseframework):
     def load_state_dict(self, state_dict, strict=True, assign=False, init_from_baseline: bool = False):
         """Fail-closed load with warm-start exceptions for inert legacy stereo keys."""
         own_keys = set(self.state_dict().keys())
-        cam_branch_enabled = bool(self.config.framework.qwenvl.get("stereo_cam_branch_enabled", False))
+        cam_branch_enabled = parse_exact_bool(self.config.framework.qwenvl.get("stereo_cam_branch_enabled", False), name="stereo_cam_branch_enabled")
         legacy_audit_label = "cam_branch audit" if cam_branch_enabled else "legacy cam_rope audit"
 
         def _is_legacy_cam_rope_key(key: str) -> bool:
